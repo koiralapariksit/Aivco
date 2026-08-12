@@ -4,3 +4,6 @@
 venv/
 memory/user/*.bak
 memory/user/profile_backup.json
+
+# Personal AIVCO memory — keep local, never push
+memory/user/profile.json
