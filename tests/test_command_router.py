@@ -52,6 +52,13 @@ def test_invalid_forget_is_reported_as_usage(tmp_path):
     assert controller.handle("forget =") == "Usage: forget <key>"
 
 
+def test_invalid_memory_search_is_reported_as_usage(tmp_path):
+    controller, _ = make_controller(tmp_path)
+
+    assert controller.handle("memory search") == "Usage: memory search <query>"
+    assert controller.handle("memory search ") == "Usage: memory search <query>"
+
+
 def test_normal_prompt_is_not_a_command(tmp_path):
     controller, _ = make_controller(tmp_path)
 

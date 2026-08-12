@@ -61,6 +61,7 @@ class MemoryController:
         self.memory_path = Path(memory_path)
         self.memory_path.parent.mkdir(parents=True, exist_ok=True)
         self._data: dict = self._load()
+        self._had_existing_data = bool(self._data)
         self._apply_profile_migration()
 
     # ---------------- persistence ----------------
@@ -174,14 +175,15 @@ class MemoryController:
             "memories": self._extract_records(self._data),
         }
 
-        for key, value in UNIFIED_PROFILE_MEMORIES.items():
-            normalized_key = self._normalize_key(key)
-            if normalized_key not in migrated["memories"]:
-                migrated["memories"][normalized_key] = self._build_record(
-                    value,
-                    category=DEFAULT_CATEGORY,
-                    importance=DEFAULT_IMPORTANCE,
-                )
+        if self._had_existing_data:
+            for key, value in UNIFIED_PROFILE_MEMORIES.items():
+                normalized_key = self._normalize_key(key)
+                if normalized_key not in migrated["memories"]:
+                    migrated["memories"][normalized_key] = self._build_record(
+                        value,
+                        category=DEFAULT_CATEGORY,
+                        importance=DEFAULT_IMPORTANCE,
+                    )
 
         if migrated != self._data:
             self._data = migrated

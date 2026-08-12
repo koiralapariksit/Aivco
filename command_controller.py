@@ -232,6 +232,9 @@ class CommandController:
                 return "No matching memories found."
             return self._format_memory_listing(results)
 
+        if kind == "memory_bad":
+            return "Usage: memory search <query>"
+
         if kind == "memory_stats":
             summary = self.memory.stats()
             lines = [
