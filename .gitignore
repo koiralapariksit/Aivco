@@ -2,8 +2,16 @@
 *.pyc
 .venv/
 venv/
+# User memory and backups (private)
+memory/user/
 memory/user/*.bak
+memory/user/profile.json
 memory/user/profile_backup.json
+memory/user/*.json.bak
+
+# Local environment and logs
+.env
+*.log
 
 # Personal AIVCO memory — keep local, never push
-memory/user/profile.json
+# Personal AIVCO memory — keep local, never push
