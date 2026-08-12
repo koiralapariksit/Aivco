@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+.venv/
+venv/
+memory/user/*.bak
+memory/user/profile_backup.json
