@@ -10,17 +10,27 @@ here, so they can never leak through to the model or the CLI.
 
 from typing import Optional
 
-from memory.memory_controller import MemoryController
+from memory.memory_controller import (
+    DEFAULT_CATEGORY,
+    DEFAULT_IMPORTANCE,
+    MemoryController,
+    VALID_CATEGORIES,
+    VALID_IMPORTANCE,
+)
 
 HELP_TEXT = """AIVCO commands:
-  remember <key> = <value>   Save a memory
-  recall [key]                Show one memory, or all memories
+  remember <key> = <value> [category=<category>] [importance=<importance>]   Save a memory
+  recall <key>                Show one memory
+  recall category <category>  Show memories in a category
+  recall important <level>    Show memories by importance
   memory                      Alias for 'recall'
-  forget <key>                 Delete one memory
-  forget all                   Delete ALL memories (asks to confirm)
-  clear                        Clear the screen
-  help                         Show this message
-  exit                         Quit AIVCO
+  memory search <query>       Search memories by key, value, or category
+  memory stats                Show memory statistics
+  forget <key>                Delete one memory
+  forget all                  Delete ALL memories (asks to confirm)
+  clear                       Clear the screen
+  help                        Show this message
+  exit                        Quit AIVCO
 
 Anything else is sent to the AI model."""
 
@@ -54,11 +64,29 @@ class CommandController:
         if keyword == "clear":
             return "clear"
         if keyword == "memory":
-            return "recall_all"
+            if not remainder:
+                return "recall_all"
+            sub = remainder.split(None, 1)
+            if sub[0].lower() == "search" and len(sub) == 2:
+                return "memory_search"
+            if sub[0].lower() == "stats" and len(sub) == 1:
+                return "memory_stats"
+            if sub[0].lower() in {"category", "importance", "important"} and len(sub) == 2:
+                return "memory_filter"
+            return "memory_bad"
         if keyword == "recall":
             if not remainder:
                 return "recall_bad"
             tokens = remainder.split()
+            first = tokens[0].lower()
+            if first == "search":
+                if len(tokens) < 2:
+                    return "recall_bad"
+                return "recall_search"
+            if first in {"category", "importance", "important"}:
+                if len(tokens) != 2:
+                    return "recall_bad"
+                return "recall_filter"
             if len(tokens) != 1 or tokens[0] == "=":
                 return "recall_bad"
             return "recall_one"
@@ -86,6 +114,48 @@ class CommandController:
     def is_command(self, raw_input: str) -> bool:
         return self._classify(raw_input.strip()) is not None
 
+    def _format_memory_line(self, key: str, record: dict) -> str:
+        return (
+            f"{key} = {record['value']} "
+            f"[category={record['category']} importance={record['importance']}]"
+        )
+
+    def _format_memory_listing(self, records: dict) -> str:
+        if not records:
+            return "No memories stored."
+        lines = ["===== AIVCO MEMORY ====="]
+        lines += [self._format_memory_line(k, v) for k, v in records.items()]
+        lines.append("=========================")
+        return "\n".join(lines)
+
+    def _parse_remember_options(self, remainder: str) -> tuple[str, str, str, str]:
+        key, rest = remainder.split("=", 1)
+        metadata = {
+            "category": DEFAULT_CATEGORY,
+            "importance": DEFAULT_IMPORTANCE,
+        }
+        value = rest.strip()
+        tokens = value.split()
+        # Support metadata tokens optionally wrapped in brackets, e.g.
+        # [category=project] [importance=high]
+        while tokens:
+            last = tokens[-1]
+            stripped = last
+            if stripped.startswith("[") and stripped.endswith("]"):
+                stripped = stripped[1:-1]
+            if "=" not in stripped:
+                break
+            opt_key, opt_value = stripped.split("=", 1)
+            opt_key = opt_key.strip().lower()
+            opt_value = opt_value.strip().lower()
+            if opt_key in metadata and opt_value:
+                metadata[opt_key] = opt_value
+                tokens.pop()
+                value = " ".join(tokens).strip()
+            else:
+                break
+        return key.strip(), value.strip(), metadata["category"], metadata["importance"]
+
     def handle(self, raw_input: str) -> Optional[str]:
         """
         Returns:
@@ -112,13 +182,7 @@ class CommandController:
         keyword, remainder = self._split_command(text)
 
         if kind == "recall_all":
-            data = self.memory.recall()
-            if not data:
-                return "No memories stored."
-            lines = ["===== AIVCO MEMORY ====="]
-            lines += [f"{k} = {v}" for k, v in data.items()]
-            lines.append("=========================")
-            return "\n".join(lines)
+            return self._format_memory_listing(self.memory.all_records())
 
         if kind == "recall_one":
             key = remainder.split()[0]
@@ -130,6 +194,55 @@ class CommandController:
             if value is None:
                 return f"No memory found for: {key}"
             return f"{key} = {value}"
+
+        if kind in {"recall_filter", "memory_filter"}:
+            tokens = remainder.split(None, 1)
+            filter_type = tokens[0].lower()
+            filter_value = tokens[1].strip().lower() if len(tokens) > 1 else ""
+            if filter_type == "category":
+                if not self.memory.is_valid_category(filter_value):
+                    return "Invalid category. Use one of: " + ", ".join(sorted(VALID_CATEGORIES))
+                records = {
+                    k: v
+                    for k, v in self.memory.all_records().items()
+                    if v["category"] == filter_value
+                }
+                if not records:
+                    return f"No memories found in category: {filter_value}"
+                return self._format_memory_listing(records)
+            if filter_type in {"importance", "important"}:
+                if not self.memory.is_valid_importance(filter_value):
+                    return "Invalid importance. Use one of: " + ", ".join(sorted(VALID_IMPORTANCE))
+                records = {
+                    k: v
+                    for k, v in self.memory.all_records().items()
+                    if v["importance"] == filter_value
+                }
+                if not records:
+                    return f"No memories found with importance: {filter_value}"
+                return self._format_memory_listing(records)
+            return "Usage: recall category <category> or recall important <level>"
+
+        if kind in {"recall_search", "memory_search"}:
+            query = remainder.split(None, 1)[1] if len(remainder.split(None, 1)) > 1 else ""
+            if not query:
+                return "Usage: memory search <query>"
+            results = self.memory.search(query)
+            if not results:
+                return "No matching memories found."
+            return self._format_memory_listing(results)
+
+        if kind == "memory_stats":
+            summary = self.memory.stats()
+            lines = [
+                f"Total memories: {summary['total']}",
+                "Importance:",
+            ]
+            lines += [f"  {level}: {count}" for level, count in summary["importance"].items()]
+            if summary["categories"]:
+                lines.append("Categories:")
+                lines += [f"  {category}: {count}" for category, count in summary["categories"].items()]
+            return "\n".join(lines)
 
         if kind == "recall_bad":
             return "Usage: recall <key>"
@@ -159,14 +272,12 @@ class CommandController:
             return "Usage: remember <key> = <value>"
 
         if kind == "remember":
-            key, value = remainder.split("=", 1)
-            key = key.strip()
-            value = value.strip()
+            key, value, category, importance = self._parse_remember_options(remainder)
             if not key or not value:
                 return "Usage: remember <key> = <value>"
             if not self.memory.is_valid_key(key):
                 return "Invalid key. Use only letters, numbers, '_' or '-' (max 64 characters)."
-            _, msg = self.memory.remember(key, value)
+            _, msg = self.memory.remember(key, value, category=category, importance=importance)
             return msg
 
         return None
