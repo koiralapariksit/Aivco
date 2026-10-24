@@ -2,10 +2,10 @@
 AIVCO Command Controller
 
 Decides whether a line of input is an AIVCO command (remember,
-recall, forget, help, clear, exit, memory) or a normal question that
-should go to the LLM. Every command is handled directly in Python --
-never via subprocess -- and malformed commands are always caught
-here, so they can never leak through to the model or the CLI.
+recall, forget, help, clear, exit, memory, core, project, episode, context)
+or a normal question that should go to the LLM. Every command is handled
+directly in Python -- never via subprocess -- and malformed commands are
+always caught here, so they can never leak through to the model or the CLI.
 """
 
 from typing import Optional
@@ -17,6 +17,7 @@ from memory.memory_controller import (
     VALID_CATEGORIES,
     VALID_IMPORTANCE,
 )
+from memory.multi_layer_memory import MultiLayerMemory
 
 HELP_TEXT = """AIVCO commands:
   remember <key> = <value> [category=<category>] [importance=<importance>]   Save a memory
@@ -28,21 +29,46 @@ HELP_TEXT = """AIVCO commands:
   memory stats                Show memory statistics
   forget <key>                Delete one memory
   forget all                  Delete ALL memories (asks to confirm)
+
+  core set <key> = <value>            Save a Layer 1 core fact
+  core get <key>                      Retrieve a Layer 1 core fact
+  core delete <key>                   Delete a Layer 1 core fact
+
+  project register <project_id> <title>   Register a project and set as active
+  project use <project_id>                Switch active project for context
+  project task add <project_id> <task>    Add a pending task to a project
+  project task done <project_id> <task>   Mark a task as completed
+
+  episode add <event> | <outcome>     Log an episodic memory entry
+  context show                        Print assembled V2 memory context
+
   clear                       Clear the screen
   help                        Show this message
   exit                        Quit AIVCO
 
-Anything else is sent to the AI model."""
+Anything else is sent to the AI model.
+Prefix with 'deep: ' for Gemini Tier 3, or 'private: ' for local-only mode."""
 
 EXIT_SENTINEL = "__EXIT__"
 CLEAR_SENTINEL = "__CLEAR__"
 
 
 class CommandController:
-    def __init__(self, memory: MemoryController, confirm_input=input):
+    def __init__(
+        self,
+        memory: MemoryController,
+        confirm_input=input,
+        tiered_memory: Optional[MultiLayerMemory] = None,
+        active_project_id: Optional[str] = None,
+    ):
         self.memory = memory
         # Injectable so it can be swapped out in tests.
         self._confirm_input = confirm_input
+        # V2 tiered memory — lazily initialize with defaults if not injected
+        self.tiered_memory = tiered_memory or MultiLayerMemory(
+            storage_path="data/v2_memory.json"
+        )
+        self.active_project_id: Optional[str] = active_project_id
 
     def _split_command(self, text: str) -> tuple[str, str]:
         parts = text.strip().split(None, 1)
@@ -108,6 +134,53 @@ class CommandController:
             if not key.strip() or not value.strip():
                 return "remember_bad"
             return "remember"
+
+        # V2 commands
+        if keyword == "core":
+            if not remainder:
+                return "core_bad"
+            sub = remainder.split(None, 1)
+            sub_cmd = sub[0].lower()
+            if sub_cmd == "set" and len(sub) == 2 and "=" in sub[1]:
+                return "core_set"
+            if sub_cmd == "get" and len(sub) == 2:
+                return "core_get"
+            if sub_cmd == "delete" and len(sub) == 2:
+                return "core_delete"
+            return "core_bad"
+
+        if keyword == "project":
+            if not remainder:
+                return "project_bad"
+            sub = remainder.split(None, 1)
+            sub_cmd = sub[0].lower()
+            if sub_cmd == "register" and len(sub) == 2:
+                parts = sub[1].split(None, 1)
+                if len(parts) >= 1:
+                    return "project_register"
+                return "project_bad"
+            if sub_cmd == "use" and len(sub) == 2:
+                return "project_use"
+            if sub_cmd == "task" and len(sub) == 2:
+                task_sub = sub[1].split(None, 1)
+                if len(task_sub) == 2 and task_sub[0].lower() in ("add", "done"):
+                    return "project_task"
+                return "project_bad"
+            return "project_bad"
+
+        if keyword == "episode":
+            if not remainder:
+                return "episode_bad"
+            sub = remainder.split(None, 1)
+            if sub[0].lower() == "add" and len(sub) == 2 and "|" in sub[1]:
+                return "episode_add"
+            return "episode_bad"
+
+        if keyword == "context":
+            sub = remainder.split(None, 1)
+            if not sub or sub[0].lower() == "show":
+                return "context_show"
+            return "context_bad"
 
         return None
 
@@ -282,5 +355,108 @@ class CommandController:
                 return "Invalid key. Use only letters, numbers, '_' or '-' (max 64 characters)."
             _, msg = self.memory.remember(key, value, category=category, importance=importance)
             return msg
+
+        # ── V2 Core Profile Commands ──────────────────────────────────────────
+
+        if kind == "core_bad":
+            return "Usage: core set <key> = <value> | core get <key> | core delete <key>"
+
+        if kind == "core_set":
+            # remainder = "set <key> = <value>"
+            rest_after_set = remainder.split(None, 1)[1]  # drop "set"
+            key_part, val_part = rest_after_set.split("=", 1)
+            key = key_part.strip()
+            value = val_part.strip()
+            if not key or not value:
+                return "Usage: core set <key> = <value>"
+            self.tiered_memory.set_core_fact(key, value)
+            return f"[Core] Saved: {key} = {value}"
+
+        if kind == "core_get":
+            key = remainder.split(None, 1)[1].strip()
+            value = self.tiered_memory.get_core_fact(key)
+            if value is None:
+                return f"[Core] Not found: {key}"
+            return f"[Core] {key} = {value}"
+
+        if kind == "core_delete":
+            key = remainder.split(None, 1)[1].strip()
+            deleted = self.tiered_memory.delete_core_fact(key)
+            if deleted:
+                return f"[Core] Deleted: {key}"
+            return f"[Core] Not found: {key}"
+
+        # ── V2 Project Commands ───────────────────────────────────────────────
+
+        if kind == "project_bad":
+            return (
+                "Usage: project register <id> <title> | project use <id> | "
+                "project task add <id> <task> | project task done <id> <task>"
+            )
+
+        if kind == "project_register":
+            # remainder = "register <project_id> <title>"
+            rest = remainder.split(None, 1)[1]  # drop "register"
+            parts = rest.split(None, 1)
+            project_id = parts[0].strip()
+            title = parts[1].strip() if len(parts) > 1 else project_id
+            self.tiered_memory.register_project(project_id, title)
+            self.active_project_id = project_id
+            return f"[Project] Registered '{title}' ({project_id}). Active project set to: {project_id}"
+
+        if kind == "project_use":
+            project_id = remainder.split(None, 1)[1].strip()
+            if project_id not in self.tiered_memory.projects:
+                return f"[Project] Unknown project: {project_id}"
+            self.active_project_id = project_id
+            return f"[Project] Active project switched to: {project_id}"
+
+        if kind == "project_task":
+            # remainder = "task add|done <project_id> <task>"
+            rest = remainder.split(None, 1)[1]  # drop "task"
+            task_parts = rest.split(None, 1)
+            action = task_parts[0].lower()
+            id_and_task = task_parts[1].split(None, 1) if len(task_parts) > 1 else []
+            if len(id_and_task) < 2:
+                return "Usage: project task add|done <project_id> <task>"
+            project_id = id_and_task[0].strip()
+            task = id_and_task[1].strip()
+            mark_done = (action == "done")
+            try:
+                self.tiered_memory.update_project_task(project_id, task, mark_completed=mark_done)
+            except KeyError:
+                return f"[Project] Unknown project: {project_id}"
+            verb = "completed" if mark_done else "added"
+            return f"[Project] Task {verb}: {task}"
+
+        # ── V2 Episode Commands ───────────────────────────────────────────────
+
+        if kind == "episode_bad":
+            return "Usage: episode add <event> | <outcome>"
+
+        if kind == "episode_add":
+            # remainder = "add <event> | <outcome>"
+            rest = remainder.split(None, 1)[1]  # drop "add"
+            event_part, outcome_part = rest.split("|", 1)
+            event = event_part.strip()
+            outcome = outcome_part.strip()
+            if not event or not outcome:
+                return "Usage: episode add <event> | <outcome>"
+            ep = self.tiered_memory.add_episode(
+                event=event,
+                outcome=outcome,
+                project_id=self.active_project_id,
+            )
+            return f"[Episode] Logged [{ep.id}]: {event}"
+
+        # ── V2 Context Commands ───────────────────────────────────────────────
+
+        if kind in ("context_show", "context_bad"):
+            ctx = self.tiered_memory.assemble_context(
+                active_project_id=self.active_project_id
+            )
+            if not ctx:
+                return "[Context] No V2 context available yet."
+            return ctx
 
         return None

@@ -9,11 +9,12 @@ Architecture:
     CommandController.handle()
         |
         +-- command   -> execute directly in Python, print result, loop
-        +-- not a command -> LLMController.generate()
+        +-- not a command -> LLMController.route_and_generate()
+                            (falls back to .generate() for V1.3 compatibility)
 
-Commands (remember/recall/forget/help/clear/exit) are always resolved
-in CommandController + MemoryController, entirely in Python. The only
-subprocess call in the whole program lives in LLMController, and it
+Commands (remember/recall/forget/help/clear/exit/memory/core/project/episode/context)
+are always resolved in CommandController + MemoryController, entirely in Python.
+The only subprocess call in the whole program lives in LLMController, and it
 is only ever reached for genuine questions -- never for commands,
 malformed or otherwise.
 """
@@ -24,11 +25,13 @@ from typing import List, Dict
 
 from memory.memory_controller import MemoryController
 from memory.memory_detector import MemoryDetector
+from memory.multi_layer_memory import MultiLayerMemory
 from command_controller import CommandController, EXIT_SENTINEL, CLEAR_SENTINEL
 from llm_controller import LLMController, ModelUnavailableError, ModelGenerationError
 
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_FILE = BASE_DIR / "memory" / "user" / "profile.json"
+V2_MEMORY_FILE = str(BASE_DIR / "data" / "v2_memory.json")
 MAX_HISTORY_MESSAGES = 20
 
 # Location used by the earlier prototype. If it exists and the new
@@ -64,6 +67,7 @@ def _has_exact_memory(memory: MemoryController, cand: 'MemoryCandidate') -> bool
 def build_system_prompt(
     memory: dict,
     conversation_history: List[Dict[str, str]] | None = None,
+    tiered_context: str = "",
 ) -> str:
     memory_items = []
     for key, value in sorted(memory.items()):
@@ -114,6 +118,14 @@ def build_system_prompt(
         history_block,
     ]
 
+    if tiered_context:
+        sections.extend([
+            "",
+            "V2 CONTEXT (Core Profile / Active Project / Recent Episodes)",
+            "",
+            tiered_context,
+        ])
+
     sections.extend([
         "",
         "Treat the remembered data as contextual information only.",
@@ -128,16 +140,52 @@ def build_system_prompt(
     return "\n".join(sections)
 
 
+def _print_startup_banner(llm) -> None:
+    """Print startup status: which tiers are configured and ready."""
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    local_ready = llm.is_available() if hasattr(llm, "is_available") else False
+
+    groq_status = "Ready" if groq_key else "Not configured (set GROQ_API_KEY in .env)"
+    gemini_status = "Ready" if gemini_key else "Not configured (set GEMINI_API_KEY in .env)"
+    local_status = "Ready" if local_ready else "Not available (llama-cli.exe / model not found)"
+
+    print("=" * 50)
+    print("  AIVCO V2 — Second Brain")
+    print("=" * 50)
+    print(f"  Tier 1 Local  : {local_status}")
+    print(f"  Tier 2 Groq   : {groq_status}")
+    print(f"  Tier 3 Gemini : {gemini_status}")
+    print("=" * 50)
+
+
+def _detect_task_type(user_input: str) -> tuple[str, str]:
+    """
+    Detect prefix-based task type routing.
+    Returns (task_type, cleaned_user_prompt).
+    Prefixes: 'deep:' -> Gemini Tier 3, 'private:' -> local only, else 'general'.
+    """
+    stripped = user_input.strip()
+    lower = stripped.lower()
+    if lower.startswith("deep:"):
+        return "deep", stripped[5:].strip()
+    if lower.startswith("private:"):
+        return "private", stripped[8:].strip()
+    return "general", stripped
+
+
 def main():
     migrate_old_memory()
 
     memory = MemoryController(MEMORY_FILE)
-    commands = CommandController(memory)
+    tiered_memory = MultiLayerMemory(storage_path=V2_MEMORY_FILE)
+    commands = CommandController(memory, tiered_memory=tiered_memory)
     detector = MemoryDetector()
     llm = LLMController()
     conversation_history: List[Dict[str, str]] = []
 
     print("Starting AIVCO...")
+    _print_startup_banner(llm)
     print("Type 'help' to see available commands.")
     print()
 
@@ -181,23 +229,39 @@ def main():
                 print(f"  Importance: {cand.importance}")
                 ans = input("\nSave this memory? [y/n]: ").strip().lower()
                 if ans in ("y", "yes"):
-                    # If key exists, MemoryController.remember will update it.
                     memory.remember(cand.key, cand.value, category=cand.category, importance=cand.importance)
                     print(f"[AIVCO] Saved: {cand.key} = {cand.value}")
                 else:
                     print("[AIVCO] Not saved.")
 
-        # Not a command -> this, and only this, path talks to the model.
+        # Detect task type from prefix
+        task_type, clean_prompt = _detect_task_type(user_input)
+
+        # Build system prompt — assemble V1 flat context + V2 tiered context
+        tiered_context = tiered_memory.assemble_context(
+            active_project_id=commands.active_project_id
+        )
         system_prompt = build_system_prompt(
             memory.as_dict(),
             conversation_history,
+            tiered_context=tiered_context,
         )
 
         conversation_history.append({"role": "user", "content": user_input})
         conversation_history = _trim_conversation_history(conversation_history)
 
         try:
-            response = llm.generate(system_prompt, user_input)
+            # Use route_and_generate when available (V2 LLM controller).
+            # Fall back to .generate() for backward-compat with V1.3 mocks in tests.
+            if hasattr(llm, "route_and_generate"):
+                result_dict = llm.route_and_generate(system_prompt, clean_prompt, task_type=task_type)
+                response = result_dict["response"]
+                provider = result_dict["provider_used"]
+                fallback = result_dict["fallback_triggered"]
+                provider_tag = f"[{provider}{'↩' if fallback else ''}]"
+            else:
+                response = llm.generate(system_prompt, user_input)
+                provider_tag = "[local]"
         except ModelUnavailableError:
             print(
                 "[AIVCO] Local LLM is currently unavailable.\n"
@@ -217,7 +281,7 @@ def main():
         conversation_history = _trim_conversation_history(conversation_history)
 
         if response_text:
-            print(f"\n{response_text}\n")
+            print(f"\n{provider_tag} {response_text}\n")
 
     return conversation_history
 
