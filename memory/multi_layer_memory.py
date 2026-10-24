@@ -53,6 +53,10 @@ class MultiLayerMemory:
         self.projects: Dict[str, ProjectState] = {}
         self.active_project_id: Optional[str] = None
         self.load()
+        # Auto-select single project if active_project_id is not set
+        if not self.active_project_id and len(self.projects) == 1:
+            self.active_project_id = next(iter(self.projects.keys()))
+            self.save()
 
     # --- Active Project Management ---
     def set_active_project(self, project_id: Optional[str]) -> None:

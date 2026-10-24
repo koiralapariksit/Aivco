@@ -1,3 +1,4 @@
+import json
 import os
 import pytest
 from memory.multi_layer_memory import MultiLayerMemory, CoreFact, Episode, ProjectState
@@ -157,7 +158,31 @@ def test_active_project_persistence(tmp_path):
     reloaded = MultiLayerMemory(storage_path=storage_file)
     assert reloaded.get_active_project() == "proj1"
 
-    # Clear active project by setting to None
+    # Auto-select single project when active_project_id is None
+    single_proj_file = str(tmp_path / "test_single_proj.json")
+    with open(single_proj_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "version": "2.0-tiered",
+            "active_project_id": None,
+            "core_profile": {},
+            "episodes": [],
+            "projects": {
+                "solo": {
+                    "project_id": "solo",
+                    "title": "Solo Project",
+                    "status": "active",
+                    "tech_stack": [],
+                    "completed_milestones": [],
+                    "pending_tasks": [],
+                    "known_issues": [],
+                    "last_updated": "2026-10-24T00:00:00"
+                }
+            }
+        }, f)
+    solo_mem = MultiLayerMemory(storage_path=single_proj_file)
+    assert solo_mem.get_active_project() == "solo"
+
+    # Clear active project by setting to None (on a multi-project file so it doesn't auto-select)
     reloaded.set_active_project(None)
     assert reloaded.get_active_project() is None
 

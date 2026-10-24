@@ -237,6 +237,11 @@ def main():
         # Detect task type from prefix
         task_type, clean_prompt = _detect_task_type(user_input)
 
+        # Ensure active_project_id is synced before context assembly
+        effective_active_proj = commands.active_project_id or tiered_memory.get_active_project()
+        if commands.active_project_id is None and effective_active_proj is not None:
+            commands.active_project_id = effective_active_proj
+
         # Build system prompt — assemble V1 flat context + V2 tiered context
         tiered_context = tiered_memory.assemble_context(
             active_project_id=commands.active_project_id
