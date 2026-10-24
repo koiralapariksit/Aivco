@@ -11,6 +11,7 @@ Supports:
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Dict, List, Optional
 import urllib.error
 import urllib.request
@@ -37,29 +38,57 @@ class ModelGenerationError(AIVCOModelError):
 def load_env_file(env_path: str = ".env") -> None:
     """
     Zero-dependency .env loader.
-    Reads line-by-line, ignores empty lines and comments (#),
-    splits on first '=' and sets os.environ using setdefault.
+    Resolves relative path to project root if default '.env' is passed.
+    Supports utf-8-sig (BOM) and utf-16 fallbacks for Windows Notepad.
+    Auto-detects raw API keys (gsk_ -> GROQ_API_KEY, AIza -> GEMINI_API_KEY).
+    Maps GOOGLE_API_KEY alias to GEMINI_API_KEY.
     """
-    if not os.path.exists(env_path):
+    path_obj = Path(env_path)
+    if env_path == ".env" and not path_obj.is_absolute():
+        path_obj = Path(__file__).resolve().parent / ".env"
+
+    if not path_obj.exists():
         return
 
+    raw_bytes = None
     try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, val = line.split("=", 1)
-                    key = key.strip()
-                    val = val.strip()
-                    if (val.startswith('"') and val.endswith('"')) or (
-                        val.startswith("'") and val.endswith("'")
-                    ):
-                        val = val[1:-1]
-                    os.environ.setdefault(key, val)
+        raw_bytes = path_obj.read_bytes()
     except OSError:
-        pass
+        return
+
+    content = ""
+    # Try encodings: utf-8-sig (handles UTF-8 with and without BOM), utf-16, latin1
+    for enc in ("utf-8-sig", "utf-16", "utf-8", "latin1"):
+        try:
+            content = raw_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if (val.startswith('"') and val.endswith('"')) or (
+                val.startswith("'") and val.endswith("'")
+            ):
+                val = val[1:-1]
+
+            os.environ.setdefault(key, val)
+            if key == "GOOGLE_API_KEY":
+                os.environ.setdefault("GEMINI_API_KEY", val)
+        else:
+            # Smart Key Detection (Safe Auto-Mapping for raw pasted keys)
+            clean_val = line.strip().strip('"').strip("'")
+            if clean_val.startswith("gsk_"):
+                os.environ.setdefault("GROQ_API_KEY", clean_val)
+            elif clean_val.startswith("AIza"):
+                os.environ.setdefault("GEMINI_API_KEY", clean_val)
 
 
 class LLMController:
@@ -126,7 +155,7 @@ class LLMController:
         self,
         system_prompt: str,
         user_prompt: str,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "openai/gpt-oss-120b",
     ) -> str:
         api_key = os.environ.get("GROQ_API_KEY", "").strip()
         if not api_key:
@@ -160,7 +189,7 @@ class LLMController:
         self,
         system_prompt: str,
         user_prompt: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-flash-latest",
     ) -> str:
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key:
@@ -228,7 +257,7 @@ class LLMController:
                 ("local_llama", self.generate),
             ]
 
-        last_error = None
+        errors = []
         for idx, (provider_name, provider_fn) in enumerate(chain):
             try:
                 response = provider_fn(system_prompt, user_prompt)
@@ -238,9 +267,21 @@ class LLMController:
                     "fallback_triggered": idx > 0,
                 }
             except AIVCOModelError as exc:
-                last_error = exc
+                errors.append((provider_name, exc))
                 continue
 
-        if last_error:
-            raise last_error
+        # If all providers failed:
+        # Check if any cloud provider failed with ModelGenerationError (e.g. HTTP 400/401/403/429/etc.)
+        cloud_generation_errors = [
+            (name, err)
+            for name, err in errors
+            if name != "local_llama" and isinstance(err, ModelGenerationError)
+        ]
+        if cloud_generation_errors:
+            err_details = "; ".join(f"[{name}] {str(err)}" for name, err in cloud_generation_errors)
+            raise ModelGenerationError(f"Cloud model generation failed: {err_details}")
+
+        # If the last error was recorded, raise it (e.g. ModelUnavailableError)
+        if errors:
+            raise errors[-1][1]
         raise ModelUnavailableError("No model provider available.")

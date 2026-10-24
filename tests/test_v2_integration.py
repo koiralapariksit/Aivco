@@ -191,9 +191,23 @@ class TestEpisodeAndContextCommands:
         assert "### Recent History / Lessons Learned" in result
         assert "Architecture review" in result
 
+    def test_episode_add_without_pipe_defaults_outcome_to_logged(self, v2_setup):
+        ctrl, mem = v2_setup
+        result = ctrl.handle("episode add Read chapter 3 on neural networks")
+        assert "[Episode] Logged" in result
+        assert len(mem.episodes) == 1
+        assert mem.episodes[0].event == "Read chapter 3 on neural networks"
+        assert mem.episodes[0].outcome == "logged"
+
+    def test_handle_strips_accidental_backticks(self, v2_setup):
+        ctrl, mem = v2_setup
+        result = ctrl.handle("`core set editor = VSCode`")
+        assert "[Core] Saved: editor = VSCode" in result
+        assert mem.get_core_fact("editor") == "VSCode"
+
     def test_episode_bad_usage(self, v2_setup):
         ctrl, _ = v2_setup
-        result = ctrl.handle("episode add No pipe separator here")
+        result = ctrl.handle("episode add")
         assert "Usage" in result
 
         result2 = ctrl.handle("episode")

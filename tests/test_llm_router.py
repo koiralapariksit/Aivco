@@ -139,3 +139,54 @@ def test_route_and_generate_all_fail_raises():
         with pytest.raises(AIVCOModelError):
             ctrl.route_and_generate("sys", "user", task_type="general")
 
+
+def test_load_env_file_utf8_sig_and_raw_keys(tmp_path):
+    env_file = tmp_path / ".env"
+    # Write with utf-8-sig BOM and raw keys (no '=' sign)
+    content = (
+        "\ufeff# Windows Notepad saved file\n"
+        "gsk_test1234567890abcdef\n"
+        "AIzaSyTestGeminiKey12345\n"
+        "GOOGLE_API_KEY=test_google_alias_key\n"
+    )
+    env_file.write_bytes(content.encode("utf-8-sig"))
+
+    for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        os.environ.pop(k, None)
+
+    load_env_file(str(env_file))
+
+    assert os.environ.get("GROQ_API_KEY") == "gsk_test1234567890abcdef"
+    # Note: AIza comes first, so setdefault sets it, or if alias sets it:
+    assert os.environ.get("GEMINI_API_KEY") == "AIzaSyTestGeminiKey12345"
+
+    for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        os.environ.pop(k, None)
+
+
+def test_load_env_file_google_alias_mapping(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("GOOGLE_API_KEY=test_alias_only\n", encoding="utf-8")
+
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        os.environ.pop(k, None)
+
+    load_env_file(str(env_file))
+    assert os.environ.get("GEMINI_API_KEY") == "test_alias_only"
+
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        os.environ.pop(k, None)
+
+
+def test_route_and_generate_preserves_cloud_generation_error_details():
+    ctrl = LLMController()
+    with patch.object(ctrl, "_generate_groq", side_effect=ModelGenerationError("HTTP 401: Unauthorized")), \
+         patch.object(ctrl, "_generate_gemini", side_effect=ModelGenerationError("HTTP 403: Forbidden")), \
+         patch.object(ctrl, "generate", side_effect=ModelUnavailableError("Local binary missing")):
+        with pytest.raises(ModelGenerationError) as exc_info:
+            ctrl.route_and_generate("sys", "user", task_type="general")
+        assert "Cloud model generation failed" in str(exc_info.value)
+        assert "[groq] Groq generation failed: HTTP 401" in str(exc_info.value) or "HTTP 401" in str(exc_info.value)
+        assert "HTTP 403" in str(exc_info.value)
+
+
