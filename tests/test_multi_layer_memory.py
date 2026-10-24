@@ -134,6 +134,41 @@ def test_project_task_state_machine(tmp_path):
     assert "Write unit test suite" in reloaded.projects["aivco"].pending_tasks
 
 
+def test_active_project_persistence(tmp_path):
+    storage_file = str(tmp_path / "test_active_project.json")
+    mem = MultiLayerMemory(storage_path=storage_file)
+
+    # Initial state
+    assert mem.get_active_project() is None
+
+    # Register project automatically sets active project
+    mem.register_project("proj1", "Project 1")
+    assert mem.get_active_project() == "proj1"
+
+    # Register second project updates active project
+    mem.register_project("proj2", "Project 2")
+    assert mem.get_active_project() == "proj2"
+
+    # Explicitly set active project
+    mem.set_active_project("proj1")
+    assert mem.get_active_project() == "proj1"
+
+    # Reload from disk into new instance
+    reloaded = MultiLayerMemory(storage_path=storage_file)
+    assert reloaded.get_active_project() == "proj1"
+
+    # Clear active project by setting to None
+    reloaded.set_active_project(None)
+    assert reloaded.get_active_project() is None
+
+    reloaded_cleared = MultiLayerMemory(storage_path=storage_file)
+    assert reloaded_cleared.get_active_project() is None
+
+    # Setting unknown project raises KeyError
+    with pytest.raises(KeyError):
+        reloaded.set_active_project("unknown_project_id")
+
+
 def test_context_assembly_output(tmp_path):
     storage_file = str(tmp_path / "test_context.json")
     mem = MultiLayerMemory(storage_path=storage_file)

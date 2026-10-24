@@ -150,6 +150,64 @@ class TestProjectCommands:
         ctrl.handle("project task add p1 Deploy service")
         assert mem.projects["p1"].pending_tasks.count("Deploy service") == 1
 
+    def test_project_list_empty(self, v2_setup):
+        ctrl, _ = v2_setup
+        result = ctrl.handle("project list")
+        assert "No registered projects found" in result
+
+    def test_project_list_shows_projects_and_identifies_active(self, v2_setup):
+        ctrl, mem = v2_setup
+        mem.register_project("p1", "Project One", tech_stack=["Python"])
+        mem.register_project("p2", "Project Two", tech_stack=["Rust"])
+        ctrl.handle("project use p1")
+
+        result = ctrl.handle("project list")
+        assert "===== REGISTERED PROJECTS =====" in result
+        assert "* p1 (Active) - Project One" in result
+        assert "p2 - Project Two" in result
+
+    def test_project_status_with_and_without_target(self, v2_setup):
+        ctrl, mem = v2_setup
+        mem.register_project("p1", "Project One", tech_stack=["Python", "Pytest"])
+        mem.update_project_task("p1", "Setup CI", mark_completed=True)
+        mem.update_project_task("p1", "Deploy App", mark_completed=False)
+        ctrl.handle("project use p1")
+
+        # Without argument -> defaults to active project
+        res_active = ctrl.handle("project status")
+        assert "Project: Project One (p1) [Status: active]" in res_active
+        assert "Tech Stack: Python, Pytest" in res_active
+        assert "Completed Milestones (1):" in res_active
+        assert "- Setup CI" in res_active
+        assert "Pending Tasks (1):" in res_active
+        assert "- Deploy App" in res_active
+
+        # With explicit argument
+        res_explicit = ctrl.handle("project status p1")
+        assert "Project: Project One (p1)" in res_explicit
+
+        # With non-existent project
+        res_missing = ctrl.handle("project status nonexistent")
+        assert "No active project set" in res_missing or "Notice" in res_missing
+
+    def test_project_use_persists_to_disk(self, tmp_path):
+        v2_path = str(tmp_path / "v2_test.json")
+        flat_mem = MemoryController(tmp_path / "profile.json")
+        tiered_mem = MultiLayerMemory(storage_path=v2_path)
+        tiered_mem.register_project("proj_a", "Project Alpha")
+        tiered_mem.register_project("proj_b", "Project Beta")
+
+        ctrl = CommandController(memory=flat_mem, tiered_memory=tiered_mem)
+        ctrl.handle("project use proj_a")
+
+        # Reload new tiered memory from disk
+        reloaded_mem = MultiLayerMemory(storage_path=v2_path)
+        assert reloaded_mem.get_active_project() == "proj_a"
+
+        # Reload new controller without active_project_id parameter
+        reloaded_ctrl = CommandController(memory=flat_mem, tiered_memory=reloaded_mem)
+        assert reloaded_ctrl.active_project_id == "proj_a"
+
 
 # ── 3. Episode & Context CLI Commands ────────────────────────────────────────
 

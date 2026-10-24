@@ -36,6 +36,8 @@ HELP_TEXT = """AIVCO commands:
 
   project register <project_id> <title>   Register a project and set as active
   project use <project_id>                Switch active project for context
+  project list                            List all registered projects
+  project status [project_id]             Show project details and tasks
   project task add <project_id> <task>    Add a pending task to a project
   project task done <project_id> <task>   Mark a task as completed
 
@@ -68,7 +70,10 @@ class CommandController:
         self.tiered_memory = tiered_memory or MultiLayerMemory(
             storage_path="data/v2_memory.json"
         )
-        self.active_project_id: Optional[str] = active_project_id
+        if active_project_id is not None:
+            self.active_project_id: Optional[str] = active_project_id
+        else:
+            self.active_project_id = self.tiered_memory.get_active_project()
 
     def _split_command(self, text: str) -> tuple[str, str]:
         parts = text.strip().split(None, 1)
@@ -161,6 +166,10 @@ class CommandController:
                 return "project_bad"
             if sub_cmd == "use" and len(sub) == 2:
                 return "project_use"
+            if sub_cmd == "list" and len(sub) == 1:
+                return "project_list"
+            if sub_cmd == "status":
+                return "project_status"
             if sub_cmd == "task" and len(sub) == 2:
                 task_sub = sub[1].split(None, 1)
                 if len(task_sub) == 2 and task_sub[0].lower() in ("add", "done"):
@@ -172,7 +181,7 @@ class CommandController:
             if not remainder:
                 return "episode_bad"
             sub = remainder.split(None, 1)
-            if sub[0].lower() == "add" and len(sub) == 2 and "|" in sub[1]:
+            if sub[0].lower() == "add" and len(sub) == 2:
                 return "episode_add"
             return "episode_bad"
 
@@ -185,7 +194,7 @@ class CommandController:
         return None
 
     def is_command(self, raw_input: str) -> bool:
-        return self._classify(raw_input.strip()) is not None
+        return self._classify(raw_input.strip().strip("`").strip()) is not None
 
     def _format_memory_line(self, key: str, record: dict) -> str:
         return (
@@ -238,7 +247,7 @@ class CommandController:
           - "__CLEAR__"      -> caller should clear the screen
           - any other string -> command handled, print this message
         """
-        text = raw_input.strip()
+        text = raw_input.strip().strip("`").strip()
         kind = self._classify(text)
 
         if kind is None:
@@ -391,6 +400,7 @@ class CommandController:
         if kind == "project_bad":
             return (
                 "Usage: project register <id> <title> | project use <id> | "
+                "project list | project status [id] | "
                 "project task add <id> <task> | project task done <id> <task>"
             )
 
@@ -407,9 +417,51 @@ class CommandController:
         if kind == "project_use":
             project_id = remainder.split(None, 1)[1].strip()
             if project_id not in self.tiered_memory.projects:
-                return f"[Project] Unknown project: {project_id}"
+                return f"[Project] Error: Project '{project_id}' not found. (Unknown project)"
+            self.tiered_memory.set_active_project(project_id)
             self.active_project_id = project_id
             return f"[Project] Active project switched to: {project_id}"
+
+        if kind == "project_list":
+            if not self.tiered_memory.projects:
+                return "[Project] No registered projects found. Use 'project register <id> <title>' to create one."
+            lines = ["===== REGISTERED PROJECTS ====="]
+            current_active = self.active_project_id or self.tiered_memory.get_active_project()
+            for pid, proj in sorted(self.tiered_memory.projects.items()):
+                is_active = (pid == current_active)
+                marker = "* " if is_active else "  "
+                active_str = " (Active)" if is_active else ""
+                lines.append(
+                    f"{marker}{pid}{active_str} - {proj.title} "
+                    f"[{len(proj.completed_milestones)} milestones, {len(proj.pending_tasks)} pending]"
+                )
+            lines.append("===============================")
+            return "\n".join(lines)
+
+        if kind == "project_status":
+            tokens = remainder.split(None, 1)
+            target_id = tokens[1].strip() if len(tokens) > 1 else (self.active_project_id or self.tiered_memory.get_active_project())
+            if not target_id or target_id not in self.tiered_memory.projects:
+                return "[Project] No active project set. Specify one or use 'project use <id>'."
+            proj = self.tiered_memory.projects[target_id]
+            stack_str = ", ".join(proj.tech_stack) if proj.tech_stack else "None specified"
+            lines = [
+                f"Project: {proj.title} ({proj.project_id}) [Status: {proj.status}]",
+                f"Tech Stack: {stack_str}",
+                f"Completed Milestones ({len(proj.completed_milestones)}):",
+            ]
+            if proj.completed_milestones:
+                for m in proj.completed_milestones:
+                    lines.append(f"  - {m}")
+            else:
+                lines.append("  (None)")
+            lines.append(f"Pending Tasks ({len(proj.pending_tasks)}):")
+            if proj.pending_tasks:
+                for t in proj.pending_tasks:
+                    lines.append(f"  - {t}")
+            else:
+                lines.append("  (None)")
+            return "\n".join(lines)
 
         if kind == "project_task":
             # remainder = "task add|done <project_id> <task>"
@@ -435,12 +487,16 @@ class CommandController:
             return "Usage: episode add <event> | <outcome>"
 
         if kind == "episode_add":
-            # remainder = "add <event> | <outcome>"
+            # remainder = "add <event> [| <outcome>]"
             rest = remainder.split(None, 1)[1]  # drop "add"
-            event_part, outcome_part = rest.split("|", 1)
-            event = event_part.strip()
-            outcome = outcome_part.strip()
-            if not event or not outcome:
+            if "|" in rest:
+                event_part, outcome_part = rest.split("|", 1)
+                event = event_part.strip()
+                outcome = outcome_part.strip() or "logged"
+            else:
+                event = rest.strip()
+                outcome = "logged"
+            if not event:
                 return "Usage: episode add <event> | <outcome>"
             ep = self.tiered_memory.add_episode(
                 event=event,

@@ -51,7 +51,18 @@ class MultiLayerMemory:
         self.core_profile: Dict[str, CoreFact] = {}
         self.episodes: List[Episode] = []
         self.projects: Dict[str, ProjectState] = {}
+        self.active_project_id: Optional[str] = None
         self.load()
+
+    # --- Active Project Management ---
+    def set_active_project(self, project_id: Optional[str]) -> None:
+        if project_id is not None and project_id not in self.projects:
+            raise KeyError(f"Project '{project_id}' not found.")
+        self.active_project_id = project_id
+        self.save()
+
+    def get_active_project(self) -> Optional[str]:
+        return self.active_project_id
 
     # --- Layer 1: Core Profile ---
     def set_core_fact(self, key: str, value: str, importance: str = "high") -> CoreFact:
@@ -107,7 +118,7 @@ class MultiLayerMemory:
                 tech_stack=tech_stack or [],
             )
             self.projects[project_id] = proj
-        self.save()
+        self.set_active_project(project_id)
         return proj
 
     def update_project_task(
@@ -133,6 +144,9 @@ class MultiLayerMemory:
     def assemble_context(
         self, active_project_id: Optional[str] = None, max_episodes: int = 3
     ) -> str:
+        if active_project_id is None:
+            active_project_id = self.get_active_project()
+
         sections = []
 
         if self.core_profile:
@@ -165,6 +179,7 @@ class MultiLayerMemory:
         os.makedirs(os.path.dirname(self.storage_path) or ".", exist_ok=True)
         data = {
             "version": "2.0-tiered",
+            "active_project_id": self.active_project_id,
             "core_profile": {k: asdict(v) for k, v in self.core_profile.items()},
             "episodes": [asdict(e) for e in self.episodes],
             "projects": {k: asdict(v) for k, v in self.projects.items()},
@@ -181,6 +196,8 @@ class MultiLayerMemory:
 
             if not isinstance(data, dict):
                 return
+
+            self.active_project_id = data.get("active_project_id")
 
             self.core_profile = {}
             core_dict = data.get("core_profile")
@@ -202,5 +219,9 @@ class MultiLayerMemory:
                 for k, v in projects_dict.items():
                     if isinstance(v, dict):
                         self.projects[k] = ProjectState(**v)
+
+            # Validate loaded active_project_id exists in projects
+            if self.active_project_id and self.active_project_id not in self.projects:
+                self.active_project_id = None
         except Exception:
             pass
