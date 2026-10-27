@@ -20,7 +20,7 @@ LLAMA_PATH = r"C:\Users\koira\AppData\Local\Microsoft\WinGet\Packages\ggml.llama
 
 MODEL_PATH = r"C:\Users\koira\.cache\huggingface\hub\models--ggml-org--Qwen3-0.6B-GGUF\snapshots\b5f37287796e5be0ea3dab2e7430873fb3f73e49\Qwen3-0.6B-Q4_0.gguf"
 LLM_TIMEOUT_SECONDS = 180
-LLM_MAX_TOKENS = 32
+LLM_MAX_TOKENS = 512
 
 
 class AIVCOModelError(RuntimeError):
@@ -89,67 +89,42 @@ def load_env_file(env_path: str = ".env") -> None:
                 os.environ.setdefault("GROQ_API_KEY", clean_val)
             elif clean_val.startswith("AIza"):
                 os.environ.setdefault("GEMINI_API_KEY", clean_val)
+            elif clean_val.startswith("sk-ant-"):
+                os.environ.setdefault("ANTHROPIC_API_KEY", clean_val)
+            elif clean_val.startswith("sk-or-"):
+                os.environ.setdefault("OPENROUTER_API_KEY", clean_val)
+            elif clean_val.startswith("xai-"):
+                os.environ.setdefault("XAI_API_KEY", clean_val)
 
 
 class LLMController:
+    local_enabled: bool = False
+
     def __init__(
         self,
-        llama_path: str = LLAMA_PATH,
-        model_path: str = MODEL_PATH,
+        llama_path: Optional[str] = None,
+        model_path: Optional[str] = None,
         env_path: str = ".env",
     ):
-        self.llama_path = llama_path
-        self.model_path = model_path
+        self.local_enabled = False
         self.env_path = env_path
         load_env_file(self.env_path)
+        # Brain 2 (Local LLM) hard-killed to prevent OS crashes & RAM exhaustion
+        self.llama_path = None
+        self.model_path = None
 
     def is_available(self) -> bool:
-        return os.path.exists(self.llama_path) and os.path.exists(self.model_path)
+        return False
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
+    def _generate_local(self, system_prompt: str = "", user_prompt: str = "") -> str:
+        return "[aivco-kernel] Local LLM tier permanently disabled to conserve system RAM."
+
+    def generate(self, system_prompt: str = "", user_prompt: str = "") -> str:
         """
-        Runs one llama-cli generation and returns the generated text.
-        The subprocess is started as a finite, non-interactive prompt
-        so it cannot wait forever for extra user input.
+        Local LLM generation permanently disabled to conserve system RAM.
+        Raises ModelUnavailableError so callers know local LLM cannot be run.
         """
-        if not self.is_available():
-            raise ModelUnavailableError("Local LLM executable or model file is missing.")
-
-        try:
-            completed = subprocess.run(
-                [
-                    self.llama_path,
-                    "-m",
-                    self.model_path,
-                    "--system-prompt",
-                    system_prompt,
-                    "-p",
-                    user_prompt,
-                    "-n",
-                    str(LLM_MAX_TOKENS),
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ModelGenerationError(
-                f"Model generation timed out after {LLM_TIMEOUT_SECONDS} seconds."
-            ) from exc
-        except OSError as exc:
-            raise ModelGenerationError(
-                f"Unable to execute local model binary: {exc}"
-            ) from exc
-
-        if completed.returncode != 0:
-            details = (completed.stderr or completed.stdout or "no output").strip()
-            raise ModelGenerationError(
-                f"Model generation failed with exit code {completed.returncode}: {details}"
-            )
-
-        return completed.stdout.strip()
+        raise ModelUnavailableError("[aivco-kernel] Local LLM tier permanently disabled to conserve system RAM.")
 
     def _generate_groq(
         self,
@@ -222,25 +197,266 @@ class LLMController:
         except Exception as exc:
             raise ModelGenerationError(f"Gemini generation failed: {exc}") from exc
 
-    def route_and_generate(
+    def _call_openai_compatible(
         self,
+        endpoint_url: str,
+        api_key: str,
+        model: str,
         system_prompt: str,
         user_prompt: str,
+        extra_headers: Optional[Dict[str, str]] = None,
+        timeout: int = 40,
+    ) -> str:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "AIVCO/2.0",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
+        body = {"model": model, "messages": messages}
+        try:
+            req_data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(endpoint_url, data=req_data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_text = resp.read().decode("utf-8")
+                data = json.loads(resp_text)
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            raise ModelGenerationError(f"OpenAI-compatible request to {endpoint_url} failed: {exc}") from exc
+
+    def _generate_claude(self, system_prompt: str, user_prompt: str) -> str:
+        res, _ = self._generate_claude_with_meta(system_prompt, user_prompt)
+        return res
+
+    def _generate_claude_with_meta(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        # 1. Anthropic Direct API
+        ant_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
+        if ant_key:
+            try:
+                url = "https://api.anthropic.com/v1/messages"
+                headers = {
+                    "x-api-key": ant_key.strip(),
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                    "User-Agent": "AIVCO/2.0",
+                }
+                body = {
+                    "model": "claude-3-7-sonnet-20250219",
+                    "max_tokens": 1500,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_prompt}],
+                }
+                req_data = json.dumps(body).encode("utf-8")
+                req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=40) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    text = "".join(part.get("text", "") for part in data.get("content", []))
+                    if text:
+                        return text.strip(), "claude-3-7-sonnet"
+            except Exception:
+                pass
+
+        # 2. OpenRouter API
+        or_key = os.environ.get("OPENROUTER_API_KEY")
+        if or_key:
+            try:
+                res = self._call_openai_compatible(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    or_key.strip(),
+                    "anthropic/claude-3.7-sonnet",
+                    system_prompt,
+                    user_prompt,
+                    extra_headers={"HTTP-Referer": "https://aivco.org", "X-Title": "AIVCO"},
+                )
+                if res:
+                    return res, "openrouter:claude-3.7-sonnet"
+            except Exception:
+                pass
+
+        # 3. Web Account DOM Automation via UniversalWebAgent
+        from browser_agent import universal_web_agent
+        res = universal_web_agent.query("claude", user_prompt)
+        return res, "web-account:claude"
+
+    def _generate_chatgpt(self, system_prompt: str, user_prompt: str) -> str:
+        res, _ = self._generate_chatgpt_with_meta(system_prompt, user_prompt)
+        return res
+
+    def _generate_chatgpt_with_meta(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if openai_key:
+            try:
+                res = self._call_openai_compatible(
+                    "https://api.openai.com/v1/chat/completions",
+                    openai_key.strip(),
+                    "gpt-4o",
+                    system_prompt,
+                    user_prompt,
+                )
+                if res:
+                    return res, "gpt-4o"
+            except Exception:
+                pass
+
+        or_key = os.environ.get("OPENROUTER_API_KEY")
+        if or_key:
+            try:
+                res = self._call_openai_compatible(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    or_key.strip(),
+                    "openai/gpt-4o",
+                    system_prompt,
+                    user_prompt,
+                    extra_headers={"HTTP-Referer": "https://aivco.org", "X-Title": "AIVCO"},
+                )
+                if res:
+                    return res, "openrouter:gpt-4o"
+            except Exception:
+                pass
+
+        # 3. Web Account DOM Automation via UniversalWebAgent
+        from browser_agent import universal_web_agent
+        res = universal_web_agent.query("chatgpt", user_prompt)
+        return res, "web-account:chatgpt"
+
+    def _generate_grok(self, system_prompt: str, user_prompt: str) -> str:
+        res, _ = self._generate_grok_with_meta(system_prompt, user_prompt)
+        return res
+
+    def _generate_grok_with_meta(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        xai_key = os.environ.get("XAI_API_KEY")
+        if xai_key:
+            try:
+                res = self._call_openai_compatible(
+                    "https://api.x.ai/v1/chat/completions",
+                    xai_key.strip(),
+                    "grok-3",
+                    system_prompt,
+                    user_prompt,
+                )
+                if res:
+                    return res, "grok-3"
+            except Exception:
+                pass
+
+        or_key = os.environ.get("OPENROUTER_API_KEY")
+        if or_key:
+            try:
+                res = self._call_openai_compatible(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    or_key.strip(),
+                    "x-ai/grok-3",
+                    system_prompt,
+                    user_prompt,
+                    extra_headers={"HTTP-Referer": "https://aivco.org", "X-Title": "AIVCO"},
+                )
+                if res:
+                    return res, "openrouter:grok-3"
+            except Exception:
+                pass
+
+        # 3. Web Account DOM Automation via UniversalWebAgent
+        from browser_agent import universal_web_agent
+        res = universal_web_agent.query("grok", user_prompt)
+        return res, "web-account:grok"
+
+    def route_and_generate(
+        self,
+        system_prompt: str = "",
+        user_prompt: str = "",
         task_type: str = "general",
+        force_provider: Optional[str] = None,
+        **kwargs,
     ) -> dict:
         """
         Routes the prompt to the appropriate model tier with automatic fallback.
+        Supports forced provider override (force_provider="claude", "chatgpt", "grok", "gemini", "groq", "local_llama").
         Returns:
             {"response": str, "provider_used": str, "fallback_triggered": bool}
         """
-        # Rule 1: Tier 1 Strict Local (no fallback)
-        if task_type in ("private", "memory", "offline"):
-            response = self.generate(system_prompt, user_prompt)
+        # Rule 1: Forced Provider Selection
+        effective_force = force_provider or (task_type if task_type in ("claude", "chatgpt", "grok", "gemini_web", "claude_web", "chatgpt_web", "grok_web", "gemini", "groq", "local_llama", "local") else None)
+
+        WEB_PROVIDERS = ("claude", "chatgpt", "grok", "gemini_web", "gemini-web", "claude_web", "chatgpt_web", "grok_web")
+        if effective_force in WEB_PROVIDERS:
+            target = "gemini_web" if effective_force in ("gemini_web", "gemini-web") else effective_force.replace("_web", "")
+            from browser_agent import universal_web_agent
+            web_res = universal_web_agent.query(target, user_prompt)
             return {
-                "response": response,
-                "provider_used": "local_llama",
+                "response": web_res,
+                "provider_used": f"web-account:{target}",
                 "fallback_triggered": False,
             }
+
+        if effective_force in ("local", "local_llama") or task_type in ("private", "memory", "offline"):
+            try:
+                response = self.generate(system_prompt, user_prompt)
+                return {
+                    "response": response,
+                    "provider_used": "local_llama",
+                    "fallback_triggered": False,
+                }
+            except ModelUnavailableError:
+                raise ModelUnavailableError("Offline model execution failed. Cloud fallback blocked to protect privacy.")
+            except AIVCOModelError:
+                raise
+
+        if effective_force == "gemini":
+            try:
+                response = self._generate_gemini(system_prompt, user_prompt)
+                return {
+                    "response": response,
+                    "provider_used": "gemini",
+                    "fallback_triggered": False,
+                }
+            except AIVCOModelError:
+                # Fallback to Groq if Gemini fails
+                try:
+                    response = self._generate_groq(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": "groq (fallback from gemini)",
+                        "fallback_triggered": True,
+                    }
+                except AIVCOModelError:
+                    response = self.generate(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": "local_llama (fallback from gemini)",
+                        "fallback_triggered": True,
+                    }
+
+        if effective_force == "groq":
+            try:
+                response = self._generate_groq(system_prompt, user_prompt)
+                return {
+                    "response": response,
+                    "provider_used": "groq",
+                    "fallback_triggered": False,
+                }
+            except AIVCOModelError:
+                # Fallback to Gemini if Groq fails
+                try:
+                    response = self._generate_gemini(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": "gemini (fallback from groq)",
+                        "fallback_triggered": True,
+                    }
+                except AIVCOModelError:
+                    response = self.generate(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": "local_llama (fallback from groq)",
+                        "fallback_triggered": True,
+                    }
 
         # Rule 2: Tier 3 Deep / Large Context
         if task_type in ("deep", "research") or (len(system_prompt) + len(user_prompt) > 6000):

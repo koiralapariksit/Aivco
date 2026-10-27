@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "AIVCO Web AI Bridge",
+  "version": "1.0.0",
+  "description": "Bridges AIVCO commands directly to authenticated web AI tabs without bot detection.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "scripting",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "*://claude.ai/*",
+    "*://*.claude.ai/*",
+    "*://chatgpt.com/*",
+    "*://*.chatgpt.com/*",
+    "*://gemini.google.com/*",
+    "*://grok.com/*",
+    "*://*.grok.com/*",
+    "*://x.ai/*",
+    "*://*.x.ai/*",
+    "http://127.0.0.1:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AIVCO Web AI Bridge"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://claude.ai/*",
+        "*://*.claude.ai/*",
+        "*://chatgpt.com/*",
+        "*://*.chatgpt.com/*",
+        "*://gemini.google.com/*",
+        "*://grok.com/*",
+        "*://*.grok.com/*",
+        "*://x.ai/*",
+        "*://*.x.ai/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
+

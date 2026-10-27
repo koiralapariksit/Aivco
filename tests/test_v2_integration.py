@@ -357,6 +357,36 @@ class TestLLMRoutingIntegration:
         assert "expertise: Machine Learning" in system_prompt
         assert "hardware: Windows Workstation" in system_prompt
 
+    def test_cloud_safe_context_redaction(self, tmp_path):
+        """Verify cloud_safe=True scrubs private facts and credentials."""
+        mem = MultiLayerMemory(storage_path=str(tmp_path / "cloud_test.json"))
+        mem.set_core_fact("public_skill", "Python Programming")
+        mem.set_core_fact("secret_token", "super_secret_token_123")
+        mem.set_core_fact("private_note", "Confidential detail [private]")
+        mem.register_project("proj1", "Project One")
+        mem.update_project_task("proj1", "Public task", mark_completed=False)
+        mem.update_project_task("proj1", "Hidden task [private]", mark_completed=False)
+        mem.add_episode("Public event", "Success", project_id="proj1")
+        mem.add_episode("Private bugfix [private]", "Done", project_id="proj1")
+
+        # Full context (local)
+        local_ctx = mem.assemble_context(cloud_safe=False)
+        assert "super_secret_token_123" in local_ctx
+        assert "Confidential detail" in local_ctx
+        assert "Hidden task" in local_ctx
+        assert "Private bugfix" in local_ctx
+
+        # Cloud-safe context (Groq/Gemini)
+        cloud_ctx = mem.assemble_context(cloud_safe=True)
+        assert "Python Programming" in cloud_ctx
+        assert "Public task" in cloud_ctx
+        assert "Public event" in cloud_ctx
+        assert "super_secret_token_123" not in cloud_ctx
+        assert "secret_token" not in cloud_ctx
+        assert "Confidential detail" not in cloud_ctx
+        assert "Hidden task" not in cloud_ctx
+        assert "Private bugfix" not in cloud_ctx
+
     def test_route_and_generate_failure_falls_back_gracefully(self, tmp_path, monkeypatch, capsys):
         """When route_and_generate raises ModelUnavailableError, AIVCO shows the right message."""
         _, calls = self._run_main(

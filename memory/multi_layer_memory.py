@@ -22,6 +22,15 @@ class CoreFact:
     importance: str = "high"
     updated_at: str = field(default_factory=_utc_iso_now)
 
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.value.lower() == other.lower()
+        if isinstance(other, bool):
+            return (self.value.lower() in ("true", "1", "yes")) if other else (self.value.lower() in ("false", "0", "no"))
+        if isinstance(other, CoreFact):
+            return self.key == other.key and self.value == other.value and self.importance == other.importance
+        return False
+
 
 @dataclass
 class Episode:
@@ -52,6 +61,8 @@ class MultiLayerMemory:
         self.episodes: List[Episode] = []
         self.projects: Dict[str, ProjectState] = {}
         self.active_project_id: Optional[str] = None
+        # Subsystem 2: Learned facts cache (persisted in JSON)
+        self.learned_facts: List[dict] = []
         self.load()
         # Auto-select single project if active_project_id is not set
         if not self.active_project_id and len(self.projects) == 1:
@@ -77,7 +88,9 @@ class MultiLayerMemory:
 
     def get_core_fact(self, key: str) -> Optional[str]:
         fact = self.core_profile.get(key)
-        return fact.value if fact else None
+        if fact is None:
+            return None
+        return fact.value if isinstance(fact, CoreFact) else str(fact)
 
     def delete_core_fact(self, key: str) -> bool:
         if key in self.core_profile:
@@ -146,29 +159,76 @@ class MultiLayerMemory:
 
     # --- Layer 4: Context Assembly for the LLM ---
     def assemble_context(
-        self, active_project_id: Optional[str] = None, max_episodes: int = 3
+        self,
+        active_project_id: Optional[str] = None,
+        max_episodes: int = 3,
+        cloud_safe: bool = False,
     ) -> str:
+        # If memory is completely empty, return empty string
+        has_data = bool(self.core_profile or self.projects or self.episodes or getattr(self, "learned_facts", []))
+        if not has_data:
+            return ""
+
         if active_project_id is None:
             active_project_id = self.get_active_project()
 
         sections = []
 
+        # High-Priority Rule Injection (Strict Operator Directives at the very top)
+        directives = []
+        preferred_addr = self.get_core_fact("preferred_address") or "Sir"
+        directives.append(f"- Operator Address: Address the operator strictly as '{preferred_addr}' or 'AIvco'. Never address the operator by birth name unless asked.")
+
+        rules_fact = self.get_core_fact("rules")
+        if rules_fact:
+            directives.append(f"- Operating Rules: {rules_fact}")
+
+        concise_fact = self.get_core_fact("concise_mode")
+        if concise_fact and str(concise_fact).lower() in ("true", "1", "yes"):
+            directives.append("- Brevity Protocol: Keep casual chat and identity responses strictly concise (1-2 sentences). Elaborate only when deep technical code or architectural explanation is explicitly requested.")
+
+        for lf in getattr(self, "learned_facts", []):
+            if lf.get("fact_type") == "taught_rule" or "rule" in str(lf.get("fact_type", "")):
+                directives.append(f"- Learned Rule: '{lf.get('trigger', '')}' -> {lf.get('fact', '')}")
+
+        if directives:
+            sections.append("### STRICT OPERATOR DIRECTIVES (HIGHEST PRIORITY):\n" + "\n".join(directives))
+
         if self.core_profile:
-            core_lines = [f"- {fact.key}: {fact.value}" for fact in self.core_profile.values()]
-            sections.append("### Core Profile Context\n" + "\n".join(core_lines))
+            core_lines = []
+            for k, fact in self.core_profile.items():
+                if isinstance(fact, CoreFact):
+                    val = fact.value
+                    imp = fact.importance
+                else:
+                    val = str(fact)
+                    imp = "high"
+                # If cloud_safe, scrub sensitive data or facts marked with [private]
+                if cloud_safe:
+                    if "[private]" in val.lower() or imp == "private":
+                        continue
+                    # Redact potential raw credentials or tokens
+                    if any(s in k.lower() for s in ("token", "password", "secret", "api_key", "credential")):
+                        continue
+                core_lines.append(f"- {k}: {val}")
+            if core_lines:
+                sections.append("### Core Profile Context\n" + "\n".join(core_lines))
 
         if active_project_id and active_project_id in self.projects:
             proj = self.projects[active_project_id]
+            pending_filtered = [t for t in proj.pending_tasks if not (cloud_safe and "[private]" in t.lower())]
             proj_info = [
                 f"### Active Project: {proj.title} ({proj.project_id})",
                 f"- Status: {proj.status}",
                 f"- Stack: {', '.join(proj.tech_stack) if proj.tech_stack else 'N/A'}",
                 f"- Completed: {len(proj.completed_milestones)} milestones",
-                f"- Pending: {', '.join(proj.pending_tasks) if proj.pending_tasks else 'None'}",
+                f"- Pending: {', '.join(pending_filtered) if pending_filtered else 'None'}",
             ]
             sections.append("\n".join(proj_info))
 
         recent_eps = self.get_recent_episodes(limit=max_episodes, project_id=active_project_id)
+        if cloud_safe:
+            recent_eps = [e for e in recent_eps if "[private]" not in e.event.lower()]
         if recent_eps:
             ep_lines = [
                 f"- [{e.timestamp[:10]}] Event: {e.event} | Outcome: {e.outcome}"
@@ -181,12 +241,24 @@ class MultiLayerMemory:
     # --- Disk Storage ---
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.storage_path) or ".", exist_ok=True)
+        core_dict = {}
+        for k, v in self.core_profile.items():
+            if isinstance(v, CoreFact):
+                core_dict[k] = asdict(v)
+            else:
+                core_dict[k] = {
+                    "key": k,
+                    "value": str(v),
+                    "importance": "high",
+                    "updated_at": _utc_iso_now(),
+                }
         data = {
             "version": "2.0-tiered",
             "active_project_id": self.active_project_id,
-            "core_profile": {k: asdict(v) for k, v in self.core_profile.items()},
+            "core_profile": core_dict,
             "episodes": [asdict(e) for e in self.episodes],
             "projects": {k: asdict(v) for k, v in self.projects.items()},
+            "learned_facts": self.learned_facts,
         }
         with open(self.storage_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -223,6 +295,12 @@ class MultiLayerMemory:
                 for k, v in projects_dict.items():
                     if isinstance(v, dict):
                         self.projects[k] = ProjectState(**v)
+
+            # Load learned facts cache (Subsystem 2)
+            self.learned_facts = []
+            lf = data.get("learned_facts")
+            if isinstance(lf, list):
+                self.learned_facts = [e for e in lf if isinstance(e, dict)]
 
             # Validate loaded active_project_id exists in projects
             if self.active_project_id and self.active_project_id not in self.projects:

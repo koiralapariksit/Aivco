@@ -104,6 +104,16 @@ def test_route_and_generate_private_lock_never_calls_cloud():
         mock_groq.assert_not_called()
         mock_gemini.assert_not_called()
 
+    # Verify that if local_llama raises ModelUnavailableError under private lock, it raises privacy notice
+    with patch.object(ctrl, "generate", side_effect=ModelUnavailableError("missing binary")) as mock_llama, \
+         patch.object(ctrl, "_generate_groq") as mock_groq, \
+         patch.object(ctrl, "_generate_gemini") as mock_gemini:
+        with pytest.raises(ModelUnavailableError) as exc_info:
+            ctrl.route_and_generate("sys", "user", task_type="private")
+        assert "Cloud fallback blocked to protect privacy" in str(exc_info.value)
+        mock_groq.assert_not_called()
+        mock_gemini.assert_not_called()
+
 
 def test_route_and_generate_groq_failure_falls_back_to_gemini():
     ctrl = LLMController()

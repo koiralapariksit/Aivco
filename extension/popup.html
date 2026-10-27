@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AIVCO Web AI Bridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      background: #06090e;
+      color: #e2e8f0;
+      padding: 14px;
+      font-size: 12px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #1e293b;
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+    .title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #56E2F5;
+      letter-spacing: 0.5px;
+    }
+    .badge {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 9999px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .badge-connected {
+      background: rgba(16, 185, 129, 0.2);
+      color: #10b981;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .badge-disconnected {
+      background: rgba(239, 68, 68, 0.2);
+      color: #ef4444;
+      border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .tab-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .tab-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+    .tab-name {
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .dot-ready { background: #10b981; box-shadow: 0 0 6px #10b981; }
+    .dot-offline { background: #64748b; }
+    .instructions {
+      background: rgba(86, 226, 245, 0.05);
+      border: 1px solid rgba(86, 226, 245, 0.2);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+    .ws-info {
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 8px;
+      text-align: center;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">⚡ AIVCO WEB BRIDGE</div>
+    <div id="statusBadge" class="badge badge-disconnected">● Connecting...</div>
+  </div>
+
+  <div style="font-size: 11px; font-weight: 600; color: #94a3b8; margin-bottom: 6px; text-transform: uppercase;">
+    Detected AI Tabs
+  </div>
+
+  <div class="tab-list">
+    <div class="tab-item">
+      <div class="tab-name">
+        <span id="dot-claude" class="dot dot-offline"></span>
+        <span>Claude</span>
+      </div>
+      <span id="label-claude" style="font-size: 10px; color: #64748b;">Not Open</span>
+    </div>
+    <div class="tab-item">
+      <div class="tab-name">
+        <span id="dot-chatgpt" class="dot dot-offline"></span>
+        <span>ChatGPT</span>
+      </div>
+      <span id="label-chatgpt" style="font-size: 10px; color: #64748b;">Not Open</span>
+    </div>
+    <div class="tab-item">
+      <div class="tab-name">
+        <span id="dot-gemini" class="dot dot-offline"></span>
+        <span>Google Gemini</span>
+      </div>
+      <span id="label-gemini" style="font-size: 10px; color: #64748b;">Not Open</span>
+    </div>
+    <div class="tab-item">
+      <div class="tab-name">
+        <span id="dot-grok" class="dot dot-offline"></span>
+        <span>Grok</span>
+      </div>
+      <span id="label-grok" style="font-size: 10px; color: #64748b;">Not Open</span>
+    </div>
+  </div>
+
+  <div class="instructions">
+    💡 <b>Keep open:</b> Leave your logged-in AI tab open in any Chrome window. AIVCO will automate prompts without bot triggers.
+  </div>
+
+  <div class="ws-info">
+    Backend: <code id="wsEndpoint">ws://127.0.0.1:8000/ws/bridge</code>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
+

@@ -18,6 +18,7 @@ from memory.memory_controller import (
     VALID_IMPORTANCE,
 )
 from memory.multi_layer_memory import MultiLayerMemory
+from memory.dataset_logger import FineTuneDatasetLogger
 
 HELP_TEXT = """AIVCO commands:
   remember <key> = <value> [category=<category>] [importance=<importance>]   Save a memory
@@ -42,7 +43,14 @@ HELP_TEXT = """AIVCO commands:
   project task done <project_id> <task>   Mark a task as completed
 
   episode add <event> | <outcome>     Log an episodic memory entry
+  episode list                        List recent episodic memory entries
   context show                        Print assembled V2 memory context
+
+  teach <trigger> => <fact>           Teach AIVCO a permanent zero-LLM rule
+  kernel status                       Show Cognitive Kernel operational status
+
+  dataset stats                       Show fine-tune dataset entry count/sources
+  dataset export                      Print path to the fine-tune dataset file
 
   clear                       Clear the screen
   help                        Show this message
@@ -74,6 +82,8 @@ class CommandController:
             self.active_project_id: Optional[str] = active_project_id
         else:
             self.active_project_id = self.tiered_memory.get_active_project()
+        # Subsystem 4: Fine-tune dataset logger
+        self._dataset_logger = FineTuneDatasetLogger()
 
     def _split_command(self, text: str) -> tuple[str, str]:
         parts = text.strip().split(None, 1)
@@ -183,6 +193,8 @@ class CommandController:
             sub = remainder.split(None, 1)
             if sub[0].lower() == "add" and len(sub) == 2:
                 return "episode_add"
+            if sub[0].lower() == "list":
+                return "episode_list"
             return "episode_bad"
 
         if keyword == "context":
@@ -190,6 +202,26 @@ class CommandController:
             if not sub or sub[0].lower() == "show":
                 return "context_show"
             return "context_bad"
+
+        if keyword == "dataset":
+            if not remainder:
+                return "dataset_bad"
+            sub = remainder.split(None, 1)
+            if sub[0].lower() == "stats":
+                return "dataset_stats"
+            if sub[0].lower() == "export":
+                return "dataset_export"
+            return "dataset_bad"
+
+        if keyword == "teach":
+            if not remainder or "=>" not in remainder:
+                return "teach_bad"
+            return "teach"
+
+        if keyword == "kernel":
+            if not remainder or remainder.strip().lower() == "status":
+                return "kernel_status"
+            return "kernel_bad"
 
         return None
 
@@ -484,7 +516,19 @@ class CommandController:
         # ── V2 Episode Commands ───────────────────────────────────────────────
 
         if kind == "episode_bad":
-            return "Usage: episode add <event> | <outcome>"
+            return "Usage: episode add <event> | <outcome> | episode list"
+
+        if kind == "episode_list":
+            eps = self.tiered_memory.get_recent_episodes(limit=10, project_id=self.active_project_id)
+            if not eps:
+                return "[Episode] No episodes logged yet."
+            lines = ["===== RECENT EPISODES ====="]
+            for ep in eps:
+                date = ep.timestamp[:10] if ep.timestamp else "recent"
+                proj = f" [{ep.project_id}]" if ep.project_id else ""
+                lines.append(f"  [{date}]{proj} {ep.event} | {ep.outcome}")
+            lines.append("===========================")
+            return "\n".join(lines)
 
         if kind == "episode_add":
             # remainder = "add <event> [| <outcome>]"
@@ -514,5 +558,71 @@ class CommandController:
             if not ctx:
                 return "[Context] No V2 context available yet."
             return ctx
+
+        # ── Dataset Commands (Subsystem 4) ────────────────────────────────────
+
+        if kind == "dataset_stats":
+            return self._dataset_logger.format_stats_report()
+
+        if kind == "dataset_export":
+            return f"[Dataset] Export path: {self._dataset_logger.export_path()}"
+
+        if kind == "dataset_bad":
+            return "Usage: dataset stats | dataset export"
+
+        # ── Teach & Kernel Commands (Cognitive Kernel) ────────────────────────
+
+        if kind == "teach_bad":
+            return "Usage: teach <trigger> => <fact>"
+
+        if kind == "teach":
+            parts = remainder.split("=>", 1)
+            trigger = parts[0].strip()
+            fact = parts[1].strip()
+            if not trigger or not fact:
+                return "Usage: teach <trigger> => <fact>"
+
+            if not hasattr(self.tiered_memory, "learned_facts"):
+                self.tiered_memory.learned_facts = []
+
+            import re
+            keywords = [k for k in re.findall(r"\b\w+\b", trigger.lower()) if len(k) >= 3]
+            found = False
+            for entry in self.tiered_memory.learned_facts:
+                if entry.get("trigger", "").strip().lower() == trigger.lower() or entry.get("fact", "").strip().lower() == fact.lower():
+                    entry["trigger"] = trigger
+                    entry["trigger_keywords"] = keywords
+                    entry["fact"] = fact
+                    entry["hit_count"] = entry.get("hit_count", 0) + 1
+                    found = True
+                    break
+            if not found:
+                from datetime import datetime, timezone
+                self.tiered_memory.learned_facts.append({
+                    "trigger": trigger,
+                    "trigger_keywords": keywords,
+                    "fact": fact,
+                    "fact_type": "taught_rule",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "hit_count": 0,
+                })
+            self.tiered_memory.save()
+            pref = getattr(self.tiered_memory, "get_core_fact", lambda k: "Sir")("preferred_address") or "Sir"
+            return f"[aivco-kernel] Learned permanent rule, {pref}: '{trigger}' -> '{fact}'"
+
+        if kind == "kernel_status":
+            num_learned = len(getattr(self.tiered_memory, "learned_facts", []))
+            return (
+                "===== AIVCO COGNITIVE KERNEL STATUS =====\n"
+                "Stage 0/1 Zero-LLM Resolver : ACTIVE\n"
+                f"Learned Rules/Facts In-Memory: {num_learned}\n"
+                "Subsystem 2 Continuous Learn  : ACTIVE\n"
+                "Subsystem 3 Autonomous Arbiter: ACTIVE\n"
+                "Subsystem 4 Dataset Logger    : ACTIVE\n"
+                "=========================================="
+            )
+
+        if kind == "kernel_bad":
+            return "Usage: kernel status"
 
         return None

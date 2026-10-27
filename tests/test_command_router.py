@@ -450,3 +450,222 @@ def test_aivco_reports_model_unavailable_without_assistant_history(tmp_path, mon
     captured = capsys.readouterr().out
     assert "[AIVCO] Local LLM is currently unavailable." in captured
     assert history == [{"role": "user", "content": "who am I?"}]
+
+
+# ---------------------------------------------------------------------------
+# KernelCognitiveArbiter Tests & Sub-Millisecond Benchmark
+# ---------------------------------------------------------------------------
+
+from kernel.arbiter import KernelCognitiveArbiter
+
+
+def test_kernel_cognitive_arbiter_kernel_patterns():
+    kernel_prompts = [
+        "who am i",
+        "who am I?",
+        "my profile",
+        "system status",
+        "kernel status",
+        "dataset stats",
+        "tasks left",
+        "tasks left?",
+        "clear screen",
+        "reset memory",
+        "clean chat",
+        "clean context",
+        "open terminal",
+        "launch code",
+        "open browser",
+        "launch dashboard",
+        "what is 42+18",
+        "calc 100/4",
+    ]
+    for prompt in kernel_prompts:
+        tier, handshake = KernelCognitiveArbiter.arbitrate(prompt)
+        assert tier == "kernel", f"Expected 'kernel' for prompt: {prompt}, got: {tier}"
+        assert handshake == "", f"Expected empty handshake for kernel prompt: {prompt}"
+
+
+def test_kernel_cognitive_arbiter_web_ai_patterns():
+    web_prompts = [
+        "single-file three.js galaxy simulation",
+        "complete website for FC Barcelona",
+        "build a complete tactical website for FC Barcelona",
+        "make an interactive dashboard with chart.js",
+        "write a tactical app for match analysis",
+        "<!doctype html> <html><body>Hello</body></html>",
+        "tactical dashboard for UEFA Champions League",
+        "starting xi probability calculator",
+    ]
+    for prompt in web_prompts:
+        tier, handshake = KernelCognitiveArbiter.arbitrate(prompt)
+        assert tier == "claude", f"Expected 'claude' for web prompt: {prompt}, got: {tier}"
+        assert "[aivco-kernel] Heavy frontend/application query detected." in handshake
+
+
+def test_kernel_cognitive_arbiter_fast_api_patterns():
+    api_prompts = [
+        "write python async await worker",
+        "implement javascript debounce function",
+        "explain c++ move semantics",
+        "debug rust memory leak",
+        "refactor sql join query",
+        "analyze this json data payload",
+        "summarize the following research notes",
+        "compare differences between REST and GraphQL",
+        "why does Python have a GIL?",
+        "how does multi-layer memory work?",
+        "architecture of convolutional neural networks",
+    ]
+    for prompt in api_prompts:
+        tier, handshake = KernelCognitiveArbiter.arbitrate(prompt)
+        assert tier == "groq", f"Expected 'groq' for API prompt: {prompt}, got: {tier}"
+        assert "[aivco-kernel] Analytical/coding query detected." in handshake
+
+
+def test_kernel_cognitive_arbiter_fallback_and_overrides():
+    # Fallback general query
+    tier, handshake = KernelCognitiveArbiter.arbitrate("good morning AIVCO")
+    assert tier == "groq"
+    assert "[aivco-kernel] General query detected." in handshake
+
+    # Explicit manual override
+    tier, handshake = KernelCognitiveArbiter.arbitrate("build a website", target_override="gemini")
+    assert tier == "gemini"
+    assert "[aivco-kernel] Manual override active: Routing to gemini." in handshake
+
+    tier, handshake = KernelCognitiveArbiter.arbitrate("what is 2+2", target_override="claude")
+    assert tier == "claude"
+    assert "[aivco-kernel] Manual override active: Routing to claude." in handshake
+
+    # "auto" and "AUTO (Arbiter)" should not override
+    tier, _ = KernelCognitiveArbiter.arbitrate("who am i", target_override="auto")
+    assert tier == "kernel"
+
+    tier, _ = KernelCognitiveArbiter.arbitrate("who am i", target_override="AUTO (Arbiter)")
+    assert tier == "kernel"
+
+
+def test_kernel_cognitive_arbiter_benchmark_1000_prompts():
+    import random
+    import time
+
+    pool = [
+        "who am I?",
+        "my profile",
+        "system status",
+        "tasks left?",
+        "clear screen",
+        "what is 42+18",
+        "single-file three.js galaxy simulation",
+        "build a complete tactical website for FC Barcelona",
+        "tactical dashboard for Barcelona",
+        "starting xi probability calculator",
+        "explain python async await syntax",
+        "write javascript function for debounce",
+        "analyze the following json data",
+        "compare differences between REST and GraphQL",
+        "why does Python have a GIL?",
+        "hello how are you today?",
+    ]
+    prompts = [random.choice(pool) for _ in range(1000)]
+
+    # Warmup
+    for p in prompts[:20]:
+        KernelCognitiveArbiter.arbitrate(p, log_telemetry=False)
+
+    t0 = time.perf_counter()
+    for p in prompts:
+        KernelCognitiveArbiter.arbitrate(p, log_telemetry=False)
+    t1 = time.perf_counter()
+
+    total_ms = (t1 - t0) * 1000.0
+    avg_per_prompt_ms = total_ms / 1000.0
+
+    # Ensure deterministic classification runs in under 2ms per query (sub-millisecond target)
+    assert avg_per_prompt_ms < 2.0, f"Average per prompt {avg_per_prompt_ms:.4f}ms exceeded 2ms"
+    # Ensure all 1,000 prompt classifications run in well under 50ms total
+    assert total_ms < 50.0, f"Total batch time {total_ms:.2f}ms exceeded 50ms"
+
+
+def test_build_executive_envelope_brain4_web_targets():
+    from kernel.arbiter import build_executive_envelope
+
+    memory_ctx = (
+        "### STRICT OPERATOR DIRECTIVES:\n"
+        "- Operator Address: Address operator as 'Sir' or 'AIvco'.\n"
+        "- Operating Rules: Never call operator by real name; keep casual chat concise.\n"
+        "- Active Project: AIVCO Assistant — active\n"
+        "- Tech Stack: Python, FastAPI, Tailwind, Vanilla JS\n"
+    )
+    prompt = "Create a real-time tactical dashboard for FC Barcelona"
+
+    for target in ["claude", "chatgpt", "gemini_web", "grok"]:
+        enveloped = build_executive_envelope(prompt, target, memory_ctx)
+        assert "[AIVCO EXECUTIVE BRIEF]" in enveloped
+        assert "[/AIVCO EXECUTIVE BRIEF]" in enveloped
+        assert "Operator Context:" in enveloped
+        assert "Execution Contract: Deliver production-grade, complete implementation." in enveloped
+        assert "Do NOT use the Artifacts sandbox tool" in enveloped
+        assert "```html <!DOCTYPE html>..." in enveloped
+        assert "USER DIRECTIVE:\nCreate a real-time tactical dashboard for FC Barcelona" in enveloped
+
+
+def test_build_executive_envelope_fast_api_keeps_prompt_clean():
+    from kernel.arbiter import build_executive_envelope
+
+    memory_ctx = "Operator Address: Sir | Tech Stack: Python"
+    prompt = "Explain asyncio event loops in Python"
+
+    for target in ["groq", "gemini", "local", "local_llama"]:
+        result = build_executive_envelope(prompt, target, memory_ctx)
+        assert result == prompt
+        assert "[AIVCO EXECUTIVE BRIEF]" not in result
+
+
+def test_compress_memory_context_handles_varied_inputs():
+    from kernel.arbiter import compress_memory_context
+
+    # Normal multi-layer memory
+    ctx = (
+        "### STRICT OPERATOR DIRECTIVES (HIGHEST PRIORITY):\n"
+        "- Operator Address: Address the operator strictly as 'sir' or 'AIvco'.\n"
+        "- Operating Rules: Keep replies concise.\n"
+        "- Active Project: FC Barcelona Tactical Room\n"
+        "- Tech Stack: React, Three.js, Tailwind\n"
+    )
+    comp = compress_memory_context(ctx)
+    assert "sir" in comp.lower() or "aivco" in comp.lower()
+    assert len(comp) < 500
+
+    # Empty context fallback
+    empty_comp = compress_memory_context("")
+    assert "AIvco" in empty_comp or "Sir" in empty_comp
+
+
+def test_arbiter_telemetry_logging_writes_valid_jsonl(tmp_path):
+    from kernel.arbiter import KernelCognitiveArbiter, set_telemetry_filepath, flush_telemetry
+    import json
+
+    test_log = tmp_path / "telemetry_test.jsonl"
+    set_telemetry_filepath(str(test_log))
+
+    try:
+        tier, msg = KernelCognitiveArbiter.arbitrate("build a tactical dashboard", target_override="auto")
+        flush_telemetry(timeout=2.0)
+
+        assert test_log.exists()
+        lines = test_log.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) >= 1
+
+        entry = json.loads(lines[-1])
+        assert entry["prompt"] == "build a tactical dashboard"
+        assert entry["target_tier"] == "claude"
+        assert "Heavy frontend" in entry["rationale"]
+        assert "timestamp" in entry
+        assert "latency_ms" in entry
+        assert isinstance(entry["latency_ms"], (int, float))
+    finally:
+        set_telemetry_filepath(None)
+
+
