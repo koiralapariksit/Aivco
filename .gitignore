@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
 .venv/
 venv/
+
 # User memory and backups (private)
 memory/user/
 memory/user/*.bak
@@ -14,9 +16,17 @@ memory/user/*.json.bak
 .env
 *.log
 
-# Personal AIVCO memory — keep local, never push
-# V2 runtime data directory — keep local, never push
+# Personal AIVCO memory & runtime data
 data/
 data/ai_credentials_vault.json
 data/browser_profiles/
 data/browser_profile/
+data/*.dmp
+data/*.pma
+
+# Temp and backup files
+scratch/
+scripts/
+*.bak
+.DS_Store
+Thumbs.db
