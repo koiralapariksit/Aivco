@@ -17,7 +17,7 @@ def make_controller(tmp_path):
     path = tmp_path / "profile.json"
     memory = MemoryController(path)
     memory.forget_all()
-    return CommandController(memory, confirm_input=lambda prompt: "yes"), memory
+    return CommandController(memory, confirm_input=lambda prompt: "yes"), memory 
 
 
 def test_help_is_handled_as_a_command(tmp_path):
@@ -608,7 +608,10 @@ def test_build_executive_envelope_brain4_web_targets():
         assert "Execution Contract: Deliver production-grade, complete implementation." in enveloped
         assert "Do NOT use the Artifacts sandbox tool" in enveloped
         assert "```html <!DOCTYPE html>..." in enveloped
-        assert "USER DIRECTIVE:\nCreate a real-time tactical dashboard for FC Barcelona" in enveloped
+        assert "USER DIRECTIVE:" in enveloped
+        assert "Create a real-time tactical dashboard for FC Barcelona" in enveloped
+        assert "ELITE ENGINEERING SPECIFICATION:" in enveloped
+        assert "<!DOCTYPE html>" in enveloped
 
 
 def test_build_executive_envelope_fast_api_keeps_prompt_clean():
@@ -667,5 +670,85 @@ def test_arbiter_telemetry_logging_writes_valid_jsonl(tmp_path):
         assert isinstance(entry["latency_ms"], (int, float))
     finally:
         set_telemetry_filepath(None)
+
+
+def test_extract_fuzzy_provider_directive_typos():
+    from kernel.arbiter import extract_fuzzy_provider_directive
+
+    cases = [
+        ("use cladue to make website", "claude", "make website"),
+        ("use claudeto make website", "claude", "make website"),
+        ("ask gpt to tell about me", "chatgpt", "tell about me"),
+        ("ask gpt to know bout me", "chatgpt", "know bout me"),
+        ("use chagpt", "chatgpt", ""),
+        ("chagpt: make an app", "chatgpt", "make an app"),
+        ("ask chatgpt to tell about me", "chatgpt", "tell about me"),
+        ("use gmini to build an ecommerce store", "gemini_web", "build an ecommerce store"),
+        ("make an app with cladue", "claude", "make an app"),
+        ("switch to grok", "grok", ""),
+        ("who am i", None, "who am i"),
+    ]
+
+    for raw, expected_prov, expected_clean in cases:
+        prov, clean = extract_fuzzy_provider_directive(raw)
+        assert prov == expected_prov, f"Failed provider for {raw}: got {prov}, expected {expected_prov}"
+        assert clean == expected_clean, f"Failed clean for {raw}: got {clean!r}, expected {expected_clean!r}"
+        # Ensure typo string was stripped from clean prompt
+        assert "cladue" not in clean.lower()
+        assert "chagpt" not in clean.lower()
+        assert not clean.startswith("to ")
+
+
+def test_synthesize_elite_prompt_categories():
+    from kernel.arbiter import synthesize_elite_prompt
+
+    # 1. Identity
+    id_prompt = synthesize_elite_prompt("tell about me", "chatgpt", "")
+    assert "Analyze the provided Operator Context" in id_prompt
+    assert "Parikshit Koirala / AIvco" in id_prompt
+
+    id_prompt2 = synthesize_elite_prompt("know bout me", "claude", "")
+    assert "Analyze the provided Operator Context" in id_prompt2
+
+    # 2. Frontend / UI
+    fe_prompt = synthesize_elite_prompt("make website for sports", "claude", "")
+    assert "USER OBJECTIVE: make website for sports" in fe_prompt
+    assert "ELITE ENGINEERING SPECIFICATION:" in fe_prompt
+    assert "<!DOCTYPE html>" in fe_prompt
+    assert "dark obsidian/glassmorphic" in fe_prompt
+
+    # 3. Coding / Backend
+    code_prompt = synthesize_elite_prompt("write a python script for sorting", "groq", "")
+    assert "USER OBJECTIVE: write a python script for sorting" in code_prompt
+    assert "ELITE ENGINEERING SPECIFICATION:" in code_prompt
+    assert "standard markdown fenced code blocks" in code_prompt
+
+    # 4. General fallback
+    gen_prompt = synthesize_elite_prompt("what is the capital of France?", "groq", "")
+    assert gen_prompt == "what is the capital of France?"
+
+
+@pytest.mark.anyio
+async def test_server_web_failover_mechanism():
+    from server import is_web_result_failure, execute_web_failover
+
+    assert is_web_result_failure("") is True
+    assert is_web_result_failure(None) is True
+    assert is_web_result_failure("RATE_LIMIT_REACHED") is True
+    assert is_web_result_failure("[aivco-kernel] Chrome Extension bridge is not connected.") is True
+    assert is_web_result_failure("Execution timed out waiting for AI response.") is True
+    assert is_web_result_failure("Here is a valid markdown answer.") is False
+
+    # Execute failover
+    res = await execute_web_failover(
+        target_tier="claude",
+        clean_prompt="explain binary search",
+        raw_prompt="use cladue to explain binary search",
+        handshake_msg="",
+        t0=0.0
+    )
+    assert "⚡ [aivco-kernel] CLAUDE web session unavailable/rate-limited" in res["response"]
+    assert res["tier"] == 2
+    assert "tier2" in res["provider"]
 
 

@@ -288,8 +288,69 @@ function deliverBridgeResult(requestId, provider, markdown, error = null) {
 
 // ── Standalone DOM Inspector for executeScript ───────────────────────────────
 
-function inspectPageState(promptText) {
+function captureTabBaseline() {
   try {
+    const assistantSelectors = [
+      '.font-claude-message',
+      '[data-message-author-role="assistant"]',
+      'model-response-text',
+      '.model-response-text',
+      'message-content.model-response-text',
+      '[data-message-role="assistant"]',
+      '.agent-turn [data-message-author-role="assistant"]',
+      'div[data-is-streaming="false"]',
+      '[data-test-render-count]',
+      '.prose'
+    ];
+    const userSelectors = '[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message, fieldset, form';
+    let assistantEls = [];
+    for (const sel of assistantSelectors) {
+      const els = Array.from(document.querySelectorAll(sel)).filter(el => !el.matches(userSelectors) && !el.closest(userSelectors));
+      if (els.length > 0) {
+        assistantEls = els;
+        break;
+      }
+    }
+    const lastEl = assistantEls.length > 0 ? assistantEls[assistantEls.length - 1] : null;
+    const lastMsgText = lastEl ? (lastEl.innerText || "").trim() : "";
+    const preEls = lastEl ? lastEl.querySelectorAll('pre, code') : document.querySelectorAll('pre, code');
+    let lastCode = "";
+    if (preEls.length > 0) {
+      const lastPre = preEls[preEls.length - 1];
+      lastCode = (lastPre.textContent || "").trim().slice(0, 120);
+    }
+    return {
+      baselineMsgCount: assistantEls.length,
+      baselineLastMsgText: lastMsgText,
+      baselineCodeSnippet: lastCode
+    };
+  } catch (_) {
+    return { baselineMsgCount: 0, baselineLastMsgText: "", baselineCodeSnippet: "" };
+  }
+}
+
+function inspectPageState(promptText, baseline) {
+  try {
+    // 0. Detect Rate-Limit Banners immediately
+    const rateLimitRegex = /(reached your .*limit|message limit|try again after|upgrade to claude pro|out of free messages|too many requests|usage limit)/i;
+    const bodyText = document.body ? (document.body.innerText || '') : '';
+    if (rateLimitRegex.test(bodyText)) {
+      const banner = Array.from(document.querySelectorAll('div, p, span, h2, h3, [role="alert"]')).find(el => {
+        const t = (el.innerText || '').trim();
+        return t.length < 350 && rateLimitRegex.test(t);
+      });
+      if (banner) {
+        return {
+          isRateLimited: true,
+          error: "RATE_LIMIT_REACHED",
+          totalLength: 0,
+          codeBlocks: [],
+          artifactHtml: '',
+          proseText: ''
+        };
+      }
+    }
+
     // 1. Check if streaming is active
     const stopSelectors = [
       'button[aria-label*="Stop" i]',
@@ -311,38 +372,104 @@ function inspectPageState(promptText) {
       if (isStreaming) break;
     }
 
-    // 2. Extract code blocks (<pre><code>, <pre>, .cm-content) — ignore user messages
-    const codeBlocks = [];
-    const preEls = document.querySelectorAll('pre, .cm-content');
-    for (const pre of preEls) {
-      if (pre.closest('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message')) {
-        continue;
+    // 2. Identify Assistant Message Nodes
+    const assistantSelectors = [
+      '.font-claude-message',
+      '[data-message-author-role="assistant"]',
+      'model-response-text',
+      '.model-response-text',
+      'message-content.model-response-text',
+      '[data-message-role="assistant"]',
+      '.agent-turn [data-message-author-role="assistant"]',
+      'div[data-is-streaming="false"]',
+      '[data-test-render-count]',
+      '.prose',
+      'main article'
+    ];
+    const userSelectors = '[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message, fieldset, form';
+    let assistantEls = [];
+    for (const sel of assistantSelectors) {
+      const els = Array.from(document.querySelectorAll(sel)).filter(el =>
+        !el.matches(userSelectors) && !el.closest(userSelectors)
+      );
+      if (els.length > 0) {
+        assistantEls = els;
+        break;
       }
+    }
+
+    const currentMsgCount = assistantEls.length;
+    const latestAssistantEl = assistantEls.length > 0 ? assistantEls[assistantEls.length - 1] : null;
+    let currentProseRaw = latestAssistantEl ? (latestAssistantEl.innerText || "").trim() : "";
+
+    // Baseline Stale-DOM Check:
+    let hasNewTurn = false;
+    if (baseline) {
+      if (currentMsgCount > baseline.baselineMsgCount) {
+        hasNewTurn = true;
+      } else if (currentProseRaw.length > 20 && currentProseRaw !== baseline.baselineLastMsgText && !currentProseRaw.startsWith(baseline.baselineLastMsgText)) {
+        hasNewTurn = true;
+      }
+    } else {
+      hasNewTurn = currentProseRaw.length > 20;
+    }
+
+    // If no new turn has started and not currently streaming, do not scrape old stale response
+    if (!hasNewTurn && !isStreaming) {
+      return {
+        isStreaming: false,
+        codeBlocks: [],
+        artifactHtml: '',
+        proseText: '',
+        totalLength: 0,
+        hasNewResponse: false
+      };
+    }
+
+    // 3. Extract code blocks RESTRICTED strictly to latest assistant container!
+    const codeBlocks = [];
+    const codeScope = latestAssistantEl || document;
+    const preEls = codeScope.querySelectorAll('pre, .cm-content');
+    for (const pre of preEls) {
+      if (pre.closest(userSelectors)) continue;
       const codeEl = pre.querySelector('code') || pre;
       const text = (codeEl.textContent || '').trim();
+
+      // Filter out Cloudflare challenge scripts / parameters
+      if (text.includes('__CF$cv$params') || text.includes('/cdn-cgi/challenge-platform/') || text.includes('cf-turnstile')) {
+        continue;
+      }
+      // Filter out baseline code snippet if turn hasn't incremented
+      if (baseline && currentMsgCount <= baseline.baselineMsgCount && text.slice(0, 120) === baseline.baselineCodeSnippet) {
+        continue;
+      }
+
       if (text.length > 15) {
         let lang = 'html';
-        if (text.startsWith('<!DOCTYPE') || text.startsWith('<html') || text.includes('</html') || text.includes('<style')) {
+        if (text.startsWith('<!DOCTYPE') || text.startsWith('<html') || text.includes('</html') || text.includes('<style') || text.includes('<body')) {
           lang = 'html';
         } else if (text.startsWith('{') || text.startsWith('[')) {
           lang = 'json';
         } else if (text.includes('import ') || text.includes('export default') || text.includes('function ')) {
           lang = 'javascript';
-        } else if (text.includes('def ') || text.includes('class ')) {
+        } else if (text.includes('def ') || text.includes('class ') || text.includes('def __init__')) {
           lang = 'python';
         }
         codeBlocks.push({ lang, code: text });
       }
     }
 
-    // 3. Extract any Artifact iframe HTML
+    // 4. Extract any Artifact iframe HTML
     let artifactHtml = '';
-    const iframes = document.querySelectorAll('iframe');
+    const iframes = (latestAssistantEl || document).querySelectorAll('iframe');
     for (const iframe of iframes) {
       try {
         let html = iframe.getAttribute('srcdoc') || '';
         if (!html && iframe.contentDocument && iframe.contentDocument.documentElement) {
           html = iframe.contentDocument.documentElement.outerHTML || '';
+        }
+        if (html && (html.includes('__CF$cv$params') || html.includes('challenge-platform') || html.includes('cf-turnstile'))) {
+          continue;
         }
         if (html && html.trim().length > 100) {
           artifactHtml = html.trim();
@@ -351,49 +478,16 @@ function inspectPageState(promptText) {
       } catch (_) {}
     }
 
-    // 4. Extract assistant prose text (Strictly ignore user bubbles and executive briefs)
-    const assistantSelectors = [
-      '.font-claude-message',
-      '[data-message-author-role="assistant"]',
-      'div[data-is-streaming="false"]',
-      '[data-test-render-count]',
-      '.prose',
-      'main article',
-      'model-response-text'
-    ];
+    // 5. Extract assistant prose text
     let proseText = '';
-    for (const sel of assistantSelectors) {
-      const els = document.querySelectorAll(sel);
-      const filteredEls = Array.from(els).filter(el => 
-        !el.matches('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message') &&
-        !el.closest('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message')
-      );
-      if (filteredEls.length > 0) {
-        const lastEl = filteredEls[filteredEls.length - 1];
-        const clone = lastEl.cloneNode(true);
-        clone.querySelectorAll('pre, iframe, [data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message').forEach(e => e.remove());
-        let txt = (clone.innerText || '').trim();
-        txt = txt.replace(/\[AIVCO EXECUTIVE BRIEF\][\s\S]*?\[\/AIVCO EXECUTIVE BRIEF\]/gi, '').trim();
-        if (txt.length > 15) {
-          proseText = txt;
-          break;
-        }
-      }
-    }
-
-    // Fallback: If no assistant selector matched, extract from main/body ignoring user messages
-    if (!proseText) {
-      const mainEl = document.querySelector('main') || document.body;
-      const clone = mainEl.cloneNode(true);
-      clone.querySelectorAll('nav, header, aside, pre, iframe, textarea, input, [contenteditable="true"], [data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message').forEach(e => e.remove());
-      const raw = (clone.innerText || '').trim();
-      if (raw.length > 50) {
-        let clean = raw.replace(/\[AIVCO EXECUTIVE BRIEF\][\s\S]*?\[\/AIVCO EXECUTIVE BRIEF\]/gi, '').trim();
-        if (promptText && clean.includes(promptText.slice(0, 35))) {
-          const idx = clean.indexOf(promptText.slice(0, 35));
-          clean = clean.slice(idx + promptText.slice(0, 35).length).trim();
-        }
-        proseText = clean.slice(-2500);
+    if (latestAssistantEl) {
+      const clone = latestAssistantEl.cloneNode(true);
+      clone.querySelectorAll('pre, iframe, ' + userSelectors).forEach(e => e.remove());
+      let txt = (clone.innerText || '').trim();
+      txt = txt.replace(/\[AIVCO EXECUTIVE BRIEF\][\s\S]*?\[\/AIVCO EXECUTIVE BRIEF\]/gi, '').trim();
+      txt = txt.replace(/^(?:Claude responded:?\s*)?/i, '').trim();
+      if (txt.length > 15) {
+        proseText = txt;
       }
     }
 
@@ -404,7 +498,8 @@ function inspectPageState(promptText) {
       codeBlocks,
       artifactHtml,
       proseText,
-      totalLength
+      totalLength,
+      hasNewResponse: hasNewTurn || totalLength > 20
     };
   } catch (err) {
     return {
@@ -413,6 +508,7 @@ function inspectPageState(promptText) {
       artifactHtml: '',
       proseText: '',
       totalLength: 0,
+      hasNewResponse: false,
       error: err.message
     };
   }
@@ -438,7 +534,7 @@ function assembleMarkdownFromResult(res) {
 
 // ── Active Supervisor Polling Loop ───────────────────────────────────────────
 
-function monitorTabGeneration(tabId, requestId, provider, promptText) {
+function monitorTabGeneration(tabId, requestId, provider, promptText, baseline) {
   let baselineLength = null;
   let lastLength = 0;
   let stableCount = 0;
@@ -460,7 +556,7 @@ function monitorTabGeneration(tabId, requestId, provider, promptText) {
         const results = await chrome.scripting.executeScript({
           target: { tabId },
           func: inspectPageState,
-          args: [promptText]
+          args: [promptText, baseline]
         });
         if (results && results[0] && results[0].result) {
           const res = results[0].result;
@@ -477,11 +573,19 @@ function monitorTabGeneration(tabId, requestId, provider, promptText) {
       const results = await chrome.scripting.executeScript({
         target: { tabId },
         func: inspectPageState,
-        args: [promptText]
+        args: [promptText, baseline]
       });
 
       if (!results || !results[0] || !results[0].result) return;
       const res = results[0].result;
+
+      // Rate limit check
+      if (res.isRateLimited || res.error === "RATE_LIMIT_REACHED") {
+        console.warn(`[AIVCO Bridge] Rate limit detected for ${requestId}! Aborting wait immediately.`);
+        clearInterval(monitorInterval);
+        deliverBridgeResult(requestId, provider, "", "RATE_LIMIT_REACHED");
+        return;
+      }
 
       if (baselineLength === null) {
         baselineLength = res.totalLength;
@@ -490,8 +594,8 @@ function monitorTabGeneration(tabId, requestId, provider, promptText) {
         return;
       }
 
-      // Detect if content has started growing or if artifact is present
-      if (res.totalLength > baselineLength + 20 || res.artifactHtml.length > 50 || res.codeBlocks.length > 0) {
+      // Detect if content has started growing or if new turn mounted
+      if (res.hasNewResponse && (res.totalLength > baselineLength + 20 || res.artifactHtml.length > 50 || res.codeBlocks.length > 0)) {
         hasIncreased = true;
       }
 
@@ -523,7 +627,22 @@ function monitorTabGeneration(tabId, requestId, provider, promptText) {
   return monitorInterval;
 }
 
-function executePromptInTab(tabId, provider, prompt, requestId, retryCount = 0) {
+async function executePromptInTab(tabId, provider, prompt, requestId, retryCount = 0) {
+  // Capture pre-flight DOM baseline snapshot to prevent re-scraping stale messages
+  let baseline = { baselineMsgCount: 0, baselineLastMsgText: "", baselineCodeSnippet: "" };
+  try {
+    const snapResults = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: captureTabBaseline
+    });
+    if (snapResults && snapResults[0] && snapResults[0].result) {
+      baseline = snapResults[0].result;
+      console.log(`[AIVCO Bridge] Captured DOM baseline for tab ${tabId}:`, baseline);
+    }
+  } catch (err) {
+    console.warn("[AIVCO Bridge] Could not capture pre-flight baseline:", err);
+  }
+
   // 1. Keep background service worker alive during generation
   const keepAliveInterval = setInterval(() => {
     try {
@@ -535,7 +654,7 @@ function executePromptInTab(tabId, provider, prompt, requestId, retryCount = 0) 
   }, 2000);
 
   // 2. Start active tab supervisor polling loop
-  const monitorInterval = monitorTabGeneration(tabId, requestId, provider, prompt);
+  const monitorInterval = monitorTabGeneration(tabId, requestId, provider, prompt, baseline);
 
   activeDispatches.set(requestId, { tabId, keepAliveInterval, monitorInterval });
 
@@ -551,7 +670,7 @@ function executePromptInTab(tabId, provider, prompt, requestId, retryCount = 0) 
 
   chrome.tabs.sendMessage(
     tabId,
-    { action: "execute_prompt", provider, prompt, request_id: requestId },
+    { action: "execute_prompt", provider, prompt, request_id: requestId, baseline },
     async (ack) => {
       if (chrome.runtime.lastError) {
         console.warn(`[AIVCO Bridge] Initial sendMessage error on tab ${tabId}:`, chrome.runtime.lastError.message);

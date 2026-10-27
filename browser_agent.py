@@ -34,10 +34,31 @@ logger = logging.getLogger("aivco.extension_bridge")
 def extract_clean_markdown_from_html(html_str: str) -> str:
     """
     Converts HTML response into clean Markdown while strictly preserving
-    <pre><code> blocks as fenced ``` code blocks.
+    <pre><code> blocks as fenced ``` code blocks. Filters out Cloudflare challenge scripts.
     """
     if not html_str:
         return ""
+
+    # Strip Cloudflare challenge scripts and parameters
+    html_str = re.sub(
+        r'<script[^>]*>[\s\S]*?(?:__CF\$cv\$params|/cdn-cgi/challenge-platform/|cf-turnstile)[\s\S]*?</script>',
+        '',
+        html_str,
+        flags=re.IGNORECASE,
+    )
+    html_str = re.sub(
+        r'<pre[^>]*><code[^>]*>[\s\S]*?(?:__CF\$cv\$params|/cdn-cgi/challenge-platform/|cf-turnstile)[\s\S]*?</code></pre>',
+        '',
+        html_str,
+        flags=re.IGNORECASE,
+    )
+    html_str = re.sub(
+        r'<pre[^>]*>[\s\S]*?(?:__CF\$cv\$params|/cdn-cgi/challenge-platform/|cf-turnstile)[\s\S]*?</pre>',
+        '',
+        html_str,
+        flags=re.IGNORECASE,
+    )
+    html_str = re.sub(r'window\.__CF\$cv\$params\s*=[\s\S]*?(?:;\s*</script>|(?=\n\n)|$)', '', html_str)
 
     blocks = {}
     counter = 0
@@ -184,6 +205,11 @@ class ExtensionBridgeRouter:
         self._pending_requests: Dict[str, concurrent.futures.Future] = {}
         self._server_loop: Optional[asyncio.AbstractEventLoop] = None
 
+    @property
+    def active_connections(self) -> Set[Any]:
+        """Returns the set of active WebSocket clients."""
+        return self._clients
+
     def register_client(self, websocket: Any) -> None:
         """Registers a connected Chrome extension WebSocket client."""
         with self._lock:
@@ -249,7 +275,11 @@ class ExtensionBridgeRouter:
                 if error:
                     fut.set_exception(RuntimeError(error))
                 else:
-                    fut.set_result(markdown or "")
+                    clean_md = markdown or ""
+                    if clean_md:
+                        clean_md = re.sub(r'```(?:html|javascript|js)?\s*<script[^>]*>[\s\S]*?__CF\$cv\$params[\s\S]*?```', '', clean_md, flags=re.IGNORECASE)
+                        clean_md = re.sub(r'window\.__CF\$cv\$params\s*=[\s\S]*?;', '', clean_md).strip()
+                    fut.set_result(clean_md)
                 logger.info("[bridge] Resolved pending request %s (markdown len: %d)", target_id, len(markdown or ""))
                 return True
 
@@ -289,6 +319,10 @@ class ExtensionBridgeRouter:
 
     def _launch_browser_for_provider(self, provider: str) -> None:
         """Launches the default browser to the provider URL in background without stealing focus."""
+        if len(self.active_connections) > 0 or self.is_connected():
+            logger.info("[bridge] Extension is already connected; zero focus steal active.")
+            return
+
         is_testing = "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
         if is_testing:
             return

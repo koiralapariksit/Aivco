@@ -32,6 +32,8 @@ from cognitive_kernel import (
     detect_explicit_model_and_intent,
     KernelCognitiveArbiter,
     build_executive_envelope,
+    synthesize_elite_prompt,
+    extract_fuzzy_provider_directive,
 )
 from browser_agent import browser_agent, search_web, universal_web_agent
 
@@ -376,6 +378,79 @@ def get_state() -> Dict[str, Any]:
     }
 
 
+def is_web_result_failure(web_res: Optional[str]) -> bool:
+    """Checks if web bridge execution failed or hit rate limit."""
+    if not web_res or not web_res.strip():
+        return True
+    s = web_res.strip().lower()
+    return (
+        "rate_limit_reached" in s
+        or "[aivco-kernel] chrome extension" in s
+        or "execution timed out waiting for ai response" in s
+        or "tab connection error" in s
+        or "failed to acquire tab" in s
+        or "rate limit" in s
+    )
+
+
+async def execute_web_failover(
+    target_tier: str,
+    clean_prompt: str,
+    raw_prompt: str,
+    handshake_msg: str,
+    t0: float,
+) -> Dict[str, Any]:
+    """Cascades to Tier 2 Groq/Gemini when Brain 4 web provider fails or hits rate limit."""
+    active_proj = tiered_memory.get_active_project()
+    tiered_context = tiered_memory.assemble_context(
+        active_project_id=active_proj,
+        cloud_safe=True,
+    )
+    failover_notice = (
+        f"⚡ [aivco-kernel] {target_tier.upper()} web session unavailable/rate-limited. "
+        "Auto-cascaded to Tier 2 Engine:\n\n"
+    )
+    system_prompt = (
+        "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
+        f"MEMORY CONTEXT:\n{tiered_context}\n\n"
+        "Synthesize an accurate, direct, production-grade response. "
+        "Follow all operator directives strictly."
+    )
+    elite_prompt = synthesize_elite_prompt(clean_prompt, "groq", tiered_context)
+    try:
+        gen_res = llm_controller.route_and_generate(
+            system_prompt=system_prompt,
+            user_prompt=elite_prompt,
+            task_type="general",
+            force_provider="groq",
+        )
+        resp_text = gen_res.get("response", "")
+        used_prov = gen_res.get("provider_used", "groq")
+    except Exception as exc:
+        resp_text = f"Fallback error: {exc}"
+        used_prov = "tier2_fallback"
+
+    final_res = f"{failover_notice}{resp_text}"
+    latency_ms = max(10, round((time.time() - t0) * 1000))
+    learn_from_turn(raw_prompt, final_res, tiered_memory)
+    dataset_logger.log(
+        source=f"failover_{target_tier}_to_{used_prov}",
+        task_type="web_agent_failover",
+        system_content=system_prompt[:500],
+        user_content=raw_prompt,
+        assistant_content=final_res,
+    )
+    return {
+        "response": final_res,
+        "provider": f"tier2:cascaded-from-{target_tier}",
+        "src": "Tier 2 (Failover)",
+        "tier": 2,
+        "lat": latency_ms,
+        "web_searched": False,
+        "handshake": handshake_msg,
+    }
+
+
 @app.post("/api/chat")
 async def post_chat(req: ChatRequest) -> Dict[str, Any]:
     """
@@ -533,6 +608,8 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             timeout=180.0,
             auto_launch_wait=15.0,
         )
+        if is_web_result_failure(web_res):
+            return await execute_web_failover(target_tier, clean_prompt, raw_prompt, handshake_msg, t0)
         latency_ms = max(10, round((time.time() - t0) * 1000))
         learn_from_turn(raw_prompt, web_res, tiered_memory)
         dataset_logger.log(
@@ -608,6 +685,8 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             timeout=180.0,
             auto_launch_wait=15.0,
         )
+        if is_web_result_failure(web_res):
+            return await execute_web_failover(target_web, clean_prompt, raw_prompt, handshake_msg, t0)
         latency_ms = max(10, round((time.time() - t0) * 1000))
         learn_from_turn(raw_prompt, web_res, tiered_memory)
         dataset_logger.log(

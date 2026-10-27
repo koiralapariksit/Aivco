@@ -209,5 +209,34 @@ def test_resolve_request_latest_fallback(bridge_router):
     assert "req-alpha" not in bridge_router._pending_requests
 
 
+def test_cloudflare_challenge_script_filtering():
+    raw_html = (
+        '<div>'
+        '<p>Valid content here</p>'
+        '<script>window.__CF$cv$params={r:"8df1",t:"MTcyODc0"};</script>'
+        '<pre><code>window.__CF$cv$params={r:"8df1"};</code></pre>'
+        '<pre><code class="language-html"><!DOCTYPE html><html><body><h1>Safe App</h1></body></html></code></pre>'
+        '</div>'
+    )
+    md = extract_clean_markdown_from_html(raw_html)
+    assert "__CF$cv$params" not in md
+    assert "Safe App" in md
+    assert "<!DOCTYPE html>" in md
+
+
+def test_zero_focus_steal_when_connected(bridge_router, monkeypatch):
+    import webbrowser
+    opened_urls = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, *args, **kwargs: opened_urls.append(url))
+
+    # When connected, _launch_browser_for_provider should NEVER call webbrowser.open
+    mock_ws = MagicMock()
+    bridge_router.register_client(mock_ws)
+    assert bridge_router.is_connected() is True
+
+    bridge_router._launch_browser_for_provider("claude")
+    assert len(opened_urls) == 0
+
+
 
 

@@ -7,6 +7,7 @@ Broker provides executive context envelopes and asynchronous telemetry training 
 """
 
 from datetime import datetime, timezone
+import difflib
 import json
 import os
 from pathlib import Path
@@ -100,6 +101,170 @@ def log_arbiter_telemetry(
 
 # ── Executive Context Broker Helpers ─────────────────────────────────────────
 
+IDENTITY_PATTERN = re.compile(
+    r"\b(about\s+me|who\s+am\s+i|know\s+(?:a?bout|abt)\s+me|my\s+profile|tell\s+(?:me\s+)?about\s+me|who\s+i\s+am)\b",
+    re.IGNORECASE,
+)
+FRONTEND_PATTERN = re.compile(
+    r"\b(web(?:site|asite)|e-?commer(?:ce|ice)|clone|dashboard|html|web\s*app|store|spotify|ui|interface|landing\s+page)\b",
+    re.IGNORECASE,
+)
+CODING_PATTERN = re.compile(
+    r"\b(py(?:thon|hton)|script|scirpt|tkinter|gui|algorithm|api|backend|endpoint|fastapi|function)\b",
+    re.IGNORECASE,
+)
+
+KNOWN_PROVIDER_ALIASES: Dict[str, str] = {
+    # Claude
+    "claude": "claude", "cladue": "claude", "claud": "claude", "cloude": "claude",
+    "calude": "claude", "claudeai": "claude", "claude_web": "claude",
+    # ChatGPT
+    "chatgpt": "chatgpt", "chat gpt": "chatgpt", "gpt": "chatgpt", "chagpt": "chatgpt",
+    "chatgtp": "chatgpt", "openai": "chatgpt", "gpt4": "chatgpt", "chatgpt_web": "chatgpt",
+    # Gemini
+    "gemini web": "gemini_web", "gemini_web": "gemini_web", "gemini": "gemini_web",
+    "gmini": "gemini_web", "gemni": "gemini_web", "gemeni": "gemini_web",
+    # Grok
+    "grok": "grok", "gork": "grok", "xai": "grok", "grok_web": "grok",
+    # Fast API / Local
+    "groq": "groq", "grq": "groq",
+    "local": "local_llama", "local_llama": "local_llama", "llama": "local_llama",
+    "kernel": "kernel", "aivco-kernel": "kernel",
+}
+
+CANONICAL_PROVIDERS: Dict[str, List[str]] = {
+    "claude": ["claude"],
+    "chatgpt": ["chatgpt", "gpt"],
+    "gemini_web": ["gemini", "gemini web"],
+    "grok": ["grok", "xai"],
+}
+
+
+DIRECTIVE_TRIGGER_CHECK = re.compile(
+    r"\b(?:use|ask|tell|run|search|via|with|on|in|switch\s+to|@)\b|^[a-zA-Z0-9_\-]+:\s*",
+    re.IGNORECASE,
+)
+TRIGGER_PATTERN = re.compile(
+    r"^(?:(?:use|ask|tell|run|search|via|with|on|in)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+web)?)(?:\s*(?:to\s+(?:search\s+)?|for\s+|:\s*|\s+-\s*|\s+–\s*)|\s+)(.*)$",
+    re.IGNORECASE,
+)
+
+
+def match_provider_token(token: str) -> Optional[str]:
+    """Matches a token to a provider canonical name using aliases and SequenceMatcher."""
+    t = token.lower().strip()
+    if t in KNOWN_PROVIDER_ALIASES:
+        return KNOWN_PROVIDER_ALIASES[t]
+    lt = len(t)
+    if lt < 3 or lt > 12:
+        return None
+    for can, targets in CANONICAL_PROVIDERS.items():
+        for target in targets:
+            if abs(lt - len(target)) <= 2:
+                if difflib.SequenceMatcher(None, t, target).ratio() >= 0.78:
+                    return can
+    return None
+
+
+def extract_fuzzy_provider_directive(prompt: str) -> Tuple[Optional[str], str]:
+    """
+    Sub-millisecond fuzzy typo-tolerant provider directive extraction.
+    Detects provider commands at start or inside prompt (e.g. 'use cladue to', 'use claudeto',
+    'ask gpt to', 'use chagpt') and strips ONLY the routing prefix cleanly.
+    """
+    raw = prompt.strip()
+    if not raw or not DIRECTIVE_TRIGGER_CHECK.search(raw):
+        return None, raw
+
+    # Check 1: Explicit switch commands ("switch to claude", "switch to grok")
+    m_switch = re.match(r"^(?:switch\s+to\s+)([\w\s\-]+?)[.?!]*$", raw, re.IGNORECASE)
+    if m_switch:
+        prov = match_provider_token(m_switch.group(1))
+        if prov:
+            return prov, ""
+
+    # Check 2: Prefix directives: (use|ask|tell|run|via|with|search)? @?(provider)(to|:|-) rest
+    # Also handles merged 'to' (e.g. claudeto, cladueto, chagptto, gptto)
+    m_pref = TRIGGER_PATTERN.match(raw)
+    if m_pref:
+        token = m_pref.group(1).strip()
+        rest = m_pref.group(2).strip()
+
+        # Check merged 'to' (e.g. claudeto -> base 'claude', rest)
+        if token.lower().endswith("to") and token.lower() not in KNOWN_PROVIDER_ALIASES:
+            base_token = token[:-2]
+            prov = match_provider_token(base_token)
+            if prov:
+                return prov, rest
+
+        prov = match_provider_token(token)
+        if prov:
+            return prov, rest
+
+    # Check 3: Short standalone (e.g. 'use cladue', 'ask gpt', 'chagpt')
+    m_standalone = re.match(r"^(?:(?:use|ask|tell)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+web)?)[.?!]*$", raw, re.IGNORECASE)
+    if m_standalone:
+        token = m_standalone.group(1).strip()
+        if token.lower().endswith("to") and token.lower() not in KNOWN_PROVIDER_ALIASES:
+            base_token = token[:-2]
+            prov = match_provider_token(base_token)
+            if prov:
+                return prov, ""
+        prov = match_provider_token(token)
+        if prov:
+            return prov, ""
+
+    # Check 4: Inline trailing directive: '... using cladue', '... with chagpt'
+    m_inline = re.search(r"\b(?:using|with|via|in|on)\s+@?([a-zA-Z0-9_\-]+(?:\s+web)?)[.?!]*$", raw, re.IGNORECASE)
+    if m_inline:
+        prov = match_provider_token(m_inline.group(1).strip())
+        if prov:
+            clean = raw[:m_inline.start()].strip()
+            return prov, clean
+
+    return None, raw
+
+
+def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_context: str = "") -> str:
+    """
+    Transforms casual or typo-laden operator requests into elite, production-grade
+    engineering specifications before dispatching to AI providers.
+    """
+    clean_intent = raw_intent.strip()
+    if not clean_intent:
+        return clean_intent
+
+    # 1. Identity / Personal queries
+    if IDENTITY_PATTERN.search(clean_intent):
+        return (
+            "Analyze the provided Operator Context in the Executive Brief and provide a comprehensive, "
+            "structured executive summary of who the operator (Parikshit Koirala / AIvco) is, including "
+            "technical stack, active engineering projects, academic background, and design preferences."
+        )
+
+    # 2. Frontend / Web App / UI / Clone queries
+    if FRONTEND_PATTERN.search(clean_intent):
+        return (
+            f"USER OBJECTIVE: {clean_intent}\n\n"
+            "ELITE ENGINEERING SPECIFICATION:\n"
+            "- Architect and output a complete, self-contained, single-file `<!DOCTYPE html>` application (HTML5 + modern CSS3 + vanilla JavaScript).\n"
+            "- Design Aesthetic: Bespoke, human-crafted editorial or dark obsidian/glassmorphic UI with custom inline SVG artwork, micro-interactions, responsive CSS Grid/Flexbox layout, and zero broken external image links.\n"
+            "- Functional Completeness: Implement working state management, interactive filters/search/controls, smooth drawers/modals, and realistic domain data.\n"
+            "- Output Contract: Do NOT use the Artifacts sandbox tool or external file cards. Output the ENTIRE runnable code directly inline inside a single ```html ... ``` fenced code block."
+        )
+
+    # 3. Coding / Script / Backend queries
+    if CODING_PATTERN.search(clean_intent):
+        return (
+            f"USER OBJECTIVE: {clean_intent}\n\n"
+            "ELITE ENGINEERING SPECIFICATION:\n"
+            "- Deliver clean, production-grade, well-structured, and immediately runnable code inside standard markdown fenced code blocks.\n"
+            "- Handle edge cases, include clear inline documentation, and provide a concise architectural breakdown."
+        )
+
+    return clean_intent
+
+
 def compress_memory_context(memory_context: str, max_chars: int = 500) -> str:
     """
     Compresses multi-layer memory context into a dense, high-signal summary
@@ -138,13 +303,15 @@ def compress_memory_context(memory_context: str, max_chars: int = 500) -> str:
 def build_executive_envelope(prompt: str, target_tier: str, memory_context: str) -> str:
     """
     Wraps prompt with an Executive Context Envelope for Brain 4 Web AI models.
-    For Tier 2 Cloud API models, keeps the user message clean while memory is passed via system context.
+    For Tier 2/3 Cloud API models, keeps the user message clean while memory is passed via system context.
     """
     tier_norm = (target_tier or "").lower()
     compact_memory_summary = compress_memory_context(memory_context)
 
     # Brain 4 Web AI (Claude, ChatGPT, Gemini Web, Grok via Extension)
-    if any(k in tier_norm for k in ("claude", "chatgpt", "gemini_web", "gemini-web", "grok", "brain4", "web")):
+    is_web_ai = any(k in tier_norm for k in ("claude", "chatgpt", "gemini_web", "gemini-web", "grok", "brain4")) or tier_norm == "web"
+    if is_web_ai:
+        synthesized_prompt = synthesize_elite_prompt(prompt, target_tier, memory_context)
         envelope = (
             "[AIVCO EXECUTIVE BRIEF]\n"
             f"Operator Context: {compact_memory_summary}\n"
@@ -154,7 +321,7 @@ def build_executive_envelope(prompt: str, target_tier: str, memory_context: str)
             "so AIVCO's Live Preview Engine can render it immediately.\n"
             "[/AIVCO EXECUTIVE BRIEF]\n\n"
             "USER DIRECTIVE:\n"
-            f"{prompt}"
+            f"{synthesized_prompt}"
         )
         return envelope
 
@@ -176,10 +343,11 @@ class KernelCognitiveArbiter:
     # 2. Brain 4 Web AI Patterns (Complex full-stack HTML/JS apps, complete game engines, massive code)
     WEB_AI_PATTERNS = [
         r"(single-file|complete) (html|website|dashboard|game|canvas|three\.js|webpage)",
-        r"(build|make|create|write) (a|an) (full|complete|interactive|tactical) (website|web page|dashboard|clone|app)",
-        r"(build|make|create|write)\s+(?:a|an)\s+(?:(?:full|complete|interactive|tactical)\s+)+(?:website|web page|dashboard|clone|app)",
+        r"(build|make|create|write) (a|an)?\s*(full|complete|interactive|tactical)?\s*(website|web\s*page|dashboard|clone|app|store|e-?commerce)",
+        r"(build|make|create|write)\s+(?:a|an)?\s+(?:(?:full|complete|interactive|tactical)\s+)+(?:website|web\s*page|dashboard|clone|app|store)",
         r"<!doctype html>",
         r"tactical dashboard|starting xi|probability calculator",
+        r"spotify clone|netflix clone|amazon clone",
     ]
 
     # 3. Tier 2 Fast Cloud API Patterns (Groq Llama 70B / Gemini Pro)
@@ -221,24 +389,30 @@ class KernelCognitiveArbiter:
             tier = target_override
             rationale = f"[aivco-kernel] Manual override active: Routing to {target_override}."
         else:
-            clean = prompt.strip().lower()
-
-            # Check Kernel-native (< 5ms resolution)
-            if cls._FAST_KERNEL.search(clean):
-                tier = "kernel"
-                rationale = ""
-            # Check Web AI (Brain 4 Claude / ChatGPT via Extension)
-            elif cls._FAST_WEB.search(clean):
-                tier = "claude"
-                rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
-            # Check Fast API (Tier 2 Groq / Gemini)
-            elif cls._FAST_API.search(clean):
-                tier = "groq"
-                rationale = "[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 (Groq Fast API)..."
-            # Default fallback: Tier 2 (Groq) or Tier 1 (Local)
+            # Check explicit fuzzy provider directive (e.g. 'use cladue to...', 'ask gpt to...', 'use chagpt')
+            prov_directive, _ = extract_fuzzy_provider_directive(prompt)
+            if prov_directive:
+                tier = prov_directive
+                rationale = "" if tier == "kernel" else f"[aivco-kernel] Operator directive detected: Routing to {tier}..."
             else:
-                tier = "groq"
-                rationale = "[aivco-kernel] General query detected. Routing to Tier 2 (Fast Inference)..."
+                clean = prompt.strip().lower()
+
+                # Check Kernel-native (< 5ms resolution)
+                if cls._FAST_KERNEL.search(clean):
+                    tier = "kernel"
+                    rationale = ""
+                # Check Web AI (Brain 4 Claude / ChatGPT via Extension)
+                elif cls._FAST_WEB.search(clean):
+                    tier = "claude"
+                    rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
+                # Check Fast API (Tier 2 Groq / Gemini)
+                elif cls._FAST_API.search(clean):
+                    tier = "groq"
+                    rationale = "[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 (Groq Fast API)..."
+                # Default fallback: Tier 2 (Groq) or Tier 1 (Local)
+                else:
+                    tier = "groq"
+                    rationale = "[aivco-kernel] General query detected. Routing to Tier 2 (Fast Inference)..."
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 

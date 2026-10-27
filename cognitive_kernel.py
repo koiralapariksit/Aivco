@@ -36,6 +36,8 @@ from kernel.arbiter import (
     KernelCognitiveArbiter,
     build_executive_envelope,
     compress_memory_context,
+    extract_fuzzy_provider_directive,
+    synthesize_elite_prompt,
 )
 
 if TYPE_CHECKING:
@@ -289,6 +291,30 @@ def detect_explicit_model_and_intent(prompt: str) -> dict:
             "is_desktop_browser_request": True,
             "run_web_search": False,
             "clean_prompt": target,
+            "is_model_switch_only": False,
+            "switch_provider": None,
+        }
+
+    # 2. Sub-millisecond fuzzy typo-tolerant provider directive extraction
+    prov, clean_text = extract_fuzzy_provider_directive(raw)
+    if prov is not None:
+        run_search = bool(re.search(r"\bsearch\b", raw, re.IGNORECASE))
+        if not clean_text:
+            return {
+                "target_provider": prov,
+                "browser_target": None,
+                "is_desktop_browser_request": False,
+                "run_web_search": False,
+                "clean_prompt": "",
+                "is_model_switch_only": True,
+                "switch_provider": prov,
+            }
+        return {
+            "target_provider": prov,
+            "browser_target": None,
+            "is_desktop_browser_request": False,
+            "run_web_search": run_search,
+            "clean_prompt": clean_text,
             "is_model_switch_only": False,
             "switch_provider": None,
         }

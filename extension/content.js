@@ -56,22 +56,26 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         inputSelectors: [
           "#prompt-textarea",
           "div[contenteditable='true']#prompt-textarea",
+          "div[contenteditable='true'][id='prompt-textarea']",
           "textarea[placeholder*='Message']",
+          "textarea[data-id]",
+          "div.ProseMirror[contenteditable='true']",
           "div[contenteditable='true']"
         ],
         sendSelectors: [
           "button[data-testid='send-button']",
-          "button[aria-label*='Send']",
+          "button[aria-label*='Send' i]",
+          "button[aria-label*='Send message' i]",
           "button:has(svg[data-icon='arrow-up'])"
         ],
         stopSelectors: [
           "button[data-testid='stop-button']",
-          "button[aria-label*='Stop']"
+          "button[aria-label*='Stop' i]",
+          "button[aria-label*='Cancel' i]"
         ],
         responseSelectors: [
           "div[data-message-author-role='assistant']",
-          ".agent-turn",
-          ".markdown"
+          "[data-message-author-role='assistant']"
         ]
       },
       gemini: {
@@ -83,15 +87,18 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         ],
         sendSelectors: [
           "button.send-button",
-          "button[aria-label*='Send']",
+          "button[aria-label*='Send' i]",
           "button[mat-icon-button]"
         ],
         stopSelectors: [
           "button.stop-button",
-          "button[aria-label*='Stop']"
+          "button[aria-label*='Stop' i]",
+          "button[aria-label*='Cancel' i]"
         ],
         responseSelectors: [
-          "model-response-text",
+          "message-content.model-response-text",
+          ".model-response-text",
+          "model-response",
           "message-content",
           ".response-container-content",
           ".markdown"
@@ -100,19 +107,22 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
       grok: {
         inputSelectors: [
           "div.tiptap.ProseMirror[contenteditable='true']",
-          "div[contenteditable='true']",
-          "textarea"
+          "textarea",
+          "div[contenteditable='true']"
         ],
         sendSelectors: [
           "button[data-testid='chat-submit']",
-          "button[aria-label*='Submit']",
-          "button[aria-label*='Send']"
+          "button[aria-label*='Submit' i]",
+          "button[aria-label*='Send' i]",
+          "button[type='submit']"
         ],
         stopSelectors: [
-          "button[aria-label*='Stop']"
+          "button[aria-label*='Stop' i]",
+          "button[aria-label*='Cancel' i]"
         ],
         responseSelectors: [
           "[data-message-role='assistant']",
+          "[data-message-author-role='assistant']",
           ".response",
           ".prose"
         ]
@@ -162,6 +172,13 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
           : "";
         // textContent on a DOM pre/code contains literal "<!DOCTYPE html><html>" characters!
         const rawCode = (codeEl ? codeEl.textContent : pre.textContent) || "";
+
+        // Strictly filter Cloudflare challenge scripts / parameters
+        if (rawCode.includes('__CF$cv$params') || rawCode.includes('/cdn-cgi/challenge-platform/') || rawCode.includes('cf-turnstile')) {
+          pre.remove();
+          return;
+        }
+
         const placeholder = `___AIVCO_CODE_BLOCK_${idx}___`;
         codeBlocks.push({ placeholder, lang, code: rawCode.trim() });
 
@@ -459,6 +476,10 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
 
     // ── Generic Prompt Submission (ChatGPT, Gemini, Grok) ───────────────────────
 
+    function escapeHtml(str) {
+      return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
     async function submitGenericPrompt(element, text, config) {
       element.focus();
 
@@ -472,20 +493,18 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
           document.execCommand("selectAll", false, null);
           inserted = document.execCommand("insertText", false, text);
           if (inserted) {
-            element.dispatchEvent(new Event("input", { bubbles: true }));
+            element.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
+            element.dispatchEvent(new Event("change", { bubbles: true }));
           }
         } catch (_) {}
         if (!inserted || !element.textContent || element.textContent.trim().length === 0) {
-          element.innerHTML = '';
-          const p = document.createElement('p');
-          p.textContent = text;
-          element.appendChild(p);
-          element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+          element.innerHTML = '<p>' + escapeHtml(text) + '</p>';
+          element.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
           element.dispatchEvent(new Event("change", { bubbles: true }));
         }
       }
 
-      await new Promise(r => setTimeout(r, 250));
+      await new Promise(r => setTimeout(r, 300));
 
       const sendBtn = findElement(config.sendSelectors);
       if (sendBtn && !sendBtn.disabled) {
@@ -495,7 +514,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         sendBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
         sendBtn.click();
       } else {
-        element.dispatchEvent(new KeyboardEvent("keydown", {
+        const enterInit = {
           key: "Enter",
           code: "Enter",
           keyCode: 13,
@@ -503,8 +522,26 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
           bubbles: true,
           cancelable: true,
           composed: true
-        }));
+        };
+        element.dispatchEvent(new KeyboardEvent("keydown", enterInit));
+        element.dispatchEvent(new KeyboardEvent("keypress", enterInit));
+        element.dispatchEvent(new KeyboardEvent("keyup", enterInit));
       }
+    }
+
+    function getAssistantMessages(config) {
+      const userSelectors = '[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message, fieldset, form';
+      for (const sel of config.responseSelectors) {
+        try {
+          const els = Array.from(document.querySelectorAll(sel)).filter(el =>
+            !el.matches(userSelectors) && !el.closest(userSelectors)
+          );
+          if (els.length > 0) {
+            return els;
+          }
+        } catch (_) {}
+      }
+      return [];
     }
 
     // ── Response Observer ────────────────────────────────────────────────────────
@@ -536,19 +573,33 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         const interval = setInterval(async () => {
           const elapsed = Date.now() - startTime;
           if (elapsed > timeoutMs) {
-            const currentResp = await getLatestResponse(config, provider);
+            const currentResp = await getLatestResponse(config, provider, initialCount, initialLastText);
             finish(currentResp || "[aivco-kernel] Execution timed out waiting for AI response.");
             return;
           }
 
+          // Check Rate Limit banner
+          const rateLimitRegex = /(reached your .*limit|message limit|try again after|upgrade to claude pro|out of free messages|too many requests|usage limit)/i;
+          const pageText = document.body ? (document.body.innerText || '') : '';
+          if (rateLimitRegex.test(pageText)) {
+            const banner = Array.from(document.querySelectorAll('div, p, span, h2, h3, [role="alert"]')).find(el => {
+              const t = (el.innerText || '').trim();
+              return t.length < 350 && rateLimitRegex.test(t);
+            });
+            if (banner) {
+              finish({ isError: true, error: "RATE_LIMIT_REACHED" });
+              return;
+            }
+          }
+
           const stopBtn = findElement(config.stopSelectors);
-          const currentElements = document.querySelectorAll(config.responseSelectors.join(","));
+          const currentElements = getAssistantMessages(config);
           const currentCount = currentElements.length;
 
           // Inspect latest assistant message text
           const latestEl = currentElements.length > 0 ? currentElements[currentElements.length - 1] : null;
           const currentText = latestEl ? (latestEl.innerText || "").trim() : "";
-          const isNewContent = (currentCount > initialCount) || (currentText.length > 20 && currentText !== initialLastText);
+          const isNewContent = (currentCount > initialCount) || (currentText.length > 20 && currentText !== initialLastText && !currentText.startsWith(initialLastText));
 
           // Check if generation is actively streaming
           if (stopBtn) {
@@ -563,7 +614,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
             // 2 quiet checks (1 second) after stop button disappears
             if (quietPeriods >= 2) {
               setTimeout(async () => {
-                const resp = await getLatestResponse(config, provider);
+                const resp = await getLatestResponse(config, provider, initialCount, initialLastText);
                 finish(resp);
               }, 300);
               return;
@@ -577,7 +628,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
               // 5 quiet checks (2.5 seconds) without length change indicates complete generation
               if (quietPeriods >= 5) {
                 setTimeout(async () => {
-                  const resp = await getLatestResponse(config, provider);
+                  const resp = await getLatestResponse(config, provider, initialCount, initialLastText);
                   finish(resp);
                 }, 300);
                 return;
@@ -591,66 +642,26 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
       });
     }
 
-    async function getLatestResponse(config, provider) {
+    async function getLatestResponse(config, provider, initialCount = 0, initialLastText = "") {
       let mainText = "";
 
       // 1. Check primary response selectors (strictly ignore user bubbles)
-      for (const sel of config.responseSelectors) {
-        try {
-          const els = Array.from(document.querySelectorAll(sel)).filter(el =>
-            !el.matches('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message') &&
-            !el.closest('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message')
-          );
-          if (els.length > 0) {
-            const lastEl = els[els.length - 1];
-            const md = cleanAndFormatElement(lastEl);
-            if (md && md.length > 10) {
-              mainText = md;
-              break;
-            }
-          }
-        } catch (_) {}
-      }
-
-      // 2. Broad fallback search across known assistant wrappers if primary selector failed
-      if (!mainText || mainText.length < 10) {
-        const fallbackSelectors = [
-          '[data-test-render-count]',
-          '.font-claude-message',
-          '[data-message-author-role="assistant"]',
-          'main article',
-          'model-response-text',
-          '.prose',
-          '.markdown',
-          'div[data-is-streaming="false"]'
-        ];
-        for (const sel of fallbackSelectors) {
-          try {
-            const els = Array.from(document.querySelectorAll(sel)).filter(el =>
-              !el.matches('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message') &&
-              !el.closest('[data-testid="user-message"], .font-user-message, [data-message-author-role="user"], .user-message')
-            );
-            if (els.length > 0) {
-              const lastEl = els[els.length - 1];
-              const md = cleanAndFormatElement(lastEl);
-              if (md && md.length > 10) {
-                mainText = md;
-                break;
-              }
-            }
-          } catch (_) {}
+      const assistantNodes = getAssistantMessages(config);
+      if (assistantNodes.length > 0) {
+        const lastEl = assistantNodes[assistantNodes.length - 1];
+        const md = cleanAndFormatElement(lastEl);
+        if (md && md.length > 10) {
+          mainText = md;
         }
       }
 
-      // 3. Check and append Artifact code if on Claude
+      // 2. Check and append Artifact code if on Claude
       if (provider === "claude") {
         try {
           const artifactCode = await safeExtractClaudeArtifactCode();
           if (artifactCode && artifactCode.trim().length > 20) {
-            // Check if code block content is already contained in mainText
             const codeSnippet = artifactCode.replace(/^```\w*\n/, '').slice(0, 50).trim();
             if (!codeSnippet || !mainText.includes(codeSnippet)) {
-              console.log("[AIVCO Bridge] Appending extracted Claude Artifact code to response.");
               mainText = (mainText ? mainText + "\n\n" : "") + artifactCode;
             }
           }
@@ -659,16 +670,9 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         }
       }
 
-      // 4. Ultimate code block fallback: If no fenced code block was captured, scan DOM for code blocks
-      if (!mainText.includes("```")) {
-        const pageCodeBlocks = Array.from(document.querySelectorAll('pre code, .cm-content'));
-        for (const block of pageCodeBlocks) {
-          const codeText = (block.textContent || '').trim();
-          if (codeText.length > 20) {
-            let lang = detectCodeLanguage(codeText);
-            mainText += (mainText ? "\n\n" : "") + `\`\`\`${lang}\n${codeText}\n\`\`\``;
-          }
-        }
+      // If text is identical to initialLastText and count hasn't grown, do not replay stale response
+      if (initialLastText && assistantNodes.length <= initialCount && mainText.trim() === initialLastText.trim()) {
+        return "";
       }
 
       // Remove executive brief if echoed and unwanted header prefixes
@@ -730,9 +734,9 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
           throw new Error(`Could not find prompt input field on ${provider} after waiting 12s. Please verify you are logged into your account.`);
         }
 
-        const initialElements = document.querySelectorAll(config.responseSelectors.join(","));
-        const initialCount = initialElements.length;
-        const initialLastText = initialElements.length > 0 ? (initialElements[initialElements.length - 1].innerText || "").trim() : "";
+        const initialElements = getAssistantMessages(config);
+        const initialCount = request.baseline ? request.baseline.baselineMsgCount : initialElements.length;
+        const initialLastText = request.baseline ? request.baseline.baselineLastMsgText : (initialElements.length > 0 ? (initialElements[initialElements.length - 1].innerText || "").trim() : "");
 
         if (provider === "claude") {
           await submitClaudePrompt(inputEl, promptText);
@@ -740,15 +744,27 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
           await submitGenericPrompt(inputEl, promptText, config);
         }
 
-        const markdownResponse = await waitForResponse(config, initialCount, initialLastText, provider, 150000, requestId);
+        const resp = await waitForResponse(config, initialCount, initialLastText, provider, 150000, requestId);
 
-        const donePayload = {
-          action: "dispatch_result",
-          request_id: requestId,
-          provider: provider,
-          status: "done",
-          markdown: markdownResponse
-        };
+        let donePayload;
+        if (resp && resp.isError) {
+          donePayload = {
+            action: "dispatch_result",
+            request_id: requestId,
+            provider: provider,
+            status: "error",
+            markdown: "",
+            error: resp.error || "GENERATION_ERROR"
+          };
+        } else {
+          donePayload = {
+            action: "dispatch_result",
+            request_id: requestId,
+            provider: provider,
+            status: "done",
+            markdown: typeof resp === "string" ? resp : (resp ? resp.markdown || "" : "")
+          };
+        }
 
         // 1. Push to background.js
         chrome.runtime.sendMessage(donePayload);
@@ -763,7 +779,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         console.error("[AIVCO Bridge] Error executing prompt:", err);
         let fallbackText = "";
         try {
-          fallbackText = await getLatestResponse(config, provider);
+          fallbackText = await getLatestResponse(config, provider, initialCount, initialLastText);
         } catch (_) {}
 
         const errPayload = {
