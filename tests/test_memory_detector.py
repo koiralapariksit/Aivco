@@ -141,7 +141,7 @@ def test_conservative_negative_sentences():
 
 
 def test_adversarial_review_and_roast_not_swallowed_by_learned_rule(tmp_path):
-    from cognitive_kernel import evaluate_query, learn_from_turn
+    from kernel.cognitive_kernel import evaluate_query, learn_from_turn
     from memory.multi_layer_memory import MultiLayerMemory
 
     mem_file = tmp_path / "test_adversarial_mem.json"

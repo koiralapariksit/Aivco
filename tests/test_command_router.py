@@ -7,11 +7,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import llm_controller
+import controllers.llm_controller as llm_controller
 from memory.memory_controller import MemoryController
 
 import Aivco
-from command_controller import CommandController, HELP_TEXT
+from controllers.command_controller import CommandController, HELP_TEXT
 
 
 def make_controller(tmp_path):
@@ -734,7 +734,7 @@ def test_synthesize_elite_prompt_categories():
 
 def test_gemini_api_directive_and_html_synthesis():
     from kernel.arbiter import extract_fuzzy_provider_directive, synthesize_elite_prompt, KernelCognitiveArbiter
-    from cognitive_kernel import detect_explicit_model_and_intent
+    from kernel.cognitive_kernel import detect_explicit_model_and_intent
 
     prompt = "use gemeni api to maek a website cloning youtube"
     prov, clean = extract_fuzzy_provider_directive(prompt)
@@ -778,7 +778,7 @@ def test_frontend_clone_typo_recognition_and_zero_roadmap():
 
 @pytest.mark.anyio
 async def test_server_web_failover_mechanism():
-    from server import is_web_result_failure, execute_web_failover
+    from server.app import is_web_result_failure, execute_web_failover
 
     assert is_web_result_failure("") is True
     assert is_web_result_failure(None) is True
@@ -887,7 +887,7 @@ def test_typescript_in_html_sanitizer():
 
 def test_model_attribution_ledger_truthful_response():
     from kernel.arbiter import KernelCognitiveArbiter, session_ledger
-    from cognitive_kernel import evaluate_query
+    from kernel.cognitive_kernel import evaluate_query
     from memory.multi_layer_memory import MultiLayerMemory
 
     session_ledger.clear()
@@ -983,7 +983,7 @@ def test_backend_tkinter_not_misclassified_as_html():
 
 def test_followup_about_me_summary_not_hijacked_by_stage0(tmp_path):
     from kernel.arbiter import KernelCognitiveArbiter, META_CONVERSATION_EXCLUDE
-    from cognitive_kernel import evaluate_query
+    from kernel.cognitive_kernel import evaluate_query
     from memory.multi_layer_memory import MultiLayerMemory
 
     mem_file = tmp_path / "test_followup_mem.json"
@@ -1008,7 +1008,7 @@ def test_followup_about_me_summary_not_hijacked_by_stage0(tmp_path):
 
 def test_multi_turn_chat_history_summarization():
     from kernel.arbiter import session_ledger
-    from llm_controller import LLMController
+    from controllers.llm_controller import LLMController
 
     session_ledger.clear()
     session_ledger.record_turn(
@@ -1054,7 +1054,7 @@ def test_multi_turn_chat_history_summarization():
 
 def test_temporal_query_routing_prefers_search():
     from kernel.arbiter import KernelCognitiveArbiter, LIVE_SEARCH_PATTERN
-    from cognitive_kernel import detect_explicit_model_and_intent
+    from kernel.cognitive_kernel import detect_explicit_model_and_intent
 
     query = "tell me about last fc barcelona match"
 
@@ -1072,7 +1072,7 @@ def test_temporal_query_routing_prefers_search():
 
 
 def test_anti_hallucination_guard_on_offline_models():
-    from llm_controller import LLMController, ANTI_HALLUCINATION_MANDATE, DEFAULT_SYSTEM_PROMPT
+    from controllers.llm_controller import LLMController, ANTI_HALLUCINATION_MANDATE, DEFAULT_SYSTEM_PROMPT
     from kernel.arbiter import synthesize_elite_prompt
 
     # 1. Mandate is present in default system prompt

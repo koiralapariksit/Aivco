@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
-from browser_agent import ExtensionBridgeRouter, extract_clean_markdown_from_html
+from agents.browser_agent import ExtensionBridgeRouter, extract_clean_markdown_from_html
 
 @pytest.mark.anyio
 async def test_websocket_markdown_preserves_html_tags():

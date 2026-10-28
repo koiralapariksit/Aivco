@@ -8,7 +8,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from browser_agent import (
+from agents.browser_agent import (
     ExtensionBridgeRouter,
     extract_clean_markdown_from_html,
     clean_search_query,
@@ -168,7 +168,7 @@ async def test_dispatch_result_push_event(bridge_router):
 @pytest.mark.anyio
 async def test_receive_bridge_result_http_endpoint():
     import time
-    from server import receive_bridge_result, universal_web_agent
+    from server.app import receive_bridge_result, universal_web_agent
     mock_ws = AsyncMock()
     universal_web_agent.register_client(mock_ws)
 

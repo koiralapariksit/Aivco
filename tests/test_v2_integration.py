@@ -14,9 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from memory.memory_controller import MemoryController
 from memory.multi_layer_memory import MultiLayerMemory
-from command_controller import CommandController
+from controllers.command_controller import CommandController
 import Aivco
-from llm_controller import LLMController, ModelGenerationError, ModelUnavailableError
+from controllers.llm_controller import LLMController, ModelGenerationError, ModelUnavailableError
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────

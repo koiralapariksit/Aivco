@@ -39,9 +39,9 @@ from memory.memory_controller import MemoryController
 from memory.memory_detector import MemoryDetector
 from memory.multi_layer_memory import MultiLayerMemory
 from memory.dataset_logger import FineTuneDatasetLogger
-from command_controller import CommandController, EXIT_SENTINEL, CLEAR_SENTINEL
-from llm_controller import LLMController, ModelUnavailableError, ModelGenerationError
-from cognitive_kernel import evaluate_query, learn_from_turn, scrub_sensitive_context
+from controllers.command_controller import CommandController, EXIT_SENTINEL, CLEAR_SENTINEL
+from controllers.llm_controller import LLMController, ModelUnavailableError, ModelGenerationError
+from kernel.cognitive_kernel import evaluate_query, learn_from_turn, scrub_sensitive_context
 
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_FILE = BASE_DIR / "memory" / "user" / "profile.json"

@@ -82,7 +82,7 @@ def load_env_file(env_path: str = ".env") -> None:
     """
     path_obj = Path(env_path)
     if env_path == ".env" and not path_obj.is_absolute():
-        path_obj = Path(__file__).resolve().parent / ".env"
+        path_obj = Path(__file__).resolve().parent.parent / ".env"
 
     if not path_obj.exists():
         return
@@ -360,7 +360,7 @@ class LLMController:
                 pass
 
         # 3. Web Account DOM Automation via UniversalWebAgent
-        from browser_agent import universal_web_agent
+        from agents.browser_agent import universal_web_agent
         res = universal_web_agent.query("claude", user_prompt)
         return res, "web-account:claude"
 
@@ -408,7 +408,7 @@ class LLMController:
                 pass
 
         # 3. Web Account DOM Automation via UniversalWebAgent
-        from browser_agent import universal_web_agent
+        from agents.browser_agent import universal_web_agent
         res = universal_web_agent.query("chatgpt", user_prompt)
         return res, "web-account:chatgpt"
 
@@ -456,7 +456,7 @@ class LLMController:
                 pass
 
         # 3. Web Account DOM Automation via UniversalWebAgent
-        from browser_agent import universal_web_agent
+        from agents.browser_agent import universal_web_agent
         res = universal_web_agent.query("grok", user_prompt)
         return res, "web-account:grok"
 
@@ -492,7 +492,7 @@ class LLMController:
         WEB_PROVIDERS = ("claude", "chatgpt", "grok", "gemini_web", "gemini-web", "claude_web", "chatgpt_web", "grok_web")
         if effective_force in WEB_PROVIDERS:
             target = "gemini_web" if effective_force in ("gemini_web", "gemini-web") else effective_force.replace("_web", "")
-            from browser_agent import universal_web_agent
+            from agents.browser_agent import universal_web_agent
             try:
                 web_res = universal_web_agent.query(target, user_prompt)
                 if _is_web_failure(web_res):
