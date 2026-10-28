@@ -213,14 +213,14 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
       });
 
       // 3. Format text blocks (headings, lists, inline code)
+      clone.querySelectorAll("strong, b").forEach(b => { b.textContent = ` **${b.textContent.trim()}** `; });
+      clone.querySelectorAll("em, i").forEach(i => { i.textContent = ` *${i.textContent.trim()}* `; });
+      clone.querySelectorAll("code").forEach(c => { c.textContent = ` \`${c.textContent.trim()}\` `; });
       clone.querySelectorAll("h1").forEach(h => { h.textContent = `\n# ${h.textContent.trim()}\n`; });
       clone.querySelectorAll("h2").forEach(h => { h.textContent = `\n## ${h.textContent.trim()}\n`; });
       clone.querySelectorAll("h3").forEach(h => { h.textContent = `\n### ${h.textContent.trim()}\n`; });
       clone.querySelectorAll("li").forEach(li => { li.textContent = `\n- ${li.textContent.trim()}`; });
       clone.querySelectorAll("p").forEach(p => { p.textContent = `\n${p.textContent.trim()}\n`; });
-      clone.querySelectorAll("strong, b").forEach(b => { b.textContent = `**${b.textContent}**`; });
-      clone.querySelectorAll("em, i").forEach(i => { i.textContent = `*${i.textContent}*`; });
-      clone.querySelectorAll("code").forEach(c => { c.textContent = `\`${c.textContent}\``; });
 
       let text = clone.textContent || clone.innerText || "";
 

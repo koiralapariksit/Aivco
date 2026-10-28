@@ -1049,3 +1049,85 @@ def test_multi_turn_chat_history_summarization():
     assert any(m.get("content") == "3 2 1" for m in captured_messages)
     assert any(m.get("content") == "Good morning, sir." for m in captured_messages)
     assert any(m.get("content") == "summarize all the above chat" for m in captured_messages)
+
+
+
+def test_temporal_query_routing_prefers_search():
+    from kernel.arbiter import KernelCognitiveArbiter, LIVE_SEARCH_PATTERN
+    from cognitive_kernel import detect_explicit_model_and_intent
+
+    query = "tell me about last fc barcelona match"
+
+    # 1. Matches LIVE_SEARCH_PATTERN
+    assert LIVE_SEARCH_PATTERN.search(query) is not None
+
+    # 2. detect_explicit_model_and_intent sets run_web_search = True
+    intent = detect_explicit_model_and_intent(query)
+    assert intent["run_web_search"] is True
+
+    # 3. KernelCognitiveArbiter routes to web-grounded tier (gemini/chatgpt/claude) over offline groq
+    tier, rationale = KernelCognitiveArbiter.arbitrate(query)
+    assert tier in ("gemini", "chatgpt", "claude")
+    assert "real-time" in rationale.lower() or "web-grounded" in rationale.lower() or "temporal" in rationale.lower()
+
+
+def test_anti_hallucination_guard_on_offline_models():
+    from llm_controller import LLMController, ANTI_HALLUCINATION_MANDATE, DEFAULT_SYSTEM_PROMPT
+    from kernel.arbiter import synthesize_elite_prompt
+
+    # 1. Mandate is present in default system prompt
+    assert "ANTI-HALLUCINATION & TEMPORAL VERIFICATION MANDATE" in DEFAULT_SYSTEM_PROMPT
+    assert "I do not have live web access or real-time verification for post-2024 events" in DEFAULT_SYSTEM_PROMPT
+
+    # 2. Mandate is synthesized into temporal query prompts when offline
+    query = "who won the champions league final yesterday"
+    elite_prompt = synthesize_elite_prompt(query)
+    assert "ANTI-HALLUCINATION & TEMPORAL VERIFICATION MANDATE" in elite_prompt
+
+    # 3. Verify route_and_generate passes the anti-hallucination mandate in system prompt
+    ctrl = LLMController()
+    captured_sys_prompt = []
+
+    def fake_groq(sys_p, usr_p, model="x", history=None):
+        captured_sys_prompt.append(sys_p)
+        return "I do not have live web access or real-time verification for post-2024 events."
+
+    ctrl._generate_groq = fake_groq
+
+    res = ctrl.route_and_generate(
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        user_prompt=elite_prompt,
+        force_provider="groq",
+    )
+    assert "I do not have live web access or real-time verification for post-2024 events" in res["response"]
+    assert "ANTI-HALLUCINATION & TEMPORAL VERIFICATION MANDATE" in captured_sys_prompt[0]
+
+
+def test_no_duplicate_concatenation_on_fallback():
+    from kernel.arbiter import normalize_text_and_whitespace, sanitize_and_validate_code_output
+
+    # 1. Unspaced period before capitalized word
+    stitched_text = "The generation failed.Sir, here is the answer."
+    cleaned = normalize_text_and_whitespace(stitched_text)
+    assert "failed. Sir, here is the answer." in cleaned
+
+    # 2. Merged dates and proper nouns
+    smashed = "FCBarcelona played against AtléticoMadrid on 20May2026. Next match in June2024."
+    cleaned_smashed = normalize_text_and_whitespace(smashed)
+    assert "FC Barcelona" in cleaned_smashed
+    assert "Atlético Madrid" in cleaned_smashed
+    assert "20 May 2026" in cleaned_smashed
+    assert "June 2024" in cleaned_smashed
+
+    # 3. Deduplication of identical paragraphs
+    duplicated = "Paragraph one.\n\nParagraph one.\n\nParagraph two."
+    deduped = normalize_text_and_whitespace(duplicated)
+    assert deduped.count("Paragraph one.") == 1
+    assert "Paragraph two." in deduped
+
+    # 4. Verified through sanitize_and_validate_code_output quality gate
+    raw_output = "⚡ [aivco-kernel] Fallback.\n\n⚡ [aivco-kernel] Fallback.\n\nResult for FCBarcelona on 20May2026.Sir, done."
+    sanitized = sanitize_and_validate_code_output(raw_output)
+    assert sanitized.count("⚡ [aivco-kernel] Fallback.") == 1
+    assert "FC Barcelona" in sanitized
+    assert "20 May 2026. Sir, done." in sanitized

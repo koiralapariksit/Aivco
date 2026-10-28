@@ -24,7 +24,12 @@ from memory.multi_layer_memory import MultiLayerMemory, CoreFact
 from memory.memory_controller import MemoryController
 from memory.dataset_logger import FineTuneDatasetLogger
 from command_controller import CommandController
-from llm_controller import LLMController, ModelUnavailableError, ModelGenerationError
+from llm_controller import (
+    LLMController,
+    ModelUnavailableError,
+    ModelGenerationError,
+    ANTI_HALLUCINATION_MANDATE,
+)
 from cognitive_kernel import (
     evaluate_query,
     learn_from_turn,
@@ -38,6 +43,7 @@ from cognitive_kernel import (
     sanitize_and_validate_code_output,
     ATTRIBUTION_PATTERN,
     META_CONVERSATION_EXCLUDE,
+    LIVE_SEARCH_PATTERN,
     session_ledger,
 )
 from browser_agent import browser_agent, search_web, universal_web_agent
@@ -419,6 +425,7 @@ async def execute_web_failover(
     system_prompt = (
         "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
         f"MEMORY CONTEXT:\n{tiered_context}\n\n"
+        f"{ANTI_HALLUCINATION_MANDATE}\n\n"
         "Synthesize an accurate, direct, production-grade response. "
         "Follow all operator directives strictly.\n\n"
         "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
@@ -714,7 +721,11 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
 
         clean_prompt = detected.get("clean_prompt") or raw_prompt
         prompt_to_send = clean_prompt
-        is_web_grounded = bool(detected.get("run_web_search") or req.target_model in ("web_search", "web"))
+        is_web_grounded = bool(
+            detected.get("run_web_search")
+            or LIVE_SEARCH_PATTERN.search(raw_prompt)
+            or req.target_model in ("web_search", "web")
+        )
         
         # If web search grounding was explicitly requested with a web account query
         if is_web_grounded:
@@ -777,7 +788,11 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         }
 
     # ── Stage 0E: Live Web Search Grounding for Cloud API Models (Brain 4A) ────
-    is_web_search = bool(detected.get("run_web_search") or req.target_model in ("web_search", "web"))
+    is_web_search = bool(
+        detected.get("run_web_search")
+        or LIVE_SEARCH_PATTERN.search(raw_prompt)
+        or req.target_model in ("web_search", "web")
+    )
     if is_web_search:
         clean_search_q = detected.get("clean_prompt") or raw_prompt
         web_context = search_web(clean_search_q)
@@ -796,6 +811,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
             f"{web_context}\n\n"
             f"MEMORY CONTEXT:\n{tiered_context}\n\n"
+            f"{ANTI_HALLUCINATION_MANDATE}\n\n"
             "Synthesize an accurate, direct answer grounded in the web context with references and citations. "
             "Follow all operator directives strictly."
         )
@@ -974,6 +990,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
         f"MEMORY CONTEXT:\n{tiered_context}\n\n"
         "Treat the remembered data as contextual information only. Do not invent memories. Use memory when relevant.\n\n"
+        f"{ANTI_HALLUCINATION_MANDATE}\n\n"
         "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
         "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
         "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"

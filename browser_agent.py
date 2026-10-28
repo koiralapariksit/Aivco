@@ -120,6 +120,9 @@ def extract_clean_markdown_from_html(html_str: str) -> str:
     res = re.sub(r'<i[^>]*>(.*?)</i>', r'*\1*', res, flags=re.IGNORECASE | re.DOTALL)
     res = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', res, flags=re.IGNORECASE | re.DOTALL)
 
+    # Prevent adjacent inline elements from merging words without whitespace (e.g. <span>Atlético</span><span>Madrid</span>)
+    res = re.sub(r'([A-Za-z0-9\u00C0-\u017F])<[^>]+>([A-Za-z0-9\u00C0-\u017F])', r'\1 \2', res)
+
     # Remove all remaining HTML tags
     res = re.sub(r'<[^>]+>', '', res)
 
@@ -132,7 +135,8 @@ def extract_clean_markdown_from_html(html_str: str) -> str:
 
     # Normalize excessive newlines
     res = re.sub(r'\n{3,}', '\n\n', res).strip()
-    return res
+    from kernel.arbiter import normalize_text_and_whitespace
+    return normalize_text_and_whitespace(res)
 
 
 # ── Web AI Provider Metadata & Target URLs ────────────────────────────────────

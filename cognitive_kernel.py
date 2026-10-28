@@ -43,6 +43,7 @@ from kernel.arbiter import (
     ATTRIBUTION_PATTERN,
     IDENTITY_PATTERN,
     META_CONVERSATION_EXCLUDE,
+    LIVE_SEARCH_PATTERN,
     session_ledger,
 )
 
@@ -423,13 +424,17 @@ def detect_explicit_model_and_intent(prompt: str) -> dict:
         run_web_search = True
         clean_prompt = re.sub(r"^(?:@search|search\s+(?:the\s+)?web|seach\s+(?:the\s+)?web|search\s+online|seach\s+online)\s*(?:for|about|:|-)?\s*", "", clean_prompt, flags=re.IGNORECASE).strip()
 
-    # 6. Automatic Factual Search Trigger
+    # 6. Automatic Factual & Real-Time Search Trigger
     is_identity = any(phrase in lower for phrase in (
         "who am i", "who are you", "who are u", "what is your name", "what is my name",
         "project status", "episode list", "dataset stats", "kernel status"
-    ))
+    )) or bool(IDENTITY_PATTERN.search(clean_prompt))
     if not is_identity and not run_web_search:
-        if re.search(r"\b(search|seach|latest|current|most|who\s+(?:won|has|is)|record\s+for|records\s+for|award|awards|ballon\s+d'?or|champions\s+league|world\s+cup|presidential|election|olympic|olympics|2024|2025|2026)\b", clean_prompt, re.IGNORECASE):
+        if LIVE_SEARCH_PATTERN.search(clean_prompt) or re.search(
+            r"\b(search|seach|latest|current|most|who\s+(?:won|has|is)|record\s+for|records\s+for|award|awards|ballon\s+d'?or|champions\s+league|world\s+cup|presidential|election|olympic|olympics|2024|2025|2026)\b",
+            clean_prompt,
+            re.IGNORECASE,
+        ):
             run_web_search = True
 
     return {

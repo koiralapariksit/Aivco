@@ -134,6 +134,11 @@ ATTRIBUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+LIVE_SEARCH_PATTERN = re.compile(
+    r"\b(today|yesterday|latest|recent|current|news|score|scores|match|matches|game|games|result|results|standing|standings|live|2025|2026|last\s+(?:match|game|night)|next\s+(?:match|game))\b",
+    re.IGNORECASE,
+)
+
 BACKEND_SCRIPT_GUARD = re.compile(
     r"\b(python|pyhton|tkinter|cli|terminal|bash|powershell|fastapi|django|flask|sql|postgresql|pytorch|pandas|numpy|scikit|c\+\+|rust)\b",
     re.IGNORECASE,
@@ -891,6 +896,17 @@ def synthesize_elite_prompt(
             "- Output immediately runnable script in standard markdown fenced code blocks."
         )
 
+    # 5. Real-Time / News / Sports / Temporal queries
+    if LIVE_SEARCH_PATTERN.search(clean_intent):
+        return (
+            f"USER OBJECTIVE: {clean_intent}\n\n"
+            "ANTI-HALLUCINATION & TEMPORAL VERIFICATION MANDATE:\n"
+            "- If you have grounded web search context provided, answer accurately citing the sources.\n"
+            "- If you do NOT have live web access or grounded search results for real-time, current, or post-2024 events, "
+            "you MUST explicitly state: 'I do not have live web access or real-time verification for post-2024 events.'\n"
+            "- NEVER fabricate, guess, or invent sports matches, scores, player transfers, or news headlines."
+        )
+
     return clean_intent
 
 
@@ -1228,6 +1244,12 @@ class KernelCognitiveArbiter:
                         chain, extension_connected=extension_connected
                     )
                     rationale = f"[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 ({tier.upper()})..."
+                elif LIVE_SEARCH_PATTERN.search(clean):
+                    chain = ["gemini", "chatgpt", "claude", "groq"]
+                    tier = provider_health.get_best_available_provider(
+                        chain, extension_connected=extension_connected
+                    )
+                    rationale = f"[aivco-kernel] Real-time/temporal query detected. Routing to web-grounded tier ({tier.upper()})..."
                 else:
                     scores = compute_vector_scores(prompt)
                     if scores["context_need"] >= 0.8 and not DIRECTIVE_TRIGGER_CHECK.search(prompt):
@@ -1461,10 +1483,96 @@ def sanitize_script_content(js_code: str) -> str:
     return js_code.strip()
 
 
+def normalize_text_and_whitespace(text: str) -> str:
+    """
+    Normalizes prose tokens and fixes spacing artifacts:
+    1. Preserves fenced code blocks (```...```) and inline code (`...`) verbatim.
+    2. Fixes unspaced sentence collisions (.Sir, -> . Sir,).
+    3. Fixes merged/smashed dates, numbers, and proper nouns:
+       - 'AtléticoMadrid' -> 'Atlético Madrid'
+       - 'FCBarcelona' -> 'FC Barcelona'
+       - 'RealMadrid' -> 'Real Madrid'
+       - '20May2026' -> '20 May 2026'
+       - 'June2024' -> 'June 2024'
+    4. Deduplicates consecutive identical lines/paragraphs caused by buffer re-stitching.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+
+    code_blocks = {}
+    counter = 0
+
+    def code_repl(m):
+        nonlocal counter
+        token = f"___AIVCO_CODE_BLOCK_{counter}___"
+        code_blocks[token] = m.group(0)
+        counter += 1
+        return token
+
+    # Protect code blocks
+    prose = re.sub(r"```[\s\S]*?```", code_repl, text)
+    prose = re.sub(r"`[^`\n]+`", code_repl, prose)
+
+    # 1. Unspaced period before capitalized word (.Sir, -> . Sir,)
+    prose = re.sub(r"\.([A-Z][a-z]+)", r". \1", prose)
+
+    # 2. Date normalization
+    prose = re.sub(
+        r"\b(\d{1,2})(January|February|March|April|May|June|July|August|September|October|November|December)(\d{4})\b",
+        r"\1 \2 \3",
+        prose,
+        flags=re.IGNORECASE,
+    )
+    prose = re.sub(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)(\d{4})\b",
+        r"\1 \2",
+        prose,
+        flags=re.IGNORECASE,
+    )
+    prose = re.sub(
+        r"\b(\d{1,2})(January|February|March|April|May|June|July|August|September|October|November|December)\b",
+        r"\1 \2",
+        prose,
+        flags=re.IGNORECASE,
+    )
+    prose = re.sub(r"\b(\d{1,4})([A-Z][a-z]+)\b", r"\1 \2", prose)
+
+    # 3. Known entity smashes
+    prose = re.sub(r"\bFCBarcelona\b", "FC Barcelona", prose)
+    prose = re.sub(r"\bAtl[eé]ticoMadrid\b", "Atlético Madrid", prose, flags=re.IGNORECASE)
+    prose = re.sub(r"\bRealMadrid\b", "Real Madrid", prose)
+    prose = re.sub(r"\b([A-Z]{2,})([A-Z][a-z]{2,})\b", r"\1 \2", prose)
+
+    # 4. Smashed unicode / CamelCase words in prose (lowercase followed by uppercase)
+    prose = re.sub(r"([a-z\u00DF-\u00FF])([A-Z\u00C0-\u00DE])", r"\1 \2", prose)
+
+    # 5. Deduplicate identical consecutive paragraphs
+    paragraphs = prose.split("\n\n")
+    deduped = []
+    for p in paragraphs:
+        p_strip = p.strip()
+        if not p_strip:
+            continue
+        if deduped and p_strip == deduped[-1].strip():
+            continue
+        deduped.append(p)
+    prose = "\n\n".join(deduped)
+
+    # 6. Deduplicate repeated back-to-back sentences within lines
+    prose = re.sub(r"([^.!?\n]{10,}[.!?])\s*\1", r"\1", prose)
+
+    # Restore code blocks
+    for token, block in code_blocks.items():
+        prose = prose.replace(token, block)
+
+    return prose.strip()
+
+
 def sanitize_and_validate_code_output(markdown_text: str) -> str:
     """
     Pre-delivery quality gate that strips accidental TypeScript syntax out of plain <script> blocks
-    (while leaving JSON/importmap/babel scripts untouched) and balances HTML & markdown fences.
+    (while leaving JSON/importmap/babel scripts untouched), balances HTML & markdown fences,
+    and normalizes prose whitespace and deduplicates fallback duplicates.
     """
     if not markdown_text or not isinstance(markdown_text, str):
         return markdown_text or ""
@@ -1503,4 +1611,5 @@ def sanitize_and_validate_code_output(markdown_text: str) -> str:
             if sanitized.count("```") % 2 != 0:
                 sanitized += "\n```"
 
+    sanitized = normalize_text_and_whitespace(sanitized)
     return sanitized

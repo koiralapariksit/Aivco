@@ -43,9 +43,18 @@ EXECUTIVE_AUTONOMY_MANDATE = (
     "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
 )
 
+ANTI_HALLUCINATION_MANDATE = (
+    "ANTI-HALLUCINATION & TEMPORAL VERIFICATION MANDATE:\n"
+    "If a user asks about real-time, current, or post-2024 events (sports scores, match results, transfers, news) "
+    "and you do not have live web access or grounded search results, you MUST explicitly state: "
+    "'I do not have live web access or real-time verification for post-2024 events.' "
+    "NEVER fabricate, guess, or invent sports matches, scores, player transfers, or news headlines."
+)
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
-    f"{EXECUTIVE_AUTONOMY_MANDATE}"
+    f"{EXECUTIVE_AUTONOMY_MANDATE}\n\n"
+    f"{ANTI_HALLUCINATION_MANDATE}"
 )
 
 
