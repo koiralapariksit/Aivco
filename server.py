@@ -1,18 +1,22 @@
 """
 AIVCO FastAPI GUI Bridge Server — Argon Edition
-Provides REST endpoints connecting the browser GUI dashboard to
-AIVCO's Cognitive Kernel, MultiLayerMemory, CommandController, and LLMController.
+Thin "waiter" layer between the browser GUI and AIVCO's Cognitive Kernel.
+
+Flow of POST /api/chat:
+    1. receive request
+    2. build_plan()    -> asks cognitive_kernel what to do (the ONLY decision point)
+    3. execute_plan()  -> runs the plan (LLM / web agent / memory / logger)
+    4. return response to the frontend
 """
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
-import subprocess
-import sys
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import json
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -64,6 +68,19 @@ dataset_logger = FineTuneDatasetLogger(filepath=DATASET_FILE)
 
 # Stateful Session Model Lock
 active_model_override: Optional[str] = None
+
+WEB_PROVIDERS = (
+    "claude", "chatgpt", "grok", "gemini_web", "gemini-web",
+    "claude_web", "chatgpt_web", "grok_web",
+)
+
+EXECUTIVE_AUTONOMY_MANDATE = (
+    "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
+    "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
+    "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
+    "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
+    "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
+)
 
 app = FastAPI(title="AIVCO GUI Bridge — Argon Edition", version="2.0")
 
@@ -389,6 +406,10 @@ def get_state() -> Dict[str, Any]:
     }
 
 
+# =============================================================================
+# CHAT PIPELINE:  build_plan  ->  execute_plan  ->  finish_turn
+# =============================================================================
+
 def is_web_result_failure(web_res: Optional[str]) -> bool:
     """Checks if web bridge execution failed or hit rate limit."""
     if not web_res or not web_res.strip():
@@ -404,109 +425,98 @@ def is_web_result_failure(web_res: Optional[str]) -> bool:
     )
 
 
-async def execute_web_failover(
-    target_tier: str,
-    clean_prompt: str,
-    raw_prompt: str,
-    handshake_msg: str,
-    t0: float,
-) -> Dict[str, Any]:
-    """Cascades to Tier 2 Groq/Gemini when Brain 4 web provider fails or hits rate limit."""
-    provider_health.record_failure(target_tier, reason="unavailable")
-    active_proj = tiered_memory.get_active_project()
-    tiered_context = tiered_memory.assemble_context(
-        active_project_id=active_proj,
-        cloud_safe=True,
-    )
-    failover_notice = (
-        f"⚡ [aivco-kernel] {target_tier.upper()} web session unavailable/rate-limited. "
-        "Auto-cascaded to Tier 2 Engine:\n\n"
-    )
-    system_prompt = (
-        "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
-        f"MEMORY CONTEXT:\n{tiered_context}\n\n"
-        f"{ANTI_HALLUCINATION_MANDATE}\n\n"
-        "Synthesize an accurate, direct, production-grade response. "
-        "Follow all operator directives strictly.\n\n"
-        "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
-        "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
-        "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
-        "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
-        "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
-    )
-    elite_prompt = synthesize_elite_prompt(clean_prompt, "groq", tiered_context)
-    try:
-        gen_res = llm_controller.route_and_generate(
-            system_prompt=system_prompt,
-            user_prompt=elite_prompt,
-            task_type="general",
-            force_provider="groq",
-            history=session_ledger.get_chat_history_messages(),
-        )
-        resp_text = gen_res.get("response", "")
-        used_prov = gen_res.get("provider_used", "groq")
-        provider_health.record_success(used_prov, round((time.time() - t0) * 1000))
-    except Exception as exc:
-        resp_text = f"Fallback error: {exc}"
-        used_prov = "tier2_fallback"
-        provider_health.record_failure("groq", reason=str(exc))
+# --- Small shared helpers (no decisions in here) ---
 
-    final_res = f"{failover_notice}{resp_text}"
-    final_res = sanitize_and_validate_code_output(final_res)
-    latency_ms = max(10, round((time.time() - t0) * 1000))
-    learn_from_turn(raw_prompt, final_res, tiered_memory)
-    session_ledger.record_turn(
-        prompt=clean_prompt,
-        target_tier=target_tier,
-        actual_provider=used_prov,
-        cascaded_from=target_tier if used_prov != target_tier else None,
-        response_markdown=final_res,
+def _assemble_context(cloud_safe: bool) -> str:
+    """Pulls the tiered memory context for the active project."""
+    return tiered_memory.assemble_context(
+        active_project_id=tiered_memory.get_active_project(),
+        cloud_safe=cloud_safe,
     )
-    dataset_logger.log(
-        source=f"failover_{target_tier}_to_{used_prov}",
-        task_type="web_agent_failover",
-        system_content=system_prompt[:500],
-        user_content=raw_prompt,
-        assistant_content=final_res,
-    )
+
+
+def _cascaded_from(initial_tier: Optional[str], actual: str, excluded: Tuple = ("auto", None)) -> Optional[str]:
+    """Returns the originally-targeted tier if the turn was served by a different provider."""
+    if actual != initial_tier and initial_tier not in excluded:
+        return initial_tier
+    return None
+
+
+def _reply(plan: Dict[str, Any], t0: float, response: str, provider: str, src: str,
+           tier: int, *, web_searched: bool = False, min_lat: int = 1) -> Dict[str, Any]:
+    """Builds the standard /api/chat JSON response shape."""
     return {
-        "response": final_res,
-        "provider": f"tier2:cascaded-from-{target_tier}",
-        "src": "Tier 2 (Failover)",
-        "tier": 2,
-        "lat": latency_ms,
-        "web_searched": False,
-        "handshake": handshake_msg,
+        "response": response,
+        "src": src,
+        "provider": provider,
+        "tier": tier,
+        "lat": max(min_lat, round((time.time() - t0) * 1000)),
+        "web_searched": web_searched,
+        "handshake": plan["handshake"],
     }
 
 
-@app.post("/api/chat")
-async def post_chat(req: ChatRequest) -> Dict[str, Any]:
+def finish_turn(
+    *,
+    raw_prompt: str,
+    response: str,
+    ledger_prompt: str,
+    target_tier: Optional[str],
+    actual_provider: str,
+    cascaded_from: Optional[str],
+    source: str,
+    task_type: str,
+    system_content: str,
+    health_ms: Optional[int] = None,
+    health_provider: Optional[str] = None,
+) -> None:
+    """Single place for end-of-turn bookkeeping: health, learning, ledger, dataset."""
+    if health_ms is not None:
+        provider_health.record_success(health_provider or actual_provider, health_ms)
+    learn_from_turn(raw_prompt, response, tiered_memory)
+    session_ledger.record_turn(
+        prompt=ledger_prompt,
+        target_tier=target_tier,
+        actual_provider=actual_provider,
+        cascaded_from=cascaded_from,
+        response_markdown=response,
+    )
+    dataset_logger.log(
+        source=source,
+        task_type=task_type,
+        system_content=system_content,
+        user_content=raw_prompt,
+        assistant_content=response,
+    )
+
+
+def _label_llm_provider(provider: str) -> Tuple[int, str]:
+    """Maps a provider name to the (tier number, label) shown in the UI."""
+    tier_num = 2
+    label = provider
+    if "llama" in provider or provider == "local_llama":
+        tier_num, label = 1, f"tier1:{provider}"
+    elif "gemini" in provider and "bridge" not in provider:
+        tier_num, label = 3, f"tier3:{provider}"
+    elif "groq" in provider and "bridge" not in provider:
+        tier_num, label = 2, f"tier2:{provider}"
+    elif "claude" in provider:
+        tier_num, label = 3, provider
+    elif "chatgpt" in provider or "grok" in provider:
+        tier_num, label = 2, provider
+    return tier_num, label
+
+
+# --- build_plan: the ONLY place that gathers decisions ---
+
+def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
     """
-    Multi-Brain Processing Architecture:
-    - Brain 1 ([aivco-kernel]): Stage 0/1 Zero-LLM resolver & directives (<5ms)
-    - Brain 4B ([brain4:browser]): Browser Agent Automation (Claude, ChatGPT, Grok)
-    - Brain 4A ([brain4:web-search]): Live Web Search Grounding (DuckDuckGo + Wikipedia)
-    - Brain 2 & 3: Fast Cloud & Deep Reasoning (Groq, Gemini, Local 5B) with forced routing
+    Asks cognitive_kernel what to do and returns a plain dict:
+      action: local | command | model_switch | browser | web_account |
+              web_search | web_fallback | llm
+      provider, task_type, private, web_search, local_response, clean_prompt,
+      handshake, initial_tier (+ a few small execution flags)
     """
-    global active_model_override
-    raw_prompt = req.prompt.strip()
-    if not raw_prompt:
-        raise HTTPException(status_code=400, detail="Empty prompt provided.")
-
-    # Unpack attachments if present
-    if req.attachments:
-        attachment_text = ""
-        for att in req.attachments:
-            name = att.get("name", "file.txt")
-            content = att.get("content", "")
-            attachment_text += f"\n\n[Attached File: {name}]\n```\n{content}\n```\n"
-        if attachment_text:
-            raw_prompt = f"{raw_prompt}{attachment_text}"
-
-    t0 = time.time()
-
-    # ── Stage 0: Sub-Second Kernel Cognitive Arbitration (< 5ms) ─────────────
     is_auto_mode = req.target_model in ("auto", "AUTO (Arbiter)", None)
     ext_connected = universal_web_agent.is_connected()
     target_tier, handshake_msg = KernelCognitiveArbiter.arbitrate(
@@ -514,202 +524,132 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         target_override=None if is_auto_mode else (req.target_model or active_model_override),
         extension_connected=ext_connected,
     )
-    initial_target_tier = target_tier
     if handshake_msg:
         print(f"[KernelCognitiveArbiter] Arbitrated '{raw_prompt[:40]}' -> Tier: {target_tier} | Handshake: {handshake_msg}")
 
-    # ── Stage 0A: Natural Language Model Detector & Switch ──────────────────
     detected = detect_explicit_model_and_intent(raw_prompt)
 
+    base: Dict[str, Any] = {
+        "action": None,
+        "provider": None,
+        "task_type": None,
+        "private": False,
+        "web_search": False,
+        "local_response": None,
+        "clean_prompt": detected.get("clean_prompt") or raw_prompt,
+        "handshake": handshake_msg,
+        "initial_tier": target_tier,
+    }
+
+    def plan(action: str, **kw) -> Dict[str, Any]:
+        return {**base, "action": action, **kw}
+
+    # Zero-LLM kernel evaluation, computed at most once per request.
+    _eval_cache: Dict[str, Any] = {}
+
+    def kernel_eval() -> Dict[str, Any]:
+        if "v" not in _eval_cache:
+            _eval_cache["v"] = evaluate_query(raw_prompt, tiered_memory)
+        return _eval_cache["v"]
+
+    # ── Natural-language model lock ("use groq from now on") ────────────────
     if detected.get("is_model_switch_only"):
-        active_model_override = detected["switch_provider"]
-        latency_ms = max(1, round((time.time() - t0) * 1000))
-        return {
-            "response": f"Sir, default model locked to [{detected['switch_provider']}].",
-            "provider": "aivco-kernel",
-            "src": "Procedural",
-            "tier": 0,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return plan("model_switch", provider=detected["switch_provider"])
 
-    # ── Stage 0B: Desktop Browser Automation (Brain 4B) — Explicit Command ONLY ──
+    # ── Explicit desktop browser command ─────────────────────────────────────
     if detected.get("is_desktop_browser_request"):
-        b_target = detected.get("browser_target") or "google"
-        clean_q = detected.get("clean_prompt") or raw_prompt
-        dispatch_info = browser_agent.open_and_dispatch(b_target, clean_q)
-        latency_ms = max(10, round((time.time() - t0) * 1000))
-        resp_msg = f"[Brain 4 Browser Agent] Dispatched desktop browser window to {b_target.upper()} ({dispatch_info['url']})."
-        return {
-            "response": resp_msg,
-            "provider": f"brain4:browser-{b_target}",
-            "src": "Brain 4",
-            "tier": 4,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return plan("browser", browser_target=detected.get("browser_target") or "google")
 
-    # ── Stage 0C: CommandController handling ──────────────────────────────────
+    # ── CommandController (slash commands etc.) ──────────────────────────────
+    # NOTE: CommandController.handle() both decides and runs; its result is
+    # captured here so ordering vs. later stages stays identical.
     cmd_result = command_controller.handle(raw_prompt)
     if cmd_result is not None:
-        if cmd_result == "__CLEAR__":
-            session_ledger.clear()
-        latency_ms = max(1, round((time.time() - t0) * 1000))
-        return {
-            "response": cmd_result,
-            "src": "Procedural",
-            "provider": "aivco-kernel",
-            "tier": 0,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return plan(
+            "command",
+            provider="aivco-kernel",
+            local_response=cmd_result,
+            clear_session=(cmd_result == "__CLEAR__"),
+        )
 
-    # ── Stage 0-Arbiter: Auto-Mode Kernel Direct Execution (<10ms) ───────────
-    if not META_CONVERSATION_EXCLUDE.search(raw_prompt) and ((is_auto_mode and not active_model_override and target_tier == "kernel") or ATTRIBUTION_PATTERN.search(raw_prompt)):
-        # Direct Model Attribution query (<1ms, 0 tokens)
+    # ── Kernel direct execution (attribution / clear / math / zero-LLM) ─────
+    # TODO: move this rule into cognitive_kernel later
+    if not META_CONVERSATION_EXCLUDE.search(raw_prompt) and (
+        (is_auto_mode and not active_model_override and target_tier == "kernel")
+        or ATTRIBUTION_PATTERN.search(raw_prompt)
+    ):
         if ATTRIBUTION_PATTERN.search(raw_prompt):
-            attr_ans = session_ledger.format_attribution_answer(raw_prompt)
-            latency_ms = max(1, round((time.time() - t0) * 1000))
-            return {
-                "response": attr_ans,
-                "src": "Procedural",
-                "provider": "aivco-kernel",
-                "tier": 0,
-                "lat": latency_ms,
-                "web_searched": False,
-                "handshake": handshake_msg,
-            }
+            return plan(
+                "command",
+                provider="aivco-kernel",
+                local_response=session_ledger.format_attribution_answer(raw_prompt),
+            )
 
-        # Direct clear/clean instruction
+        # TODO: move this rule into cognitive_kernel later
         clean_lower = raw_prompt.strip().lower()
         if re.match(r"^(clear|reset|clean)\s+(screen|memory|chat|context)$", clean_lower):
-            session_ledger.clear()
-            latency_ms = max(1, round((time.time() - t0) * 1000))
-            return {
-                "response": f"[aivco-kernel] Direct instruction executed: {clean_lower}.",
-                "src": "Procedural",
-                "provider": "aivco-kernel",
-                "tier": 0,
-                "lat": latency_ms,
-                "web_searched": False,
-                "handshake": handshake_msg,
-            }
+            return plan(
+                "command",
+                provider="aivco-kernel",
+                local_response=f"[aivco-kernel] Direct instruction executed: {clean_lower}.",
+                clear_session=True,
+            )
 
-        # Direct math evaluation (<2ms)
+        # TODO: move this rule into cognitive_kernel later
         m_calc = re.search(r"^(?:what is|calc)\s*(\d+\s*[\+\-\*\/]\s*\d+)", raw_prompt.strip(), re.IGNORECASE)
         if m_calc:
             expr = m_calc.group(1).replace(" ", "")
             m_ops = re.match(r"^(\d+)([\+\-\*\/])(\d+)$", expr)
             if m_ops:
                 a, op, b = int(m_ops.group(1)), m_ops.group(2), int(m_ops.group(3))
-                res = a + b if op == "+" else (a - b if op == "-" else (a * b if op == "*" else (round(a / b, 4) if b != 0 else "Error: Division by zero")))
-                latency_ms = max(1, round((time.time() - t0) * 1000))
-                return {
-                    "response": f"[aivco-kernel] Calculation: {expr} = {res}",
-                    "src": "Procedural",
-                    "provider": "aivco-kernel",
-                    "tier": 0,
-                    "lat": latency_ms,
-                    "web_searched": False,
-                    "handshake": handshake_msg,
-                }
+                if op == "+":
+                    res: Any = a + b
+                elif op == "-":
+                    res = a - b
+                elif op == "*":
+                    res = a * b
+                else:
+                    res = round(a / b, 4) if b != 0 else "Error: Division by zero"
+                return plan(
+                    "command",
+                    provider="aivco-kernel",
+                    local_response=f"[aivco-kernel] Calculation: {expr} = {res}",
+                )
 
-        # Zero-LLM local evaluation (identity, profile, tasks left, project status)
-        kernel_eval = evaluate_query(raw_prompt, tiered_memory)
-        if kernel_eval.get("can_answer_locally"):
-            local_res = kernel_eval.get("local_response", "")
-            learn_from_turn(raw_prompt, local_res, tiered_memory)
-            session_ledger.record_turn(
-                prompt=raw_prompt,
-                target_tier="kernel",
-                actual_provider="kernel",
-                cascaded_from=None,
-                response_markdown=local_res,
+        ev = kernel_eval()
+        if ev.get("can_answer_locally"):
+            return plan(
+                "local",
+                provider="aivco-kernel",
+                local_response=ev.get("local_response", ""),
+                kernel_stage=0,
+                min_lat=1,
             )
-            dataset_logger.log(
-                source="aivco_kernel",
-                task_type="kernel",
-                system_content="AIVCO Cognitive Kernel — Stage 0 zero-LLM local resolution.",
-                user_content=raw_prompt,
-                assistant_content=local_res,
-            )
-            latency_ms = max(1, round((time.time() - t0) * 1000))
-            return {
-                "response": local_res,
-                "src": "Semantic",
-                "provider": "aivco-kernel",
-                "tier": 0,
-                "lat": latency_ms,
-                "web_searched": False,
-                "handshake": handshake_msg,
-            }
 
-    # ── Stage 0-Arbiter: Auto-Mode Web AI Escalation (Brain 4 Claude/ChatGPT) ──
+    # ── Auto-mode web AI escalation (arbiter picked a web account) ──────────
     if is_auto_mode and not active_model_override and target_tier in ("claude", "chatgpt", "grok", "gemini_web"):
-        clean_prompt = detected.get("clean_prompt") or raw_prompt
-        # Executive Context Broker: wrap prompt with executive brief and memory context
-        active_proj = tiered_memory.get_active_project()
-        tiered_context = tiered_memory.assemble_context(
-            active_project_id=active_proj,
-            cloud_safe=True,
-        )
-        prompt_with_envelope = build_executive_envelope(clean_prompt, target_tier, tiered_context)
+        return plan("web_account", provider=target_tier, web_search=False, escalated=True)
 
-        web_res = await universal_web_agent.dispatch_prompt_async(
-            target_tier,
-            prompt_with_envelope,
-            timeout=180.0,
-            auto_launch_wait=15.0,
-        )
-        if is_web_result_failure(web_res):
-            return await execute_web_failover(target_tier, clean_prompt, raw_prompt, handshake_msg, t0)
-        latency_ms = max(10, round((time.time() - t0) * 1000))
-        web_res = sanitize_and_validate_code_output(web_res)
-        learn_from_turn(raw_prompt, web_res, tiered_memory)
-        session_ledger.record_turn(
-            prompt=clean_prompt,
-            target_tier=initial_target_tier,
-            actual_provider=target_tier,
-            cascaded_from=None,
-            response_markdown=web_res,
-        )
-        dataset_logger.log(
-            source=f"web_account_{target_tier}",
-            task_type="web_agent",
-            system_content=f"AIVCO Cognitive Arbiter -> Brain 4 ({target_tier}) execution.",
-            user_content=raw_prompt,
-            assistant_content=web_res,
-        )
-        return {
-            "response": web_res,
-            "provider": f"web-account:{target_tier}",
-            "src": "Brain 4 (Web Agent)",
-            "tier": 4,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
-
-    # ── Stage 0D: Universal Web AI Accounts Execution (Brain 4B) ──────────────
-    # Real personal web AI accounts (Claude, ChatGPT, Grok, Gemini Web) via Playwright DOM
-    WEB_PROVIDERS = (
-        "claude", "chatgpt", "grok", "gemini_web", "gemini-web",
-        "claude_web", "chatgpt_web", "grok_web",
-    )
+    # ── Resolve explicit provider ────────────────────────────────────────────
+    # NOTE: preserved as-is from the original routing behavior.
     explicit_provider = (
         detected.get("target_provider")
         or (req.target_model if req.target_model not in ("auto", "web_search", "web") else None)
         or active_model_override
     )
+    wants_search = bool(
+        detected.get("run_web_search")
+        or LIVE_SEARCH_PATTERN.search(raw_prompt)
+        or req.target_model in ("web_search", "web")
+    )
+
+    # ── Explicit web account (Claude / ChatGPT / Grok / Gemini Web) ─────────
     target_web = (
         explicit_provider if explicit_provider in WEB_PROVIDERS
         else (req.target_model if req.target_model in WEB_PROVIDERS else None)
     )
-
     if target_web:
+        # TODO: move this rule into cognitive_kernel later
         if target_web in ("gemini-web", "gemini_web"):
             target_web = "gemini_web"
         elif target_web in ("claude", "claude_web"):
@@ -718,233 +658,50 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             target_web = "chatgpt"
         elif target_web in ("grok", "grok_web"):
             target_web = "grok"
+        return plan("web_account", provider=target_web, web_search=wants_search, escalated=False)
 
-        clean_prompt = detected.get("clean_prompt") or raw_prompt
-        prompt_to_send = clean_prompt
-        is_web_grounded = bool(
-            detected.get("run_web_search")
-            or LIVE_SEARCH_PATTERN.search(raw_prompt)
-            or req.target_model in ("web_search", "web")
-        )
-        
-        # If web search grounding was explicitly requested with a web account query
-        if is_web_grounded:
-            try:
-                snippets = search_web(clean_prompt)
-                if snippets:
-                    prompt_to_send = (
-                        f"[Grounding Information from Web Search]:\n{snippets}\n\n"
-                        f"User Prompt: {clean_prompt}\n"
-                        f"Please answer the user prompt accurately using the grounding information above."
-                    )
-            except Exception:
-                pass
-
-        active_proj = tiered_memory.get_active_project()
-        tiered_context = tiered_memory.assemble_context(
-            active_project_id=active_proj,
-            cloud_safe=True,
-        )
-        prompt_to_send = build_executive_envelope(prompt_to_send, target_web, tiered_context)
-
-        web_res = await universal_web_agent.dispatch_prompt_async(
-            target_web,
-            prompt_to_send,
-            timeout=180.0,
-            auto_launch_wait=15.0,
-        )
-        if is_web_result_failure(web_res):
-            provider_health.record_failure(
-                target_web,
-                reason="rate_limit" if "rate" in (web_res or "").lower() else "timeout",
-            )
-            return await execute_web_failover(target_web, clean_prompt, raw_prompt, handshake_msg, t0)
-        latency_ms = max(10, round((time.time() - t0) * 1000))
-        provider_health.record_success(target_web, latency_ms)
-        web_res = sanitize_and_validate_code_output(web_res)
-        learn_from_turn(raw_prompt, web_res, tiered_memory)
-        session_ledger.record_turn(
-            prompt=clean_prompt,
-            target_tier=initial_target_tier or target_web,
-            actual_provider=target_web,
-            cascaded_from=initial_target_tier if target_web != initial_target_tier and initial_target_tier not in ("auto", None) else None,
-            response_markdown=web_res,
-        )
-        dataset_logger.log(
-            source=f"web_account_{target_web}",
-            task_type="web_agent",
-            system_content=f"AIVCO ExtensionBridgeRouter -> {target_web} Chrome Extension execution.",
-            user_content=raw_prompt,
-            assistant_content=web_res,
-        )
-        return {
-            "response": web_res,
-            "provider": f"web-account:{target_web}",
-            "src": "Brain 4 (Web Agent)",
-            "tier": 4,
-            "lat": latency_ms,
-            "web_searched": is_web_grounded,
-            "handshake": handshake_msg,
-        }
-
-    # ── Stage 0E: Live Web Search Grounding for Cloud API Models (Brain 4A) ────
-    is_web_search = bool(
-        detected.get("run_web_search")
-        or LIVE_SEARCH_PATTERN.search(raw_prompt)
-        or req.target_model in ("web_search", "web")
-    )
-    if is_web_search:
-        clean_search_q = detected.get("clean_prompt") or raw_prompt
-        web_context = search_web(clean_search_q)
+    # ── Live web search grounding for cloud API models ──────────────────────
+    if wants_search:
+        # TODO: move this rule into cognitive_kernel later
         target_prov = (
             explicit_provider
-            if (explicit_provider and explicit_provider not in ("auto", "web_search", "web") and explicit_provider not in WEB_PROVIDERS)
+            if (explicit_provider and explicit_provider not in ("auto", "web_search", "web")
+                and explicit_provider not in WEB_PROVIDERS)
             else "gemini"
         )
-        
-        active_proj = tiered_memory.get_active_project()
-        tiered_context = tiered_memory.assemble_context(
-            active_project_id=active_proj,
-            cloud_safe=True,
+        return plan(
+            "web_search",
+            provider=target_prov,
+            task_type="deep" if target_prov == "gemini" else "general",
+            web_search=True,
         )
-        system_prompt = (
-            "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
-            f"{web_context}\n\n"
-            f"MEMORY CONTEXT:\n{tiered_context}\n\n"
-            f"{ANTI_HALLUCINATION_MANDATE}\n\n"
-            "Synthesize an accurate, direct answer grounded in the web context with references and citations. "
-            "Follow all operator directives strictly."
-        )
-        try:
-            gen_res = llm_controller.route_and_generate(
-                system_prompt=system_prompt,
-                user_prompt=clean_search_q,
-                task_type="deep" if target_prov == "gemini" else "general",
-                force_provider=target_prov,
-                history=session_ledger.get_chat_history_messages(),
-            )
-            resp_text = gen_res.get("response", "")
-            used_prov = gen_res.get("provider_used", target_prov)
-            provider_health.record_success(used_prov, round((time.time() - t0) * 1000))
-        except Exception:
-            # Fallback to direct web grounding synthesis when API keys are not configured in .env
-            resp_text = (
-                f"[AIVCO Real-Time Web Grounding]:\n\n"
-                f"{web_context}\n\n"
-                f"(Grounded directly from live web search — DuckDuckGo & Wikipedia verified knowledge)."
-            )
-            used_prov = f"web_grounding:{target_prov}"
-        
-        resp_text = sanitize_and_validate_code_output(resp_text)
-        latency_ms = max(10, round((time.time() - t0) * 1000))
-        
-        learn_from_turn(raw_prompt, resp_text, tiered_memory)
-        session_ledger.record_turn(
-            prompt=clean_search_q,
-            target_tier=initial_target_tier or target_prov,
-            actual_provider=used_prov,
-            cascaded_from=initial_target_tier if used_prov != initial_target_tier and initial_target_tier not in ("auto", None) else None,
-            response_markdown=resp_text,
-        )
-        dataset_logger.log(
-            source=f"web_search_{used_prov}",
-            task_type="web_search",
-            system_content=system_prompt[:500],
-            user_content=raw_prompt,
-            assistant_content=resp_text,
-        )
-        prov_label = used_prov
-        if "gemini" in used_prov and not used_prov.startswith("tier"):
-            prov_label = f"tier3:{used_prov}"
-        elif "groq" in used_prov and not used_prov.startswith("tier"):
-            prov_label = f"tier2:{used_prov}"
 
-        return {
-            "response": resp_text,
-            "provider": prov_label,
-            "src": "Brain 4 (Web Grounding)",
-            "tier": 3 if "gemini" in used_prov else 2,
-            "lat": latency_ms,
-            "web_searched": True,
-            "handshake": handshake_msg,
-        }
-
-    # ── Stage 1: CognitiveKernel Zero-LLM Evaluation ─────────────────────────
-    kernel_eval = evaluate_query(raw_prompt, tiered_memory)
-
-    if kernel_eval.get("can_answer_locally") and kernel_eval.get("confidence", 0) >= 0.85:
-        is_directive = "directive" in kernel_eval.get("reason", "").lower()
+    # ── Stage 1 kernel zero-LLM evaluation ───────────────────────────────────
+    ev = kernel_eval()
+    if ev.get("can_answer_locally") and ev.get("confidence", 0) >= 0.85:
+        is_directive = "directive" in ev.get("reason", "").lower()
         is_who_am_i = bool(re.search(r"\b(who\s+am\s+i)\b", raw_prompt, re.IGNORECASE))
         if not explicit_provider or explicit_provider == "aivco-kernel" or is_directive or is_who_am_i:
-            local_res = kernel_eval.get("local_response", "")
-            learn_from_turn(raw_prompt, local_res, tiered_memory)
-            session_ledger.record_turn(
-                prompt=raw_prompt,
-                target_tier="kernel",
-                actual_provider="kernel",
-                cascaded_from=None,
-                response_markdown=local_res,
+            return plan(
+                "local",
+                provider="aivco-kernel",
+                local_response=ev.get("local_response", ""),
+                kernel_stage=1,
+                min_lat=2,
             )
-            dataset_logger.log(
-                source="aivco_kernel",
-                task_type="kernel",
-                system_content="AIVCO Cognitive Kernel — Stage 1 zero-LLM local resolution.",
-                user_content=raw_prompt,
-                assistant_content=local_res,
-            )
-            latency_ms = max(2, round((time.time() - t0) * 1000))
-            return {
-                "response": local_res,
-                "src": "Semantic",
-                "provider": "aivco-kernel",
-                "tier": 0,
-                "lat": latency_ms,
-                "web_searched": False,
-                "handshake": handshake_msg,
-            }
 
-    # ── Stage 2: Autonomous LLM Escalation ────────────────────────────────────
-    clean_prompt = detected.get("clean_prompt") or raw_prompt
+    # ── Stage 2: autonomous LLM escalation ───────────────────────────────────
+    clean_prompt = base["clean_prompt"]
     lower_prompt = clean_prompt.lower()
 
-    # Automatic Web Agent fallback when cloud API keys are commented out in .env
-    has_cloud_keys = bool(os.environ.get("GROQ_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip())
+    # Web agent fallback when cloud API keys are not configured
+    has_cloud_keys = bool(
+        os.environ.get("GROQ_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+    )
     if not has_cloud_keys and explicit_provider not in ("local", "local_llama"):
-        fallback_target = explicit_provider or "claude"
-        active_proj = tiered_memory.get_active_project()
-        tiered_context = tiered_memory.assemble_context(
-            active_project_id=active_proj,
-            cloud_safe=True,
-        )
-        enveloped_fallback = build_executive_envelope(clean_prompt, fallback_target, tiered_context)
-        web_res = universal_web_agent.query(fallback_target, enveloped_fallback)
-        latency_ms = max(10, round((time.time() - t0) * 1000))
-        learn_from_turn(raw_prompt, web_res, tiered_memory)
-        session_ledger.record_turn(
-            prompt=clean_prompt,
-            target_tier=initial_target_tier or fallback_target,
-            actual_provider=fallback_target,
-            cascaded_from=initial_target_tier if fallback_target != initial_target_tier and initial_target_tier not in ("auto", None) else None,
-            response_markdown=web_res,
-        )
-        dataset_logger.log(
-            source=f"web_agent_{fallback_target}",
-            task_type="web_agent_fallback",
-            system_content=f"AIVCO UniversalWebAgent -> {fallback_target} web fallback.",
-            user_content=raw_prompt,
-            assistant_content=web_res,
-        )
-        return {
-            "response": web_res,
-            "provider": f"web-account:{fallback_target}",
-            "src": "Brain 4 (Web Agent)",
-            "tier": 4,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return plan("web_fallback", provider=explicit_provider or "claude")
 
-    # Priority routing resolution
+    # TODO: move this rule into cognitive_kernel later
     force_provider = explicit_provider
     if force_provider == "gemini":
         task_type = "deep"
@@ -963,7 +720,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         clean_prompt = clean_prompt[9:].strip()
     else:
         if req.auto_route:
-            task_type = kernel_eval.get("task_type", "general")
+            task_type = ev.get("task_type", "general")
         else:
             if req.tier == 1:
                 task_type = "private"
@@ -972,17 +729,268 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             else:
                 task_type = "general"
 
+    # TODO: move this rule into cognitive_kernel later
     # Strict privacy lock on sensitive contents
     if any(s in lower_prompt for s in ("password", "secret", "my key", "token", "credential", "finance")):
         task_type = "private"
         force_provider = "local_llama"
 
-    is_cloud = task_type not in ("private", "offline", "memory")
-    active_proj = tiered_memory.get_active_project()
-    tiered_context = tiered_memory.assemble_context(
-        active_project_id=active_proj,
-        cloud_safe=is_cloud,
+    return plan(
+        "llm",
+        provider=force_provider,
+        task_type=task_type,
+        private=task_type in ("private", "offline", "memory"),
+        clean_prompt=clean_prompt,
     )
+
+
+# --- execute_plan: only runs what the plan says ---
+
+async def _run_model_switch(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    global active_model_override
+    active_model_override = plan["provider"]
+    return _reply(plan, t0, f"Sir, default model locked to [{plan['provider']}].",
+                  "aivco-kernel", "Procedural", 0)
+
+
+async def _run_browser(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    b_target = plan["browser_target"]
+    dispatch_info = browser_agent.open_and_dispatch(b_target, plan["clean_prompt"])
+    msg = f"[Brain 4 Browser Agent] Dispatched desktop browser window to {b_target.upper()} ({dispatch_info['url']})."
+    return _reply(plan, t0, msg, f"brain4:browser-{b_target}", "Brain 4", 4, min_lat=10)
+
+
+async def _run_command(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    """Procedural direct answers (commands, attribution, clear, math): no bookkeeping."""
+    if plan.get("clear_session"):
+        session_ledger.clear()
+    return _reply(plan, t0, plan["local_response"], plan["provider"], "Procedural", 0)
+
+
+async def _run_local(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    """Zero-LLM kernel answer with full bookkeeping."""
+    local_res = plan["local_response"]
+    finish_turn(
+        raw_prompt=raw_prompt,
+        response=local_res,
+        ledger_prompt=raw_prompt,
+        target_tier="kernel",
+        actual_provider="kernel",
+        cascaded_from=None,
+        source="aivco_kernel",
+        task_type="kernel",
+        system_content=f"AIVCO Cognitive Kernel — Stage {plan['kernel_stage']} zero-LLM local resolution.",
+    )
+    return _reply(plan, t0, local_res, "aivco-kernel", "Semantic", 0, min_lat=plan.get("min_lat", 1))
+
+
+async def execute_web_failover(
+    target_tier: str,
+    clean_prompt: str,
+    raw_prompt: str,
+    handshake_msg: str,
+    t0: float,
+) -> Dict[str, Any]:
+    """Cascades to Tier 2 Groq/Gemini when Brain 4 web provider fails or hits rate limit."""
+    provider_health.record_failure(target_tier, reason="unavailable")
+    tiered_context = _assemble_context(cloud_safe=True)
+    failover_notice = (
+        f"⚡ [aivco-kernel] {target_tier.upper()} web session unavailable/rate-limited. "
+        "Auto-cascaded to Tier 2 Engine:\n\n"
+    )
+    system_prompt = (
+        "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
+        f"MEMORY CONTEXT:\n{tiered_context}\n\n"
+        f"{ANTI_HALLUCINATION_MANDATE}\n\n"
+        "Synthesize an accurate, direct, production-grade response. "
+        "Follow all operator directives strictly.\n\n"
+        f"{EXECUTIVE_AUTONOMY_MANDATE}"
+    )
+    elite_prompt = synthesize_elite_prompt(clean_prompt, "groq", tiered_context)
+    try:
+        gen_res = await asyncio.to_thread(
+            llm_controller.route_and_generate,
+            system_prompt=system_prompt,
+            user_prompt=elite_prompt,
+            task_type="general",
+            force_provider="groq",
+            history=session_ledger.get_chat_history_messages(),
+        )
+        resp_text = gen_res.get("response", "")
+        used_prov = gen_res.get("provider_used", "groq")
+        provider_health.record_success(used_prov, round((time.time() - t0) * 1000))
+    except Exception as exc:
+        resp_text = f"Fallback error: {exc}"
+        used_prov = "tier2_fallback"
+        provider_health.record_failure("groq", reason=str(exc))
+
+    final_res = sanitize_and_validate_code_output(f"{failover_notice}{resp_text}")
+    latency_ms = max(10, round((time.time() - t0) * 1000))
+    finish_turn(
+        raw_prompt=raw_prompt,
+        response=final_res,
+        ledger_prompt=clean_prompt,
+        target_tier=target_tier,
+        actual_provider=used_prov,
+        cascaded_from=target_tier if used_prov != target_tier else None,
+        source=f"failover_{target_tier}_to_{used_prov}",
+        task_type="web_agent_failover",
+        system_content=system_prompt[:500],
+    )
+    return {
+        "response": final_res,
+        "provider": f"tier2:cascaded-from-{target_tier}",
+        "src": "Tier 2 (Failover)",
+        "tier": 2,
+        "lat": latency_ms,
+        "web_searched": False,
+        "handshake": handshake_msg,
+    }
+
+
+async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    provider = plan["provider"]
+    clean_prompt = plan["clean_prompt"]
+    escalated = plan.get("escalated", False)
+    prompt_to_send = clean_prompt
+
+    if plan["web_search"]:
+        try:
+            snippets = await asyncio.to_thread(search_web, clean_prompt)
+            if snippets:
+                prompt_to_send = (
+                    f"[Grounding Information from Web Search]:\n{snippets}\n\n"
+                    f"User Prompt: {clean_prompt}\n"
+                    f"Please answer the user prompt accurately using the grounding information above."
+                )
+        except Exception:
+            pass
+
+    prompt_to_send = build_executive_envelope(prompt_to_send, provider, _assemble_context(cloud_safe=True))
+    web_res = await universal_web_agent.dispatch_prompt_async(
+        provider,
+        prompt_to_send,
+        timeout=180.0,
+        auto_launch_wait=15.0,
+    )
+    if is_web_result_failure(web_res):
+        if not escalated:
+            provider_health.record_failure(
+                provider,
+                reason="rate_limit" if "rate" in (web_res or "").lower() else "timeout",
+            )
+        return await execute_web_failover(provider, clean_prompt, raw_prompt, plan["handshake"], t0)
+
+    latency_ms = max(10, round((time.time() - t0) * 1000))
+    web_res = sanitize_and_validate_code_output(web_res)
+    finish_turn(
+        raw_prompt=raw_prompt,
+        response=web_res,
+        ledger_prompt=clean_prompt,
+        target_tier=plan["initial_tier"] or provider,
+        actual_provider=provider,
+        cascaded_from=_cascaded_from(plan["initial_tier"], provider),
+        source=f"web_account_{provider}",
+        task_type="web_agent",
+        system_content=(
+            f"AIVCO Cognitive Arbiter -> Brain 4 ({provider}) execution." if escalated
+            else f"AIVCO ExtensionBridgeRouter -> {provider} Chrome Extension execution."
+        ),
+        health_ms=None if escalated else latency_ms,
+    )
+    return {
+        "response": web_res,
+        "provider": f"web-account:{provider}",
+        "src": "Brain 4 (Web Agent)",
+        "tier": 4,
+        "lat": latency_ms,
+        "web_searched": plan["web_search"],
+        "handshake": plan["handshake"],
+    }
+
+
+async def _run_web_search(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    clean_search_q = plan["clean_prompt"]
+    target_prov = plan["provider"]
+    web_context = await asyncio.to_thread(search_web, clean_search_q)
+    tiered_context = _assemble_context(cloud_safe=True)
+    system_prompt = (
+        "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
+        f"{web_context}\n\n"
+        f"MEMORY CONTEXT:\n{tiered_context}\n\n"
+        f"{ANTI_HALLUCINATION_MANDATE}\n\n"
+        "Synthesize an accurate, direct answer grounded in the web context with references and citations. "
+        "Follow all operator directives strictly."
+    )
+    health_ms: Optional[int] = None
+    try:
+        gen_res = await asyncio.to_thread(
+            llm_controller.route_and_generate,
+            system_prompt=system_prompt,
+            user_prompt=clean_search_q,
+            task_type=plan["task_type"],
+            force_provider=target_prov,
+            history=session_ledger.get_chat_history_messages(),
+        )
+        resp_text = gen_res.get("response", "")
+        used_prov = gen_res.get("provider_used", target_prov)
+        health_ms = round((time.time() - t0) * 1000)
+    except Exception:
+        # Fallback to direct web grounding synthesis when API keys are not configured in .env
+        resp_text = (
+            f"[AIVCO Real-Time Web Grounding]:\n\n"
+            f"{web_context}\n\n"
+            f"(Grounded directly from live web search — DuckDuckGo & Wikipedia verified knowledge)."
+        )
+        used_prov = f"web_grounding:{target_prov}"
+
+    resp_text = sanitize_and_validate_code_output(resp_text)
+    finish_turn(
+        raw_prompt=raw_prompt,
+        response=resp_text,
+        ledger_prompt=clean_search_q,
+        target_tier=plan["initial_tier"] or target_prov,
+        actual_provider=used_prov,
+        cascaded_from=_cascaded_from(plan["initial_tier"], used_prov),
+        source=f"web_search_{used_prov}",
+        task_type="web_search",
+        system_content=system_prompt[:500],
+        health_ms=health_ms,
+    )
+    prov_label = used_prov
+    if "gemini" in used_prov and not used_prov.startswith("tier"):
+        prov_label = f"tier3:{used_prov}"
+    elif "groq" in used_prov and not used_prov.startswith("tier"):
+        prov_label = f"tier2:{used_prov}"
+    return _reply(plan, t0, resp_text, prov_label, "Brain 4 (Web Grounding)",
+                  3 if "gemini" in used_prov else 2, web_searched=True, min_lat=10)
+
+
+async def _run_web_fallback(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    fallback_target = plan["provider"]
+    clean_prompt = plan["clean_prompt"]
+    enveloped = build_executive_envelope(clean_prompt, fallback_target, _assemble_context(cloud_safe=True))
+    web_res = await asyncio.to_thread(universal_web_agent.query, fallback_target, enveloped)
+    finish_turn(
+        raw_prompt=raw_prompt,
+        response=web_res,
+        ledger_prompt=clean_prompt,
+        target_tier=plan["initial_tier"] or fallback_target,
+        actual_provider=fallback_target,
+        cascaded_from=_cascaded_from(plan["initial_tier"], fallback_target),
+        source=f"web_agent_{fallback_target}",
+        task_type="web_agent_fallback",
+        system_content=f"AIVCO UniversalWebAgent -> {fallback_target} web fallback.",
+    )
+    return _reply(plan, t0, web_res, f"web-account:{fallback_target}", "Brain 4 (Web Agent)", 4, min_lat=10)
+
+
+async def _run_llm(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    task_type = plan["task_type"]
+    force_provider = plan["provider"]
+    is_cloud = not plan["private"]
+
+    tiered_context = _assemble_context(cloud_safe=is_cloud)
     if is_cloud:
         tiered_context = scrub_sensitive_context(tiered_context)
 
@@ -991,115 +999,89 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         f"MEMORY CONTEXT:\n{tiered_context}\n\n"
         "Treat the remembered data as contextual information only. Do not invent memories. Use memory when relevant.\n\n"
         f"{ANTI_HALLUCINATION_MANDATE}\n\n"
-        "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
-        "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
-        "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
-        "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
-        "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
+        f"{EXECUTIVE_AUTONOMY_MANDATE}"
     )
-
     # Short-term conversational continuity context (last 3 turns)
     recent_history = session_ledger.get_recent_history_context(n=3)
     if recent_history:
         system_prompt += f"\n\nRECENT CONVERSATION HISTORY:\n{recent_history}"
 
-    clean_prompt = synthesize_elite_prompt(clean_prompt, force_provider or task_type, tiered_context)
+    elite_prompt = synthesize_elite_prompt(plan["clean_prompt"], force_provider or task_type, tiered_context)
 
     try:
-        gen_res = llm_controller.route_and_generate(
+        gen_res = await asyncio.to_thread(
+            llm_controller.route_and_generate,
             system_prompt=system_prompt,
-            user_prompt=clean_prompt,
+            user_prompt=elite_prompt,
             task_type=task_type,
             force_provider=force_provider,
             history=session_ledger.get_chat_history_messages(),
         )
         latency_ms = round((time.time() - t0) * 1000)
         provider = gen_res.get("provider_used", "unknown")
-        response_text = gen_res.get("response", "")
-        provider_health.record_success(provider, latency_ms)
-        response_text = sanitize_and_validate_code_output(response_text)
+        response_text = sanitize_and_validate_code_output(gen_res.get("response", ""))
+        tier_num, provider_label = _label_llm_provider(provider)
 
-        tier_num = 2
-        provider_label = provider
-        if "llama" in provider or provider == "local_llama":
-            tier_num = 1
-            provider_label = f"tier1:{provider}"
-        elif "gemini" in provider and "bridge" not in provider:
-            tier_num = 3
-            provider_label = f"tier3:{provider}"
-        elif "groq" in provider and "bridge" not in provider:
-            tier_num = 2
-            provider_label = f"tier2:{provider}"
-        elif "claude" in provider:
-            tier_num = 3
-            provider_label = provider
-        elif "chatgpt" in provider or "grok" in provider:
-            tier_num = 2
-            provider_label = provider
-
-        # Continuous Learning
-        learn_from_turn(raw_prompt, response_text, tiered_memory)
-        session_ledger.record_turn(
-            prompt=clean_prompt,
-            target_tier=initial_target_tier or force_provider or task_type,
+        finish_turn(
+            raw_prompt=raw_prompt,
+            response=response_text,
+            ledger_prompt=elite_prompt,
+            target_tier=plan["initial_tier"] or force_provider or task_type,
             actual_provider=provider,
-            cascaded_from=initial_target_tier if provider != initial_target_tier and initial_target_tier not in ("auto", "kernel", None) else None,
-            response_markdown=response_text,
-        )
-
-        # Fine-tune dataset logging
-        dataset_logger.log(
+            cascaded_from=_cascaded_from(plan["initial_tier"], provider, ("auto", "kernel", None)),
             source=provider,
             task_type=task_type,
             system_content=system_prompt[:500],
-            user_content=raw_prompt,
-            assistant_content=response_text,
+            health_ms=latency_ms,
         )
-
-        return {
-            "response": response_text,
-            "src": "Episodic",
-            "provider": provider_label,
-            "tier": tier_num,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return _reply(plan, t0, response_text, provider_label, "Episodic", tier_num, min_lat=0)
     except ModelUnavailableError as exc:
         provider_health.record_failure(force_provider or "groq", reason=str(exc))
-        latency_ms = round((time.time() - t0) * 1000)
-        return {
-            "response": f"[AIVCO] Model unavailable: {exc}",
-            "src": "Procedural",
-            "provider": "unavailable",
-            "tier": 0,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return _reply(plan, t0, f"[AIVCO] Model unavailable: {exc}", "unavailable", "Procedural", 0, min_lat=0)
     except ModelGenerationError as exc:
         provider_health.record_failure(force_provider or "groq", reason=str(exc))
-        latency_ms = round((time.time() - t0) * 1000)
-        return {
-            "response": f"[AIVCO] Generation error: {exc}",
-            "src": "Procedural",
-            "provider": "error",
-            "tier": 0,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return _reply(plan, t0, f"[AIVCO] Generation error: {exc}", "error", "Procedural", 0, min_lat=0)
     except Exception as exc:
-        latency_ms = round((time.time() - t0) * 1000)
-        return {
-            "response": f"[AIVCO] Error: {exc}",
-            "src": "Procedural",
-            "provider": "error",
-            "tier": 0,
-            "lat": latency_ms,
-            "web_searched": False,
-            "handshake": handshake_msg,
-        }
+        return _reply(plan, t0, f"[AIVCO] Error: {exc}", "error", "Procedural", 0, min_lat=0)
+
+
+_EXECUTORS = {
+    "model_switch": _run_model_switch,
+    "browser": _run_browser,
+    "command": _run_command,
+    "local": _run_local,
+    "web_account": _run_web_account,
+    "web_search": _run_web_search,
+    "web_fallback": _run_web_fallback,
+    "llm": _run_llm,
+}
+
+
+async def execute_plan(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
+    """Runs the plan exactly as given. No routing decisions here."""
+    return await _EXECUTORS[plan["action"]](plan, raw_prompt, t0)
+
+
+@app.post("/api/chat")
+async def post_chat(req: ChatRequest) -> Dict[str, Any]:
+    """Thin waiter: receive -> build_plan -> execute_plan -> return."""
+    raw_prompt = req.prompt.strip()
+    if not raw_prompt:
+        raise HTTPException(status_code=400, detail="Empty prompt provided.")
+
+    # Unpack attachments if present
+    if req.attachments:
+        attachment_text = ""
+        for att in req.attachments:
+            name = att.get("name", "file.txt")
+            content = att.get("content", "")
+            attachment_text += f"\n\n[Attached File: {name}]\n```\n{content}\n```\n"
+        if attachment_text:
+            raw_prompt = f"{raw_prompt}{attachment_text}"
+
+    t0 = time.time()
+    plan = build_plan(req, raw_prompt)
+    return await execute_plan(plan, raw_prompt, t0)
 
 
 # --- Native Chrome Extension Bridge (WebSocket & REST) ---
@@ -1205,6 +1187,8 @@ def get_vault_status_endpoint() -> Dict[str, Any]:
 @app.post("/api/vault/login")
 def vault_login_endpoint(req: VaultLoginRequest) -> Dict[str, Any]:
     """Launches the persistent agent browser on port 9222 (CDP Bridge)."""
+    # NOTE: `req` is intentionally unused. The URL and request body shape are kept
+    # for frontend compatibility; the CDP launcher takes no provider/slot arguments.
     return universal_web_agent.launch_cdp()
 
 
