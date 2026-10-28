@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -683,7 +684,9 @@ def test_extract_fuzzy_provider_directive_typos():
         ("use chagpt", "chatgpt", ""),
         ("chagpt: make an app", "chatgpt", "make an app"),
         ("ask chatgpt to tell about me", "chatgpt", "tell about me"),
-        ("use gmini to build an ecommerce store", "gemini_web", "build an ecommerce store"),
+        ("use gmini to build an ecommerce store", "gemini", "build an ecommerce store"),
+        ("use gemini web to build an ecommerce store", "gemini_web", "build an ecommerce store"),
+        ("use gemeni api to maek a website cloning youtube", "gemini", "maek a website cloning youtube"),
         ("make an app with cladue", "claude", "make an app"),
         ("switch to grok", "grok", ""),
         ("who am i", None, "who am i"),
@@ -714,6 +717,7 @@ def test_synthesize_elite_prompt_categories():
     fe_prompt = synthesize_elite_prompt("make website for sports", "claude", "")
     assert "USER OBJECTIVE: make website for sports" in fe_prompt
     assert "ELITE ENGINEERING SPECIFICATION:" in fe_prompt
+    assert "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):" in fe_prompt
     assert "<!DOCTYPE html>" in fe_prompt
     assert "dark obsidian/glassmorphic" in fe_prompt
 
@@ -726,6 +730,50 @@ def test_synthesize_elite_prompt_categories():
     # 4. General fallback
     gen_prompt = synthesize_elite_prompt("what is the capital of France?", "groq", "")
     assert gen_prompt == "what is the capital of France?"
+
+
+def test_gemini_api_directive_and_html_synthesis():
+    from kernel.arbiter import extract_fuzzy_provider_directive, synthesize_elite_prompt, KernelCognitiveArbiter
+    from cognitive_kernel import detect_explicit_model_and_intent
+
+    prompt = "use gemeni api to maek a website cloning youtube"
+    prov, clean = extract_fuzzy_provider_directive(prompt)
+    assert prov == "gemini", f"Expected gemini for '{prompt}', got '{prov}'"
+    assert clean == "maek a website cloning youtube"
+
+    tier, _ = KernelCognitiveArbiter.arbitrate(prompt)
+    assert tier == "gemini"
+
+    detected = detect_explicit_model_and_intent(prompt)
+    assert detected["target_provider"] == "gemini"
+
+    # Verify elite HTML specification synthesis
+    fe_spec = synthesize_elite_prompt(clean, "gemini")
+    assert "<!DOCTYPE html>" in fe_spec
+    assert "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):" in fe_spec
+    assert "```html" in fe_spec
+    assert "cloning youtube" in fe_spec.lower()
+
+
+def test_frontend_clone_typo_recognition_and_zero_roadmap():
+    from kernel.arbiter import KernelCognitiveArbiter, synthesize_elite_prompt, FRONTEND_PATTERN
+
+    prompt = "HEy aiv i want you to build a working claong website of nelflix for me"
+
+    # Check that FRONTEND_PATTERN matches typos claong and nelflix
+    assert FRONTEND_PATTERN.search(prompt) is not None
+
+    # Check arbitration escalates to claude (Brain 4)
+    tier, rationale = KernelCognitiveArbiter.arbitrate(prompt)
+    assert tier == "claude"
+    assert "Heavy frontend" in rationale
+
+    # Check synthesized specification mandates executable single-file HTML, never a roadmap
+    fe_spec = synthesize_elite_prompt(prompt, target_tier="claude")
+    assert "<!DOCTYPE html>" in fe_spec
+    assert "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):" in fe_spec
+    assert "NEVER reply with a high-level text roadmap" in fe_spec
+    assert "```html" in fe_spec
 
 
 @pytest.mark.anyio
@@ -750,5 +798,91 @@ async def test_server_web_failover_mechanism():
     assert "⚡ [aivco-kernel] CLAUDE web session unavailable/rate-limited" in res["response"]
     assert res["tier"] == 2
     assert "tier2" in res["provider"]
+
+
+def test_circuit_breaker_cooldown_routing():
+    from kernel.arbiter import KernelCognitiveArbiter, provider_health
+
+    try:
+        provider_health.reset_all()
+
+        # Normal condition: claude is healthy, extension connected
+        tier, _ = KernelCognitiveArbiter.arbitrate("build a complete website", extension_connected=True)
+        assert tier == "claude"
+
+        # Record rate limit failure on claude
+        t_start = time.perf_counter()
+        provider_health.record_failure("claude", reason="rate_limit")
+
+        # Claude is now on 600s cooldown. When extension is connected, next healthy provider is chatgpt
+        tier_fallback_ext, rationale = KernelCognitiveArbiter.arbitrate("build a complete website", extension_connected=True)
+        routing_time_ms = (time.perf_counter() - t_start) * 1000.0
+        assert routing_time_ms < 5.0, f"Routing took {routing_time_ms}ms, expected < 1ms"
+        assert tier_fallback_ext == "chatgpt", f"Expected chatgpt fallback, got {tier_fallback_ext}"
+        assert "chatgpt" in rationale.lower()
+
+        # When extension is disconnected and claude is on cooldown, next healthy is gemini (Cloud API)
+        tier_fallback_no_ext, rationale2 = KernelCognitiveArbiter.arbitrate("build a complete website", extension_connected=False)
+        assert tier_fallback_no_ext == "gemini", f"Expected gemini fallback, got {tier_fallback_no_ext}"
+        assert "gemini" in rationale2.lower()
+    finally:
+        provider_health.reset_all()
+
+
+def test_domain_blueprint_injection():
+    from kernel.arbiter import synthesize_elite_prompt
+
+    # 1. Generic website -> AIVCO Command Center
+    cmd_prompt = synthesize_elite_prompt("make a website for me", "claude")
+    assert "DOMAIN FEATURE BLUEPRINT (AIVCO COMMAND CENTER & DEVELOPER PORTFOLIO):" in cmd_prompt
+    assert "Executive Hero Header" in cmd_prompt
+    assert "Live System Telemetry Deck" in cmd_prompt
+
+    # 2. Video / Streaming -> Video & Streaming Blueprint
+    yt_prompt = synthesize_elite_prompt("clone youtube", "gemini")
+    assert "DOMAIN FEATURE BLUEPRINT (VIDEO & STREAMING PLATFORM):" in yt_prompt
+    assert "Hero Billboard" in yt_prompt
+    assert "Horizontal Content Rails" in yt_prompt
+
+    netflix_prompt = synthesize_elite_prompt("claong website of nelflix", "claude")
+    assert "DOMAIN FEATURE BLUEPRINT (VIDEO & STREAMING PLATFORM):" in netflix_prompt
+
+    # 3. Music / Audio -> Music & Audio Blueprint
+    spot_prompt = synthesize_elite_prompt("clone spotify", "claude")
+    assert "DOMAIN FEATURE BLUEPRINT (MUSIC & AUDIO STREAMING SYSTEM):" in spot_prompt
+    assert "Web Audio API Sound Engine" in spot_prompt
+    assert "3-Pane Architecture" in spot_prompt
+
+    # 4. E-Commerce -> Storefront Blueprint
+    ecom_prompt = synthesize_elite_prompt("build an ecommerce store", "groq")
+    assert "DOMAIN FEATURE BLUEPRINT (EDITORIAL E-COMMERCE STOREFRONT):" in ecom_prompt
+    assert "Slide-Over Cart Drawer" in ecom_prompt
+
+
+def test_typescript_in_html_sanitizer():
+    from kernel.arbiter import sanitize_and_validate_code_output
+
+    broken_html = (
+        "```html\n"
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<body>\n"
+        "<script>\n"
+        "type Item = {...}; const container = document.getElementById('c') as HTMLElement; function openModal(id:number){}\n"
+        "</script>\n"
+        "</body>\n"
+        "</html>\n"
+        "```"
+    )
+
+    sanitized = sanitize_and_validate_code_output(broken_html)
+    assert "type Item" not in sanitized
+    assert "as HTMLElement" not in sanitized
+    assert "id:number" not in sanitized
+    assert "function openModal(id)" in sanitized
+    assert "document.getElementById('c')" in sanitized
+    assert "<!DOCTYPE html>" in sanitized
+    assert "</html>" in sanitized
+
 
 

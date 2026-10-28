@@ -1,6 +1,11 @@
 import os
+import sys
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from llm_controller import (
     LLMController,
     load_env_file,
@@ -82,7 +87,7 @@ def test_route_and_generate_large_prompt_calls_gemini_first():
         mock_llama.assert_not_called()
 
 
-def test_route_and_generate_private_lock_never_calls_cloud():
+def test_route_and_generate_private_lock_cascades_on_failure():
     ctrl = LLMController()
     with patch.object(ctrl, "generate", return_value="Local response") as mock_llama, \
          patch.object(ctrl, "_generate_groq") as mock_groq, \
@@ -95,24 +100,29 @@ def test_route_and_generate_private_lock_never_calls_cloud():
         mock_groq.assert_not_called()
         mock_gemini.assert_not_called()
 
-    # Verify that if local_llama fails under private lock, it raises and never falls back
+    # Verify that if local_llama fails under private lock, it cascades to Groq (privacy block eliminated)
     with patch.object(ctrl, "generate", side_effect=ModelGenerationError("local error")) as mock_llama, \
-         patch.object(ctrl, "_generate_groq") as mock_groq, \
+         patch.object(ctrl, "_generate_groq", return_value="Groq fallback response") as mock_groq, \
          patch.object(ctrl, "_generate_gemini") as mock_gemini:
-        with pytest.raises(ModelGenerationError):
-            ctrl.route_and_generate("sys", "user", task_type="private")
-        mock_groq.assert_not_called()
+        res = ctrl.route_and_generate("sys", "user", task_type="private")
+        assert res["provider_used"] == "groq (fallback from local)"
+        assert res["response"] == "Groq fallback response"
+        assert res["fallback_triggered"] is True
+        mock_llama.assert_called_once_with("sys", "user")
+        mock_groq.assert_called_once_with("sys", "user")
         mock_gemini.assert_not_called()
 
-    # Verify that if local_llama raises ModelUnavailableError under private lock, it raises privacy notice
+    # Verify that if local_llama raises ModelUnavailableError under private lock, it cascades to Groq -> Gemini without raising privacy notice
     with patch.object(ctrl, "generate", side_effect=ModelUnavailableError("missing binary")) as mock_llama, \
-         patch.object(ctrl, "_generate_groq") as mock_groq, \
-         patch.object(ctrl, "_generate_gemini") as mock_gemini:
-        with pytest.raises(ModelUnavailableError) as exc_info:
-            ctrl.route_and_generate("sys", "user", task_type="private")
-        assert "Cloud fallback blocked to protect privacy" in str(exc_info.value)
-        mock_groq.assert_not_called()
-        mock_gemini.assert_not_called()
+         patch.object(ctrl, "_generate_groq", side_effect=ModelUnavailableError("no groq key")) as mock_groq, \
+         patch.object(ctrl, "_generate_gemini", return_value="Gemini fallback response") as mock_gemini:
+        res = ctrl.route_and_generate("sys", "user", task_type="private")
+        assert res["provider_used"] == "gemini (fallback from local)"
+        assert res["response"] == "Gemini fallback response"
+        assert res["fallback_triggered"] is True
+        mock_llama.assert_called_once_with("sys", "user")
+        mock_groq.assert_called_once_with("sys", "user")
+        mock_gemini.assert_called_once_with("sys", "user")
 
 
 def test_route_and_generate_groq_failure_falls_back_to_gemini():

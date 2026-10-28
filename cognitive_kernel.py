@@ -38,6 +38,8 @@ from kernel.arbiter import (
     compress_memory_context,
     extract_fuzzy_provider_directive,
     synthesize_elite_prompt,
+    provider_health,
+    sanitize_and_validate_code_output,
 )
 
 if TYPE_CHECKING:
@@ -340,13 +342,18 @@ def detect_explicit_model_and_intent(prompt: str) -> dict:
 
     # 3. Model prefix extraction (e.g. 'search claude - ...', 'use claude to search...', 'claude: ...')
     m_model_prefix = re.match(
-        r"^(?:search|seach|ask|use)\s+(claude|chatgpt|grok|gemini\s+web|gemini_web|gemini|gemeni|groq)\s*(?:to\s+(?:search|seach)\s*)?[-:]?\s*(.*)$",
+        r"^(?:search|seach|ask|use)\s+(claude|chatgpt|grok|gemini\s+(?:web|browser|api|key|pro|flash)|gemini_web|gemeni\s+(?:web|browser|api|key|pro|flash)|gemini|gemeni|groq)\s*(?:to\s+(?:search|seach)\s*)?[-:]?\s*(.*)$",
         raw,
         re.IGNORECASE,
     )
     if m_model_prefix:
         model = m_model_prefix.group(1).lower().replace(" ", "_")
-        target_provider = "gemini" if ("gemen" in model or model == "gemini") else model
+        if "web" in model or "browser" in model:
+            target_provider = "gemini_web"
+        elif "gemin" in model or "gemen" in model:
+            target_provider = "gemini"
+        else:
+            target_provider = model
         clean_prompt = m_model_prefix.group(2).strip()
         if re.search(r"^(?:search|seach)\s+", lower) or "to search" in lower or "to seach" in lower:
             run_web_search = True
@@ -359,12 +366,12 @@ def detect_explicit_model_and_intent(prompt: str) -> dict:
 
     # 4. Standalone model triggers if not matched by prefix
     if not target_provider:
-        if re.search(r"\b(?:use\s+gemini\s+web|ask\s+gemini\s+web|@gemini_web)\b", lower):
+        if re.search(r"\b(?:use\s+gemini\s+(?:web|browser)|ask\s+gemini\s+(?:web|browser)|@gemini_web)\b", lower):
             target_provider = "gemini_web"
-            clean_prompt = re.sub(r"^(?:use\s+gemini\s+web|ask\s+gemini\s+web|@gemini_web)\s*(?:to|for)?\s*", "", clean_prompt, flags=re.IGNORECASE).strip()
-        elif re.search(r"\b(?:use\s+(?:gemini|gemeni)|ask\s+(?:gemini|gemeni)|@(?:gemini|gemeni))\b", lower):
+            clean_prompt = re.sub(r"^(?:use\s+gemini\s+(?:web|browser)|ask\s+gemini\s+(?:web|browser)|@gemini_web)\s*(?:to|for)?\s*", "", clean_prompt, flags=re.IGNORECASE).strip()
+        elif re.search(r"\b(?:use\s+(?:gemini|gemeni)(?:\s+(?:api|key|pro|flash))?|ask\s+(?:gemini|gemeni)(?:\s+(?:api|key|pro|flash))?|@(?:gemini|gemeni))\b", lower):
             target_provider = "gemini"
-            clean_prompt = re.sub(r"^(?:use\s+(?:gemini|gemeni)|ask\s+(?:gemini|gemeni)|@(?:gemini|gemeni))\s*(?:to|for)?\s*", "", clean_prompt, flags=re.IGNORECASE).strip()
+            clean_prompt = re.sub(r"^(?:use\s+(?:gemini|gemeni)(?:\s+(?:api|key|pro|flash))?|ask\s+(?:gemini|gemeni)(?:\s+(?:api|key|pro|flash))?|@(?:gemini|gemeni))\s*(?:to|for)?\s*", "", clean_prompt, flags=re.IGNORECASE).strip()
         elif re.search(r"\b(?:use\s+groq|ask\s+groq|@groq)\b", lower):
             target_provider = "groq"
             clean_prompt = re.sub(r"^(?:use\s+groq|ask\s+groq|@groq)\s*(?:to|for)?\s*", "", clean_prompt, flags=re.IGNORECASE).strip()

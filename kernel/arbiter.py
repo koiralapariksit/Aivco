@@ -106,7 +106,7 @@ IDENTITY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FRONTEND_PATTERN = re.compile(
-    r"\b(web(?:site|asite)|e-?commer(?:ce|ice)|clone|dashboard|html|web\s*app|store|spotify|ui|interface|landing\s+page)\b",
+    r"\b(web(?:site|asite)|e-?commer(?:ce|ice)|clon(?:e|ing|ed)|claong|dashboard|html|web\s*app|store|spotify|netflix|nelflix|youtube|ui(?:\s+only)?|interface|landing\s+page|working\s+app|build\s+it|make\s+it)\b",
     re.IGNORECASE,
 )
 CODING_PATTERN = re.compile(
@@ -121,9 +121,14 @@ KNOWN_PROVIDER_ALIASES: Dict[str, str] = {
     # ChatGPT
     "chatgpt": "chatgpt", "chat gpt": "chatgpt", "gpt": "chatgpt", "chagpt": "chatgpt",
     "chatgtp": "chatgpt", "openai": "chatgpt", "gpt4": "chatgpt", "chatgpt_web": "chatgpt",
-    # Gemini
-    "gemini web": "gemini_web", "gemini_web": "gemini_web", "gemini": "gemini_web",
-    "gmini": "gemini_web", "gemni": "gemini_web", "gemeni": "gemini_web",
+    # Gemini Cloud API (Tier 3 Fast Cloud API Key)
+    "gemini": "gemini", "gemeni": "gemini", "gmini": "gemini", "gemni": "gemini",
+    "gemini api": "gemini", "gemeni api": "gemini", "gemini key": "gemini", "gemeni key": "gemini",
+    "gemini pro": "gemini", "gemini flash": "gemini", "gemeni pro": "gemini", "gemeni flash": "gemini",
+    "gemini-flash": "gemini", "gemini-pro": "gemini",
+    # Gemini Web (Browser Account Automation)
+    "gemini web": "gemini_web", "gemini_web": "gemini_web", "gemini browser": "gemini_web",
+    "gemeni web": "gemini_web", "gemeni browser": "gemini_web",
     # Grok
     "grok": "grok", "gork": "grok", "xai": "grok", "grok_web": "grok",
     # Fast API / Local
@@ -135,9 +140,158 @@ KNOWN_PROVIDER_ALIASES: Dict[str, str] = {
 CANONICAL_PROVIDERS: Dict[str, List[str]] = {
     "claude": ["claude"],
     "chatgpt": ["chatgpt", "gpt"],
-    "gemini_web": ["gemini", "gemini web"],
+    "gemini": ["gemini", "gemeni", "gemini api", "gemeni api"],
+    "gemini_web": ["gemini web", "gemeni web", "gemini browser"],
     "grok": ["grok", "xai"],
+    "groq": ["groq"],
 }
+
+
+# ── Live Provider Health & Circuit Breaker ───────────────────────────────────
+
+class ProviderHealthRecord:
+    def __init__(self, name: str):
+        self.name = name
+        self.healthy: bool = True
+        self.cooldown_until: float = 0.0
+        self.consecutive_failures: int = 0
+        self.avg_latency_ms: float = 0.0
+        self.last_failure_reason: str = ""
+
+    def is_available(self, extension_connected: bool = True) -> bool:
+        if self.name in ("claude", "chatgpt", "gemini_web", "grok", "claude_web", "chatgpt_web", "grok_web"):
+            if not extension_connected:
+                return False
+        if time.time() < self.cooldown_until:
+            return False
+        return True
+
+
+class ProviderHealthRegistry:
+    """
+    Live Provider Health & Circuit Breaker.
+    Prevents repeated dispatches to rate-limited, cloudflare-challenged, or disconnected providers.
+    """
+    DEFAULT_PROVIDERS = ["claude", "chatgpt", "gemini_web", "grok", "gemini", "groq"]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._registry: Dict[str, ProviderHealthRecord] = {
+            p: ProviderHealthRecord(p) for p in self.DEFAULT_PROVIDERS
+        }
+        self._has_active_cooldown: bool = False
+
+    def _normalize(self, provider: str) -> str:
+        prov = (provider or "").strip().lower()
+        prov = prov.replace("-", "_")
+        if prov in ("gemini_web", "claude_web", "chatgpt_web", "grok_web"):
+            return prov
+        if prov.startswith("web_account:") or prov.startswith("web-account:"):
+            prov = prov.split(":", 1)[1]
+        if prov in KNOWN_PROVIDER_ALIASES:
+            return KNOWN_PROVIDER_ALIASES[prov]
+        return prov
+
+    def get_record(self, provider: str) -> ProviderHealthRecord:
+        norm = self._normalize(provider)
+        with self._lock:
+            if norm not in self._registry:
+                self._registry[norm] = ProviderHealthRecord(norm)
+            return self._registry[norm]
+
+    def record_failure(self, provider: str, reason: str = "") -> None:
+        norm = self._normalize(provider)
+        reason_lower = (reason or "").lower()
+        now = time.time()
+        with self._lock:
+            if norm not in self._registry:
+                self._registry[norm] = ProviderHealthRecord(norm)
+            rec = self._registry[norm]
+            rec.consecutive_failures += 1
+            rec.last_failure_reason = reason
+            rec.healthy = False
+            self._has_active_cooldown = True
+
+            if "rate_limit" in reason_lower or "rate limit" in reason_lower or "cloudflare" in reason_lower:
+                rec.cooldown_until = now + 600.0  # 10 minutes
+            elif "timeout" in reason_lower or "disconnected" in reason_lower or "disconnect" in reason_lower:
+                rec.cooldown_until = now + 120.0  # 2 minutes
+            else:
+                if rec.consecutive_failures >= 2:
+                    rec.cooldown_until = now + 60.0
+                else:
+                    rec.cooldown_until = now + 15.0
+
+    def record_success(self, provider: str, latency_ms: float = 0.0) -> None:
+        norm = self._normalize(provider)
+        with self._lock:
+            if norm not in self._registry:
+                self._registry[norm] = ProviderHealthRecord(norm)
+            rec = self._registry[norm]
+            rec.consecutive_failures = 0
+            rec.cooldown_until = 0.0
+            rec.healthy = True
+            rec.last_failure_reason = ""
+            if latency_ms > 0:
+                if rec.avg_latency_ms <= 0:
+                    rec.avg_latency_ms = latency_ms
+                else:
+                    rec.avg_latency_ms = 0.7 * rec.avg_latency_ms + 0.3 * latency_ms
+
+    def is_available(self, provider: str, extension_connected: bool = True) -> bool:
+        if not self._has_active_cooldown and extension_connected:
+            return True
+        norm = self._normalize(provider)
+        with self._lock:
+            rec = self._registry.get(norm)
+            if not rec:
+                rec = ProviderHealthRecord(norm)
+                self._registry[norm] = rec
+            return rec.is_available(extension_connected)
+
+    def get_best_available_provider(
+        self,
+        preferred_chain: list[str],
+        extension_connected: bool = True,
+    ) -> str:
+        if not self._has_active_cooldown and extension_connected:
+            return self._normalize(preferred_chain[0]) if preferred_chain else "groq"
+
+        now = time.time()
+        with self._lock:
+            has_any_cd = False
+            for p in preferred_chain:
+                norm = self._normalize(p)
+                rec = self._registry.get(norm)
+                if not rec:
+                    rec = ProviderHealthRecord(norm)
+                    self._registry[norm] = rec
+
+                if norm in ("claude", "chatgpt", "gemini_web", "grok", "claude_web", "chatgpt_web", "grok_web"):
+                    if not extension_connected:
+                        continue
+
+                if now < rec.cooldown_until:
+                    has_any_cd = True
+                    continue
+
+                return norm
+
+            self._has_active_cooldown = has_any_cd
+
+        return self._normalize(preferred_chain[-1]) if preferred_chain else "groq"
+
+    def reset_all(self) -> None:
+        with self._lock:
+            for rec in self._registry.values():
+                rec.healthy = True
+                rec.cooldown_until = 0.0
+                rec.consecutive_failures = 0
+                rec.last_failure_reason = ""
+            self._has_active_cooldown = False
+
+
+provider_health = ProviderHealthRegistry()
 
 
 DIRECTIVE_TRIGGER_CHECK = re.compile(
@@ -145,7 +299,7 @@ DIRECTIVE_TRIGGER_CHECK = re.compile(
     re.IGNORECASE,
 )
 TRIGGER_PATTERN = re.compile(
-    r"^(?:(?:use|ask|tell|run|search|via|with|on|in)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+web)?)(?:\s*(?:to\s+(?:search\s+)?|for\s+|:\s*|\s+-\s*|\s+–\s*)|\s+)(.*)$",
+    r"^(?:(?:use|ask|tell|run|search|via|with|on|in)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)(?:\s*(?:to\s+(?:search\s+)?|for\s+|:\s*|\s+-\s*|\s+–\s*)|\s+)(.*)$",
     re.IGNORECASE,
 )
 
@@ -202,7 +356,7 @@ def extract_fuzzy_provider_directive(prompt: str) -> Tuple[Optional[str], str]:
             return prov, rest
 
     # Check 3: Short standalone (e.g. 'use cladue', 'ask gpt', 'chagpt')
-    m_standalone = re.match(r"^(?:(?:use|ask|tell)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+web)?)[.?!]*$", raw, re.IGNORECASE)
+    m_standalone = re.match(r"^(?:(?:use|ask|tell)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)[.?!]*$", raw, re.IGNORECASE)
     if m_standalone:
         token = m_standalone.group(1).strip()
         if token.lower().endswith("to") and token.lower() not in KNOWN_PROVIDER_ALIASES:
@@ -215,7 +369,7 @@ def extract_fuzzy_provider_directive(prompt: str) -> Tuple[Optional[str], str]:
             return prov, ""
 
     # Check 4: Inline trailing directive: '... using cladue', '... with chagpt'
-    m_inline = re.search(r"\b(?:using|with|via|in|on)\s+@?([a-zA-Z0-9_\-]+(?:\s+web)?)[.?!]*$", raw, re.IGNORECASE)
+    m_inline = re.search(r"\b(?:using|with|via|in|on)\s+@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)[.?!]*$", raw, re.IGNORECASE)
     if m_inline:
         prov = match_provider_token(m_inline.group(1).strip())
         if prov:
@@ -223,6 +377,40 @@ def extract_fuzzy_provider_directive(prompt: str) -> Tuple[Optional[str], str]:
             return prov, clean
 
     return None, raw
+
+
+# ── Domain Feature Blueprints ───────────────────────────────────────────────
+
+VIDEO_STREAMING_BLUEPRINT = """DOMAIN FEATURE BLUEPRINT (VIDEO & STREAMING PLATFORM):
+- Hero Billboard: Large cinematic backdrop with title logo, metadata badges (4K Ultra HD, Dolby Vision, Match 98%), summary synopsis, and interactive "Play Trailer" modal embed.
+- Horizontal Content Rails: Multiple smooth-scrolling category carousels (Trending Now, Top 10 Today, Originals, Action & Sci-Fi) with hover scale-up preview cards and badge overlays.
+- Real-Time Search & Filtering: Instant search input with live genre filter chips that dynamically filter the video catalog with zero page reload.
+- Watchlist & Favorites Persistence: Interactive "Add to Watchlist" / "Like" buttons that persist user selections in browser localStorage.
+- Responsive Video Player Modal: Fullscreen-capable modal with working playback scrubber, time counter, volume slider, play/pause toggles, and ESC key listener.
+- Aesthetic: Dark obsidian cinema palette (#141414 base, #E50914 red accents or crimson gradients), custom inline SVG logos/icons, zero external image broken links."""
+
+MUSIC_AUDIO_BLUEPRINT = """DOMAIN FEATURE BLUEPRINT (MUSIC & AUDIO STREAMING SYSTEM):
+- 3-Pane Architecture: Collapsible left navigation sidebar (Home, Search, Your Library, Create Playlist), central scrollable track table with album artwork & duration, and sticky bottom playback control bar.
+- Real Web Audio API Sound Engine: Built-in JavaScript Web Audio API synthesizer / oscillator sound generator so tracks actually play real synthesized melodic chords/beats with visual feedback without needing external MP3 URLs!
+- Interactive Playback Controls: Play/pause toggle, next/previous track, seek scrubber with live time counter, volume slider, shuffle and repeat toggles.
+- Live Equalizer & Visualizer: Animated HTML5 canvas or CSS bar equalizer reacting in real-time to track playback.
+- Playlist & Queue Management: Functional playlist switching, queue drawer, and track favoriting stored in localStorage.
+- Aesthetic: Spotify-grade dark jade & obsidian theme (#121212, #1DB954 vibrant green accents), modern typography, custom inline SVG icons."""
+
+ECOMMERCE_BLUEPRINT = """DOMAIN FEATURE BLUEPRINT (EDITORIAL E-COMMERCE STOREFRONT):
+- Editorial Product Grid: Responsive multi-column showcase with category filtering, price/popularity sorting, and badges (Bestseller, Limited Edition).
+- Bespoke Visuals: Elegant custom inline SVG product artwork/graphics for every item with hover image switching.
+- Slide-Over Cart Drawer: Live slide-in cart with quantity increment/decrement, line-item removal, real-time subtotal/tax calculation, and promo code entry.
+- Free Shipping Progress Bar: Dynamic animated meter calculating "$X away from Free Express Shipping".
+- Interactive Checkout & Feedback: Mock checkout modal with validation and instant floating toast notifications upon "Added to Bag".
+- Aesthetic: Luxury editorial minimalism or sleek dark glassmorphism, refined serif/sans typography, smooth CSS transitions."""
+
+COMMAND_CENTER_BLUEPRINT = """DOMAIN FEATURE BLUEPRINT (AIVCO COMMAND CENTER & DEVELOPER PORTFOLIO):
+- Executive Hero Header: Dynamic system status badge (Kernel v2.0 Operational), animated greeting, and operator profile summary (Parikshit Koirala / AIvco).
+- Live System Telemetry Deck: Interactive real-time metrics (CPU latency simulation, RAM efficiency counters, model arbitration graph).
+- Active Project Showcase: Interactive cards for active engineering initiatives (AIVCO Cognitive Kernel, Multi-Layer Memory Engine, Chrome Extension Bridge) with tech stack tags and live status badges.
+- Interactive Task Kanban / Tracker: Draggable/clickable task board (To Do, In Progress, Shipped) with ability to add new tasks locally in localStorage.
+- Aesthetic: High-tech obsidian glassmorphism (#0A0F1D, electric cyan #00F0FF and violet #8B5CF6 glow accents), backdrop-filter blur, custom inline SVG telemetry icons."""
 
 
 def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_context: str = "") -> str:
@@ -244,8 +432,24 @@ def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_conte
 
     # 2. Frontend / Web App / UI / Clone queries
     if FRONTEND_PATTERN.search(clean_intent):
+        lower_intent = clean_intent.lower()
+        if re.search(r"\b(netflix|nelflix|youtube|video|stream(?:ing)?|cinema|movie)\b", lower_intent):
+            blueprint = VIDEO_STREAMING_BLUEPRINT
+        elif re.search(r"\b(spotify|music|audio|player|song|sound|playlist|track)\b", lower_intent):
+            blueprint = MUSIC_AUDIO_BLUEPRINT
+        elif re.search(r"\b(ecommerce|e-?commer(?:ce|ice)|store|shop|brand|sell|tshimhchet|cart|checkout|product)\b", lower_intent):
+            blueprint = ECOMMERCE_BLUEPRINT
+        else:
+            blueprint = COMMAND_CENTER_BLUEPRINT
+
         return (
             f"USER OBJECTIVE: {clean_intent}\n\n"
+            f"{blueprint}\n\n"
+            "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
+            "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
+            "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
+            "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
+            "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn.\n\n"
             "ELITE ENGINEERING SPECIFICATION:\n"
             "- Architect and output a complete, self-contained, single-file `<!DOCTYPE html>` application (HTML5 + modern CSS3 + vanilla JavaScript).\n"
             "- Design Aesthetic: Bespoke, human-crafted editorial or dark obsidian/glassmorphic UI with custom inline SVG artwork, micro-interactions, responsive CSS Grid/Flexbox layout, and zero broken external image links.\n"
@@ -316,6 +520,7 @@ def build_executive_envelope(prompt: str, target_tier: str, memory_context: str)
             "[AIVCO EXECUTIVE BRIEF]\n"
             f"Operator Context: {compact_memory_summary}\n"
             "Execution Contract: Deliver production-grade, complete implementation. "
+            "Act with absolute CEO autonomy (ZERO hand-holding, no clarifying questions, no text roadmaps). "
             "Do NOT use the Artifacts sandbox tool or create external file cards—output all code directly "
             "inline inside standard markdown fenced code blocks (e.g., ```html <!DOCTYPE html>... ```) "
             "so AIVCO's Live Preview Engine can render it immediately.\n"
@@ -327,6 +532,66 @@ def build_executive_envelope(prompt: str, target_tier: str, memory_context: str)
 
     # Tier 2 Fast Cloud API (Groq, Gemini) / Kernel / Local
     return prompt
+
+
+# ── Multi-Vector Scoring & Capability Matrix ──────────────────────────────────
+
+def compute_vector_scores(prompt: str) -> Dict[str, float]:
+    """
+    Computes 4-vector capability scores for incoming prompt in <0.1ms:
+    - ui_density (0.0 to 1.0)
+    - logic_depth (0.0 to 1.0)
+    - context_need (0.0 to 1.0)
+    - speed_priority (0.0 to 1.0)
+    """
+    clean = (prompt or "").strip().lower()
+    if not clean:
+        return {"ui_density": 0.0, "logic_depth": 0.0, "context_need": 0.0, "speed_priority": 1.0}
+
+    # 1. Context Need (Zero-LLM kernel queries)
+    context_need = 0.0
+    if KernelCognitiveArbiter._FAST_KERNEL.search(clean) or IDENTITY_PATTERN.search(clean):
+        context_need = 1.0
+    elif any(k in clean for k in ("who am i", "my profile", "system status", "kernel status", "tasks left", "clear screen", "clear memory")):
+        context_need = 1.0
+
+    # 2. UI Density (Full-stack HTML/JS apps, complete game engines, websites, dashboards, clones)
+    ui_density = 0.0
+    if KernelCognitiveArbiter._FAST_WEB.search(clean):
+        ui_density = 0.95
+    elif FRONTEND_PATTERN.search(clean):
+        if any(k in clean for k in ("clone", "claong", "single-file", "complete website", "dashboard", "ecommerce", "store", "player", "game", "canvas", "three.js", "netflix", "nelflix", "youtube", "spotify")):
+            ui_density = 0.90
+        elif any(k in clean for k in ("website", "webasite", "web page", "html", "app", "interface", "ui only", "working app")):
+            ui_density = 0.80
+        else:
+            ui_density = 0.70
+
+    # 3. Logic Depth (Algorithmic / Data Science / Python / SQL / Debugging)
+    logic_depth = 0.0
+    if KernelCognitiveArbiter._FAST_API.search(clean):
+        logic_depth = 0.90
+    elif CODING_PATTERN.search(clean):
+        if ui_density < 0.70:
+            logic_depth = 0.85
+        else:
+            logic_depth = 0.60
+    elif any(k in clean for k in ("binary search", "algorithm", "regex", "sql", "fastapi", "refactor", "debug", "benchmark", "sort")):
+        logic_depth = 0.80
+
+    # 4. Speed Priority
+    speed_priority = 0.2
+    if len(clean) < 40 and ui_density < 0.70 and logic_depth < 0.70:
+        speed_priority = 0.85
+    elif "quick" in clean or "fast" in clean:
+        speed_priority = 0.90
+
+    return {
+        "ui_density": round(ui_density, 2),
+        "logic_depth": round(logic_depth, 2),
+        "context_need": round(context_need, 2),
+        "speed_priority": round(speed_priority, 2),
+    }
 
 
 # ── Kernel Cognitive Arbiter Class ───────────────────────────────────────────
@@ -342,12 +607,14 @@ class KernelCognitiveArbiter:
 
     # 2. Brain 4 Web AI Patterns (Complex full-stack HTML/JS apps, complete game engines, massive code)
     WEB_AI_PATTERNS = [
-        r"(single-file|complete) (html|website|dashboard|game|canvas|three\.js|webpage)",
-        r"(build|make|create|write) (a|an)?\s*(full|complete|interactive|tactical)?\s*(website|web\s*page|dashboard|clone|app|store|e-?commerce)",
-        r"(build|make|create|write)\s+(?:a|an)?\s+(?:(?:full|complete|interactive|tactical)\s+)+(?:website|web\s*page|dashboard|clone|app|store)",
+        r"(single-file|complete|working)\s+(html|website|webasite|dashboard|game|canvas|three\.js|webpage|app)",
+        r"(build|make|maek|create|write)\s+(?:me\s+)?(?:a|an)?\s*(?:(?:full|complete|interactive|tactical|working)\s+)*(?:clon(?:e|ing)|claong)?\s*(?:website|webasite|web\s*page|dashboard|clone|claong|app|store|e-?commer(?:ce|ice))",
+        r"(build|make|maek|create|write)\s+(?:it|a\s+working\s+app|a\s+working\s+clone)",
         r"<!doctype html>",
         r"tactical dashboard|starting xi|probability calculator",
-        r"spotify clone|netflix clone|amazon clone",
+        r"(spotify|netflix|nelflix|youtube|amazon)\s+(?:clon(?:e|ing)|claong)",
+        r"(?:clon(?:e|ing)|claong)\s+(?:website|webasite|app)?\s*(?:of|for)?\s*(spotify|netflix|nelflix|youtube|amazon)",
+        r"\b(?:ui\s+only|working\s+app)\b",
     ]
 
     # 3. Tier 2 Fast Cloud API Patterns (Groq Llama 70B / Gemini Pro)
@@ -368,19 +635,23 @@ class KernelCognitiveArbiter:
     _FAST_WEB = re.compile("|".join(f"(?:{p})" for p in WEB_AI_PATTERNS), re.IGNORECASE)
     _FAST_API = re.compile("|".join(f"(?:{p})" for p in API_FAST_PATTERNS), re.IGNORECASE)
 
+    compute_vector_scores = staticmethod(compute_vector_scores)
+
     @classmethod
     def arbitrate(
         cls,
         prompt: str,
         target_override: Optional[str] = None,
+        extension_connected: bool = True,
         log_telemetry: bool = True,
     ) -> Tuple[str, str]:
         """
-        Deterministically arbitrates prompt intent in <5ms (zero LLM calls).
+        Deterministically arbitrates prompt intent in <5ms using multi-vector capability scoring
+        and live provider health registry circuit breakers.
 
         Returns:
             Tuple[str, str]: (target_tier, notification_message)
-            Tiers: 'kernel', 'claude' (Brain 4 Web), 'groq' (Tier 2 Fast API), etc.
+            Tiers: 'kernel', 'claude' (Brain 4 Web), 'chatgpt' (Brain 4 Web), 'gemini', 'groq', etc.
         """
         t0 = time.perf_counter()
 
@@ -389,30 +660,74 @@ class KernelCognitiveArbiter:
             tier = target_override
             rationale = f"[aivco-kernel] Manual override active: Routing to {target_override}."
         else:
-            # Check explicit fuzzy provider directive (e.g. 'use cladue to...', 'ask gpt to...', 'use chagpt')
-            prov_directive, _ = extract_fuzzy_provider_directive(prompt)
-            if prov_directive:
-                tier = prov_directive
-                rationale = "" if tier == "kernel" else f"[aivco-kernel] Operator directive detected: Routing to {tier}..."
-            else:
-                clean = prompt.strip().lower()
+            clean = prompt.strip().lower()
 
-                # Check Kernel-native (< 5ms resolution)
-                if cls._FAST_KERNEL.search(clean):
-                    tier = "kernel"
-                    rationale = ""
-                # Check Web AI (Brain 4 Claude / ChatGPT via Extension)
+            # Fast-path 1: Kernel-native (<0.003ms)
+            if cls._FAST_KERNEL.search(clean):
+                tier = "kernel"
+                rationale = ""
+            else:
+                # Check explicit fuzzy provider directive only if directive triggers present
+                prov_directive = None
+                if DIRECTIVE_TRIGGER_CHECK.search(prompt):
+                    prov_directive, _ = extract_fuzzy_provider_directive(prompt)
+
+                if prov_directive:
+                    if prov_directive == "kernel":
+                        tier = "kernel"
+                        rationale = ""
+                    else:
+                        if provider_health.is_available(prov_directive, extension_connected=extension_connected):
+                            tier = prov_directive
+                            rationale = f"[aivco-kernel] Operator directive detected: Routing to {tier}..."
+                        else:
+                            scores = compute_vector_scores(prompt)
+                            if scores["ui_density"] >= 0.7:
+                                chain = ["claude", "chatgpt", "gemini", "groq"]
+                            else:
+                                chain = ["groq", "gemini"]
+                            tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                            rationale = f"[aivco-kernel] Operator directive '{prov_directive}' on cooldown/unavailable. Auto-routed to {tier}."
                 elif cls._FAST_WEB.search(clean):
-                    tier = "claude"
-                    rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
-                # Check Fast API (Tier 2 Groq / Gemini)
+                    chain = ["claude", "chatgpt", "gemini", "groq"]
+                    tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                    if tier == "claude":
+                        rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
+                    elif tier == "chatgpt":
+                        rationale = "[aivco-kernel] Heavy frontend query detected. Claude on cooldown/unavailable; routing to Brain 4 (ChatGPT Web Bridge)..."
+                    elif tier == "gemini":
+                        rationale = "[aivco-kernel] Heavy frontend query detected. Web bridge on cooldown/unavailable; routing to Tier 3 (Gemini Pro API)..."
+                    else:
+                        rationale = "[aivco-kernel] Heavy frontend query detected. Cascading to Tier 2 (Groq Fast API)..."
                 elif cls._FAST_API.search(clean):
-                    tier = "groq"
-                    rationale = "[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 (Groq Fast API)..."
-                # Default fallback: Tier 2 (Groq) or Tier 1 (Local)
+                    chain = ["groq", "gemini", "claude"]
+                    tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                    rationale = f"[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 ({tier.upper()})..."
                 else:
-                    tier = "groq"
-                    rationale = "[aivco-kernel] General query detected. Routing to Tier 2 (Fast Inference)..."
+                    # Multi-Vector Capability Matrix Scoring
+                    scores = compute_vector_scores(prompt)
+                    if scores["context_need"] >= 0.8:
+                        tier = "kernel"
+                        rationale = ""
+                    elif scores["ui_density"] >= 0.7:
+                        chain = ["claude", "chatgpt", "gemini", "groq"]
+                        tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                        if tier == "claude":
+                            rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
+                        elif tier == "chatgpt":
+                            rationale = "[aivco-kernel] Heavy frontend query detected. Claude on cooldown/unavailable; routing to Brain 4 (ChatGPT Web Bridge)..."
+                        elif tier == "gemini":
+                            rationale = "[aivco-kernel] Heavy frontend query detected. Web bridge on cooldown/unavailable; routing to Tier 3 (Gemini Pro API)..."
+                        else:
+                            rationale = "[aivco-kernel] Heavy frontend query detected. Cascading to Tier 2 (Groq Fast API)..."
+                    elif scores["logic_depth"] >= 0.7:
+                        chain = ["groq", "gemini", "claude"]
+                        tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                        rationale = f"[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 ({tier.upper()})..."
+                    else:
+                        chain = ["groq", "gemini"]
+                        tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                        rationale = f"[aivco-kernel] General query detected. Routing to Tier 2 ({tier.upper()})..."
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
@@ -425,3 +740,163 @@ class KernelCognitiveArbiter:
     def flush_telemetry(cls, timeout: float = 2.0) -> None:
         """Flushes pending telemetry writes to disk."""
         flush_telemetry(timeout=timeout)
+
+
+# ── Pre-Delivery Code Quality Gate & TypeScript-in-HTML Sanitizer ────────────
+
+def sanitize_script_content(js_code: str) -> str:
+    """
+    Sanitizes inline JavaScript by stripping accidental TypeScript syntax:
+    - type / interface declarations
+    - type assertions ('as HTMLElement', 'as any', etc.)
+    - non-null assertions ('!.addEventListener')
+    - parameter and variable type annotations
+    """
+    if not js_code or not isinstance(js_code, str):
+        return js_code or ""
+
+    # 1. Strip interface declarations: interface Foo { ... }
+    js_code = re.sub(
+        r"interface\s+[A-Za-z0-9_$]+(?:\s+extends\s+[^{]+)?\s*\{[\s\S]*?\}",
+        "",
+        js_code,
+    )
+
+    # 2. Strip type declarations: type Foo = ...;
+    js_code = re.sub(
+        r"type\s+[A-Za-z0-9_$]+\s*=\s*\{[\s\S]*?\};?",
+        "",
+        js_code,
+    )
+    js_code = re.sub(
+        r"type\s+[A-Za-z0-9_$]+\s*=\s*[^;\n]+;",
+        "",
+        js_code,
+    )
+
+    # 3. Strip type assertions: " as HTMLElement", " as HTMLInputElement", " as HTMLButtonElement", " as any", etc.
+    js_code = re.sub(
+        r"\s+as\s+[A-Za-z0-9_$]+(?:<[^>]+>)?(?:\[\])?",
+        "",
+        js_code,
+    )
+
+    # 4. Strip non-null assertions: "element!.addEventListener", "container!.innerHTML", "el!;"
+    js_code = re.sub(
+        r"([a-zA-Z0-9_$\]\)])!([.\[(])",
+        r"\1\2",
+        js_code,
+    )
+    js_code = re.sub(
+        r"([a-zA-Z0-9_$\]\)])!\s*;",
+        r"\1;",
+        js_code,
+    )
+
+    # 5. Strip return type annotations on functions: function foo(...): Type {
+    js_code = re.sub(
+        r"\)\s*:\s*[A-Za-z0-9_$<>[\]|&?\s]+\s*\{",
+        ") {",
+        js_code,
+    )
+
+    # 6. Strip variable type annotations: const x: number = ..., let y: Item[] = ...
+    js_code = re.sub(
+        r"\b(const|let|var)\s+([a-zA-Z0-9_$]+)\s*:\s*[A-Za-z0-9_$<>[\]|&?\s]+(?=\s*=)",
+        r"\1 \2",
+        js_code,
+    )
+
+    # 7. Function parameters type annotations: function foo(param: Type, ...)
+    def _clean_params(m):
+        fn_name = m.group(1)
+        raw_params = m.group(2)
+        cleaned = []
+        for p in raw_params.split(","):
+            p_strip = p.strip()
+            if not p_strip:
+                continue
+            if ":" in p_strip:
+                p_name, rest = p_strip.split(":", 1)
+                p_name = p_name.strip()
+                if "=" in rest:
+                    val = rest.split("=", 1)[1].strip()
+                    cleaned.append(f"{p_name} = {val}")
+                else:
+                    cleaned.append(p_name)
+            else:
+                cleaned.append(p_strip)
+        return f"function {fn_name}({', '.join(cleaned)})"
+
+    js_code = re.sub(
+        r"function\s*([a-zA-Z0-9_$]*)\s*\(([^)]*)\)",
+        _clean_params,
+        js_code,
+    )
+
+    # 8. Arrow function return types and parameters: (a: number, b: number): number =>
+    js_code = re.sub(
+        r"\(([^)]*)\)\s*:\s*[A-Za-z0-9_$<>[\]|&?\s]+\s*=>",
+        r"(\1) =>",
+        js_code,
+    )
+
+    def _clean_arrow_params(m):
+        raw_params = m.group(1)
+        cleaned = []
+        for p in raw_params.split(","):
+            p_strip = p.strip()
+            if not p_strip:
+                continue
+            if ":" in p_strip:
+                p_name = p_strip.split(":", 1)[0].strip()
+                cleaned.append(p_name)
+            else:
+                cleaned.append(p_strip)
+        return f"({', '.join(cleaned)}) =>"
+
+    js_code = re.sub(
+        r"\(([^)]+:[^)]+)\)\s*=>",
+        _clean_arrow_params,
+        js_code,
+    )
+
+    return js_code.strip()
+
+
+def sanitize_and_validate_code_output(markdown_text: str) -> str:
+    """
+    Quality gate that cleans TypeScript syntax out of plain <script> blocks
+    and ensures balanced HTML structure and markdown code fences.
+    """
+    if not markdown_text or not isinstance(markdown_text, str):
+        return markdown_text or ""
+
+    def _clean_script_tag(match):
+        open_tag = match.group(1)
+        body = match.group(2)
+        close_tag = match.group(3)
+        return f"{open_tag}\n{sanitize_script_content(body)}\n{close_tag}"
+
+    sanitized = re.sub(
+        r"(<script(?:\s+[^>]*)?>)([\s\S]*?)(</script>)",
+        _clean_script_tag,
+        markdown_text,
+        flags=re.IGNORECASE,
+    )
+
+    # Ensure unclosed ```html block or missing </html> is closed
+    if "```html" in sanitized.lower():
+        lower_san = sanitized.lower()
+        if "<html" in lower_san and "</html>" not in lower_san:
+            last_fence = sanitized.rfind("```")
+            if last_fence > sanitized.lower().find("```html"):
+                sanitized = sanitized[:last_fence] + "\n</html>\n" + sanitized[last_fence:]
+            else:
+                sanitized += "\n</html>\n```"
+        else:
+            fence_count = sanitized.count("```")
+            if fence_count % 2 != 0:
+                sanitized += "\n```"
+
+    return sanitized

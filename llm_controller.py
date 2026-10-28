@@ -35,6 +35,34 @@ class ModelGenerationError(AIVCOModelError):
     """The model failed during generation or network request."""
 
 
+EXECUTIVE_AUTONOMY_MANDATE = (
+    "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
+    "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
+    "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
+    "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
+    "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
+)
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
+    f"{EXECUTIVE_AUTONOMY_MANDATE}"
+)
+
+
+def _is_web_failure(web_res: Optional[str]) -> bool:
+    if not web_res or not web_res.strip():
+        return True
+    s = web_res.strip().lower()
+    return (
+        "rate_limit_reached" in s
+        or "[aivco-kernel] chrome extension" in s
+        or "execution timed out waiting for ai response" in s
+        or "tab connection error" in s
+        or "failed to acquire tab" in s
+        or "rate limit" in s
+    )
+
+
 def load_env_file(env_path: str = ".env") -> None:
     """
     Zero-dependency .env loader.
@@ -381,6 +409,9 @@ class LLMController:
         Returns:
             {"response": str, "provider_used": str, "fallback_triggered": bool}
         """
+        if not system_prompt:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
+
         # Rule 1: Forced Provider Selection
         effective_force = force_provider or (task_type if task_type in ("claude", "chatgpt", "grok", "gemini_web", "claude_web", "chatgpt_web", "grok_web", "gemini", "groq", "local_llama", "local") else None)
 
@@ -388,12 +419,31 @@ class LLMController:
         if effective_force in WEB_PROVIDERS:
             target = "gemini_web" if effective_force in ("gemini_web", "gemini-web") else effective_force.replace("_web", "")
             from browser_agent import universal_web_agent
-            web_res = universal_web_agent.query(target, user_prompt)
-            return {
-                "response": web_res,
-                "provider_used": f"web-account:{target}",
-                "fallback_triggered": False,
-            }
+            try:
+                web_res = universal_web_agent.query(target, user_prompt)
+                if _is_web_failure(web_res):
+                    raise AIVCOModelError(f"Web provider {target} failed: {web_res}")
+                return {
+                    "response": web_res,
+                    "provider_used": f"web-account:{target}",
+                    "fallback_triggered": False,
+                }
+            except Exception:
+                # Brain 4 Web failed / timed out / rate-limited: auto-cascade to Groq API -> Gemini API
+                try:
+                    response = self._generate_groq(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": f"groq (fallback from {target})",
+                        "fallback_triggered": True,
+                    }
+                except AIVCOModelError:
+                    response = self._generate_gemini(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": f"gemini (fallback from {target})",
+                        "fallback_triggered": True,
+                    }
 
         if effective_force in ("local", "local_llama") or task_type in ("private", "memory", "offline"):
             try:
@@ -403,10 +453,27 @@ class LLMController:
                     "provider_used": "local_llama",
                     "fallback_triggered": False,
                 }
-            except ModelUnavailableError:
-                raise ModelUnavailableError("Offline model execution failed. Cloud fallback blocked to protect privacy.")
-            except AIVCOModelError:
-                raise
+            except AIVCOModelError as local_err:
+                # Privacy block eliminated: operator requires cloud fallback (Groq -> Gemini) to execute
+                try:
+                    response = self._generate_groq(system_prompt, user_prompt)
+                    return {
+                        "response": response,
+                        "provider_used": "groq (fallback from local)",
+                        "fallback_triggered": True,
+                    }
+                except AIVCOModelError as groq_err:
+                    try:
+                        response = self._generate_gemini(system_prompt, user_prompt)
+                        return {
+                            "response": response,
+                            "provider_used": "gemini (fallback from local)",
+                            "fallback_triggered": True,
+                        }
+                    except AIVCOModelError as gemini_err:
+                        raise ModelUnavailableError(
+                            f"All providers failed (local: {local_err}; groq: {groq_err}; gemini: {gemini_err})"
+                        )
 
         if effective_force == "gemini":
             try:

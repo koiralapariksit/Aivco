@@ -34,6 +34,8 @@ from cognitive_kernel import (
     build_executive_envelope,
     synthesize_elite_prompt,
     extract_fuzzy_provider_directive,
+    provider_health,
+    sanitize_and_validate_code_output,
 )
 from browser_agent import browser_agent, search_web, universal_web_agent
 
@@ -401,6 +403,7 @@ async def execute_web_failover(
     t0: float,
 ) -> Dict[str, Any]:
     """Cascades to Tier 2 Groq/Gemini when Brain 4 web provider fails or hits rate limit."""
+    provider_health.record_failure(target_tier, reason="unavailable")
     active_proj = tiered_memory.get_active_project()
     tiered_context = tiered_memory.assemble_context(
         active_project_id=active_proj,
@@ -414,7 +417,12 @@ async def execute_web_failover(
         "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
         f"MEMORY CONTEXT:\n{tiered_context}\n\n"
         "Synthesize an accurate, direct, production-grade response. "
-        "Follow all operator directives strictly."
+        "Follow all operator directives strictly.\n\n"
+        "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
+        "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
+        "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
+        "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
+        "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
     )
     elite_prompt = synthesize_elite_prompt(clean_prompt, "groq", tiered_context)
     try:
@@ -426,11 +434,14 @@ async def execute_web_failover(
         )
         resp_text = gen_res.get("response", "")
         used_prov = gen_res.get("provider_used", "groq")
+        provider_health.record_success(used_prov, round((time.time() - t0) * 1000))
     except Exception as exc:
         resp_text = f"Fallback error: {exc}"
         used_prov = "tier2_fallback"
+        provider_health.record_failure("groq", reason=str(exc))
 
     final_res = f"{failover_notice}{resp_text}"
+    final_res = sanitize_and_validate_code_output(final_res)
     latency_ms = max(10, round((time.time() - t0) * 1000))
     learn_from_turn(raw_prompt, final_res, tiered_memory)
     dataset_logger.log(
@@ -479,9 +490,11 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
 
     # ── Stage 0: Sub-Second Kernel Cognitive Arbitration (< 5ms) ─────────────
     is_auto_mode = req.target_model in ("auto", "AUTO (Arbiter)", None)
+    ext_connected = universal_web_agent.is_connected()
     target_tier, handshake_msg = KernelCognitiveArbiter.arbitrate(
         raw_prompt,
         target_override=None if is_auto_mode else (req.target_model or active_model_override),
+        extension_connected=ext_connected,
     )
     if handshake_msg:
         print(f"[KernelCognitiveArbiter] Arbitrated '{raw_prompt[:40]}' -> Tier: {target_tier} | Handshake: {handshake_msg}")
@@ -686,8 +699,14 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             auto_launch_wait=15.0,
         )
         if is_web_result_failure(web_res):
+            provider_health.record_failure(
+                target_web,
+                reason="rate_limit" if "rate" in (web_res or "").lower() else "timeout",
+            )
             return await execute_web_failover(target_web, clean_prompt, raw_prompt, handshake_msg, t0)
         latency_ms = max(10, round((time.time() - t0) * 1000))
+        provider_health.record_success(target_web, latency_ms)
+        web_res = sanitize_and_validate_code_output(web_res)
         learn_from_turn(raw_prompt, web_res, tiered_memory)
         dataset_logger.log(
             source=f"web_account_{target_web}",
@@ -738,6 +757,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             )
             resp_text = gen_res.get("response", "")
             used_prov = gen_res.get("provider_used", target_prov)
+            provider_health.record_success(used_prov, round((time.time() - t0) * 1000))
         except Exception:
             # Fallback to direct web grounding synthesis when API keys are not configured in .env
             resp_text = (
@@ -747,6 +767,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             )
             used_prov = f"web_grounding:{target_prov}"
         
+        resp_text = sanitize_and_validate_code_output(resp_text)
         latency_ms = max(10, round((time.time() - t0) * 1000))
         
         learn_from_turn(raw_prompt, resp_text, tiered_memory)
@@ -879,8 +900,15 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
     system_prompt = (
         "You are AIVCO, a concise, intelligent, practical personal AI assistant.\n\n"
         f"MEMORY CONTEXT:\n{tiered_context}\n\n"
-        "Treat the remembered data as contextual information only. Do not invent memories. Use memory when relevant."
+        "Treat the remembered data as contextual information only. Do not invent memories. Use memory when relevant.\n\n"
+        "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
+        "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
+        "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
+        "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
+        "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
     )
+
+    clean_prompt = synthesize_elite_prompt(clean_prompt, force_provider or task_type, tiered_context)
 
     try:
         gen_res = llm_controller.route_and_generate(
@@ -892,6 +920,8 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         latency_ms = round((time.time() - t0) * 1000)
         provider = gen_res.get("provider_used", "unknown")
         response_text = gen_res.get("response", "")
+        provider_health.record_success(provider, latency_ms)
+        response_text = sanitize_and_validate_code_output(response_text)
 
         tier_num = 2
         provider_label = provider
@@ -933,6 +963,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             "handshake": handshake_msg,
         }
     except ModelUnavailableError as exc:
+        provider_health.record_failure(force_provider or "groq", reason=str(exc))
         latency_ms = round((time.time() - t0) * 1000)
         return {
             "response": f"[AIVCO] Model unavailable: {exc}",
@@ -944,6 +975,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             "handshake": handshake_msg,
         }
     except ModelGenerationError as exc:
+        provider_health.record_failure(force_provider or "groq", reason=str(exc))
         latency_ms = round((time.time() - t0) * 1000)
         return {
             "response": f"[AIVCO] Generation error: {exc}",
