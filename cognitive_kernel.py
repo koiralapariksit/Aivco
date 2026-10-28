@@ -40,6 +40,8 @@ from kernel.arbiter import (
     synthesize_elite_prompt,
     provider_health,
     sanitize_and_validate_code_output,
+    ATTRIBUTION_PATTERN,
+    session_ledger,
 )
 
 if TYPE_CHECKING:
@@ -462,6 +464,28 @@ def _get_core_field(memory: "MultiLayerMemory", *keys: str) -> Optional[str]:
     return None
 
 
+def process_kernel_command(prompt: str, memory: Optional["MultiLayerMemory"] = None) -> Optional[str]:
+    """
+    Direct Stage 0 Kernel Command & Attribution Processor (<1ms, 0 LLM tokens).
+    Handles model attribution queries and session reset instructions deterministically.
+    """
+    clean = (prompt or "").strip()
+    if not clean:
+        return None
+
+    # 1. Model Attribution queries
+    if ATTRIBUTION_PATTERN.search(clean):
+        return session_ledger.format_attribution_answer(clean)
+
+    # 2. Session / Chat / Context reset commands
+    lower = clean.lower()
+    if re.match(r"^(?:clear|reset|clean)\s+(?:screen|memory|chat|context)$", lower):
+        session_ledger.clear()
+        return f"[aivco-kernel] Context and session ledger cleared: {lower}."
+
+    return None
+
+
 def evaluate_query(user_prompt: str, memory: "MultiLayerMemory") -> dict:
     """
     Stage 0 / Stage 1: Evaluate whether AIVCO can answer locally.
@@ -476,6 +500,18 @@ def evaluate_query(user_prompt: str, memory: "MultiLayerMemory") -> dict:
     """
     prompt = user_prompt.strip()
     lower = prompt.lower()
+
+    # ---- Stage 0: Intercept Model Attribution & Kernel Session Commands (<1ms, 0 tokens) ----
+    cmd_resp = process_kernel_command(prompt, memory)
+    if cmd_resp:
+        return KernelEvaluation(
+            can_answer_locally=True,
+            confidence=1.0,
+            local_response=cmd_resp,
+            recommended_tier="aivco-kernel",
+            reason="Stage 0 model attribution or kernel session command resolved.",
+            task_type="kernel",
+        ).__dict__
 
     # ---- Stage 0: Intercept Direct Operator Directives (Name override, brevity, rules) ----
     directive_response = _intercept_operator_directives(prompt, memory)

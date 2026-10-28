@@ -69,6 +69,12 @@ class MultiLayerMemory:
             self.active_project_id = next(iter(self.projects.keys()))
             self.save()
 
+    @property
+    def session_ledger(self):
+        """Reference to the singleton SessionExecutionLedger."""
+        from kernel.arbiter import session_ledger
+        return session_ledger
+
     # --- Active Project Management ---
     def set_active_project(self, project_id: Optional[str]) -> None:
         if project_id is not None and project_id not in self.projects:

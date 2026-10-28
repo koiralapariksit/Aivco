@@ -258,3 +258,19 @@ def test_corrupt_data_resilience(tmp_path):
 
     mem_invalid_schema = MultiLayerMemory(storage_path=storage_file)
     assert mem_invalid_schema.core_profile == {}
+
+
+def test_session_ledger_integration_in_memory(tmp_path):
+    storage_file = str(tmp_path / "test_ledger_mem.json")
+    mem = MultiLayerMemory(storage_path=storage_file)
+
+    assert hasattr(mem, "session_ledger")
+    mem.session_ledger.clear()
+    rec = mem.session_ledger.record_turn(
+        prompt="build netflix",
+        target_tier="claude",
+        actual_provider="claude",
+        response_markdown="```html\n<!DOCTYPE html><html><body>Test</body></html>\n```",
+    )
+    assert rec.turn_id == 1
+    assert mem.session_ledger.get_last_turn().prompt == "build netflix"

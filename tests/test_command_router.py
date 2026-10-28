@@ -885,4 +885,97 @@ def test_typescript_in_html_sanitizer():
     assert "</html>" in sanitized
 
 
+def test_model_attribution_ledger_truthful_response():
+    from kernel.arbiter import KernelCognitiveArbiter, session_ledger
+    from cognitive_kernel import evaluate_query
+    from memory.multi_layer_memory import MultiLayerMemory
+
+    session_ledger.clear()
+    session_ledger.record_turn(
+        prompt="build a netflix clone",
+        target_tier="claude",
+        actual_provider="groq",
+        cascaded_from="claude",
+        response_markdown="```html\n<!DOCTYPE html><html><body><h1>Netflix Clone</h1></body></html>\n```",
+    )
+
+    query = "for netflix clone which model did you use"
+    tier, _ = KernelCognitiveArbiter.arbitrate(query)
+    assert tier == "kernel"
+
+    answer = session_ledger.format_attribution_answer(query)
+    assert "Claude 3.7 Sonnet" in answer
+    assert "Llama 3.3 70B Versatile" in answer
+
+    # Also verify deterministic Stage 0 evaluation via evaluate_query
+    dummy_mem = MultiLayerMemory(storage_path="data/test_dummy_mem.json")
+    k_res = evaluate_query(query, dummy_mem)
+    assert k_res["can_answer_locally"] is True
+    assert "Claude 3.7 Sonnet" in k_res["local_response"]
+    assert "Llama 3.3 70B Versatile" in k_res["local_response"]
+
+
+def test_iterative_html_refinement_injection():
+    from kernel.arbiter import session_ledger, synthesize_elite_prompt
+
+    session_ledger.clear()
+    session_ledger.record_turn(
+        prompt="build a netflix clone",
+        target_tier="claude",
+        actual_provider="groq",
+        response_markdown="```html\n<!DOCTYPE html><html><body><header>Netflix Old Header</header></body></html>\n```",
+    )
+
+    refined_prompt = synthesize_elite_prompt("now add a search bar to the header")
+    assert "ITERATIVE REFINEMENT DIRECTIVE: now add a search bar to the header" in refined_prompt
+    assert "PREVIOUS ACTIVE APPLICATION BASELINE:" in refined_prompt
+    assert "Netflix Old Header" in refined_prompt
+    assert "EXECUTIVE AUTONOMY MANDATE:" in refined_prompt
+
+
+def test_nested_typescript_interface_sanitizer():
+    from kernel.arbiter import sanitize_and_validate_code_output
+
+    nested_ts_html = (
+        "```html\n"
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<head>\n"
+        "<script type=\"application/json\">{\"nested\": {\"key\": 123}}</script>\n"
+        "</head>\n"
+        "<body>\n"
+        "<script>\n"
+        "interface Config { nested: { a: number; b: string }; }\n"
+        "type State = { theme: { primary: string; secondary: string }; count: number };\n"
+        "const cfg = { nested: { a: 1, b: 'ok' } };\n"
+        "</script>\n"
+        "</body>\n"
+        "</html>\n"
+        "```"
+    )
+
+    sanitized = sanitize_and_validate_code_output(nested_ts_html)
+    assert "interface Config" not in sanitized
+    assert "type State" not in sanitized
+    assert "nested: { a: number" not in sanitized
+    assert "const cfg = { nested: { a: 1, b: 'ok' } };" in sanitized
+    # Ensure application/json was protected
+    assert '{"nested": {"key": 123}}' in sanitized
+    # Ensure no dangling closing braces
+    assert "}; }" not in sanitized
+
+
+def test_backend_tkinter_not_misclassified_as_html():
+    from kernel.arbiter import synthesize_elite_prompt, _is_true_frontend_intent
+
+    prompt = "write a python script to make tkinter gui app"
+    assert _is_true_frontend_intent(prompt) is False
+
+    spec = synthesize_elite_prompt(prompt)
+    assert "<!DOCTYPE html>" not in spec
+    assert "DOMAIN FEATURE BLUEPRINT" not in spec
+    assert "USER OBJECTIVE: write a python script to make tkinter gui app" in spec
+    assert "EXECUTIVE AUTONOMY MANDATE" in spec
+
+
 

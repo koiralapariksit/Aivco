@@ -36,6 +36,8 @@ from cognitive_kernel import (
     extract_fuzzy_provider_directive,
     provider_health,
     sanitize_and_validate_code_output,
+    ATTRIBUTION_PATTERN,
+    session_ledger,
 )
 from browser_agent import browser_agent, search_web, universal_web_agent
 
@@ -444,6 +446,13 @@ async def execute_web_failover(
     final_res = sanitize_and_validate_code_output(final_res)
     latency_ms = max(10, round((time.time() - t0) * 1000))
     learn_from_turn(raw_prompt, final_res, tiered_memory)
+    session_ledger.record_turn(
+        prompt=clean_prompt,
+        target_tier=target_tier,
+        actual_provider=used_prov,
+        cascaded_from=target_tier if used_prov != target_tier else None,
+        response_markdown=final_res,
+    )
     dataset_logger.log(
         source=f"failover_{target_tier}_to_{used_prov}",
         task_type="web_agent_failover",
@@ -496,6 +505,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         target_override=None if is_auto_mode else (req.target_model or active_model_override),
         extension_connected=ext_connected,
     )
+    initial_target_tier = target_tier
     if handshake_msg:
         print(f"[KernelCognitiveArbiter] Arbitrated '{raw_prompt[:40]}' -> Tier: {target_tier} | Handshake: {handshake_msg}")
 
@@ -535,6 +545,8 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
     # ── Stage 0C: CommandController handling ──────────────────────────────────
     cmd_result = command_controller.handle(raw_prompt)
     if cmd_result is not None:
+        if cmd_result == "__CLEAR__":
+            session_ledger.clear()
         latency_ms = max(1, round((time.time() - t0) * 1000))
         return {
             "response": cmd_result,
@@ -547,7 +559,36 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         }
 
     # ── Stage 0-Arbiter: Auto-Mode Kernel Direct Execution (<10ms) ───────────
-    if is_auto_mode and not active_model_override and target_tier == "kernel":
+    if (is_auto_mode and not active_model_override and target_tier == "kernel") or ATTRIBUTION_PATTERN.search(raw_prompt):
+        # Direct Model Attribution query (<1ms, 0 tokens)
+        if ATTRIBUTION_PATTERN.search(raw_prompt):
+            attr_ans = session_ledger.format_attribution_answer(raw_prompt)
+            latency_ms = max(1, round((time.time() - t0) * 1000))
+            return {
+                "response": attr_ans,
+                "src": "Procedural",
+                "provider": "aivco-kernel",
+                "tier": 0,
+                "lat": latency_ms,
+                "web_searched": False,
+                "handshake": handshake_msg,
+            }
+
+        # Direct clear/clean instruction
+        clean_lower = raw_prompt.strip().lower()
+        if re.match(r"^(clear|reset|clean)\s+(screen|memory|chat|context)$", clean_lower):
+            session_ledger.clear()
+            latency_ms = max(1, round((time.time() - t0) * 1000))
+            return {
+                "response": f"[aivco-kernel] Direct instruction executed: {clean_lower}.",
+                "src": "Procedural",
+                "provider": "aivco-kernel",
+                "tier": 0,
+                "lat": latency_ms,
+                "web_searched": False,
+                "handshake": handshake_msg,
+            }
+
         # Direct math evaluation (<2ms)
         m_calc = re.search(r"^(?:what is|calc)\s*(\d+\s*[\+\-\*\/]\s*\d+)", raw_prompt.strip(), re.IGNORECASE)
         if m_calc:
@@ -567,25 +608,18 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
                     "handshake": handshake_msg,
                 }
 
-        # Direct clear/clean instruction
-        clean_lower = raw_prompt.strip().lower()
-        if re.match(r"^(clear|reset|clean)\s+(screen|memory|chat|context)$", clean_lower):
-            latency_ms = max(1, round((time.time() - t0) * 1000))
-            return {
-                "response": f"[aivco-kernel] Direct instruction executed: {clean_lower}.",
-                "src": "Procedural",
-                "provider": "aivco-kernel",
-                "tier": 0,
-                "lat": latency_ms,
-                "web_searched": False,
-                "handshake": handshake_msg,
-            }
-
         # Zero-LLM local evaluation (identity, profile, tasks left, project status)
         kernel_eval = evaluate_query(raw_prompt, tiered_memory)
         if kernel_eval.get("can_answer_locally"):
             local_res = kernel_eval.get("local_response", "")
             learn_from_turn(raw_prompt, local_res, tiered_memory)
+            session_ledger.record_turn(
+                prompt=raw_prompt,
+                target_tier="kernel",
+                actual_provider="kernel",
+                cascaded_from=None,
+                response_markdown=local_res,
+            )
             dataset_logger.log(
                 source="aivco_kernel",
                 task_type="kernel",
@@ -624,7 +658,15 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         if is_web_result_failure(web_res):
             return await execute_web_failover(target_tier, clean_prompt, raw_prompt, handshake_msg, t0)
         latency_ms = max(10, round((time.time() - t0) * 1000))
+        web_res = sanitize_and_validate_code_output(web_res)
         learn_from_turn(raw_prompt, web_res, tiered_memory)
+        session_ledger.record_turn(
+            prompt=clean_prompt,
+            target_tier=initial_target_tier,
+            actual_provider=target_tier,
+            cascaded_from=None,
+            response_markdown=web_res,
+        )
         dataset_logger.log(
             source=f"web_account_{target_tier}",
             task_type="web_agent",
@@ -708,6 +750,13 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         provider_health.record_success(target_web, latency_ms)
         web_res = sanitize_and_validate_code_output(web_res)
         learn_from_turn(raw_prompt, web_res, tiered_memory)
+        session_ledger.record_turn(
+            prompt=clean_prompt,
+            target_tier=initial_target_tier or target_web,
+            actual_provider=target_web,
+            cascaded_from=initial_target_tier if target_web != initial_target_tier and initial_target_tier not in ("auto", None) else None,
+            response_markdown=web_res,
+        )
         dataset_logger.log(
             source=f"web_account_{target_web}",
             task_type="web_agent",
@@ -771,6 +820,13 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         latency_ms = max(10, round((time.time() - t0) * 1000))
         
         learn_from_turn(raw_prompt, resp_text, tiered_memory)
+        session_ledger.record_turn(
+            prompt=clean_search_q,
+            target_tier=initial_target_tier or target_prov,
+            actual_provider=used_prov,
+            cascaded_from=initial_target_tier if used_prov != initial_target_tier and initial_target_tier not in ("auto", None) else None,
+            response_markdown=resp_text,
+        )
         dataset_logger.log(
             source=f"web_search_{used_prov}",
             task_type="web_search",
@@ -803,6 +859,13 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         if not explicit_provider or explicit_provider == "aivco-kernel" or is_directive or is_who_am_i:
             local_res = kernel_eval.get("local_response", "")
             learn_from_turn(raw_prompt, local_res, tiered_memory)
+            session_ledger.record_turn(
+                prompt=raw_prompt,
+                target_tier="kernel",
+                actual_provider="kernel",
+                cascaded_from=None,
+                response_markdown=local_res,
+            )
             dataset_logger.log(
                 source="aivco_kernel",
                 task_type="kernel",
@@ -838,6 +901,13 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         web_res = universal_web_agent.query(fallback_target, enveloped_fallback)
         latency_ms = max(10, round((time.time() - t0) * 1000))
         learn_from_turn(raw_prompt, web_res, tiered_memory)
+        session_ledger.record_turn(
+            prompt=clean_prompt,
+            target_tier=initial_target_tier or fallback_target,
+            actual_provider=fallback_target,
+            cascaded_from=initial_target_tier if fallback_target != initial_target_tier and initial_target_tier not in ("auto", None) else None,
+            response_markdown=web_res,
+        )
         dataset_logger.log(
             source=f"web_agent_{fallback_target}",
             task_type="web_agent_fallback",
@@ -908,6 +978,11 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn."
     )
 
+    # Short-term conversational continuity context (last 3 turns)
+    recent_history = session_ledger.get_recent_history_context(n=3)
+    if recent_history:
+        system_prompt += f"\n\nRECENT CONVERSATION HISTORY:\n{recent_history}"
+
     clean_prompt = synthesize_elite_prompt(clean_prompt, force_provider or task_type, tiered_context)
 
     try:
@@ -943,6 +1018,13 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
 
         # Continuous Learning
         learn_from_turn(raw_prompt, response_text, tiered_memory)
+        session_ledger.record_turn(
+            prompt=clean_prompt,
+            target_tier=initial_target_tier or force_provider or task_type,
+            actual_provider=provider,
+            cascaded_from=initial_target_tier if provider != initial_target_tier and initial_target_tier not in ("auto", "kernel", None) else None,
+            response_markdown=response_text,
+        )
 
         # Fine-tune dataset logging
         dataset_logger.log(

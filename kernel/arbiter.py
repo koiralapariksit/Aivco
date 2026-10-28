@@ -1,21 +1,25 @@
 """
-AIVCO Kernel Cognitive Arbiter & Executive Context Broker
+AIVCO Kernel Cognitive Arbiter, Executive Context Broker & Session Attribution Ledger
 Deterministically classifies incoming user queries into Kernel (Zero-LLM),
-Brain 4 Web AI (Claude/ChatGPT via Extension Bridge), or Tier 2 Fast API (Groq/Gemini).
+Brain 4 Web AI (Claude/ChatGPT via Extension Bridge), or Tier 2/3 Fast API (Groq/Gemini).
 Runs in <5ms with 0-LLM token consumption.
-Broker provides executive context envelopes and asynchronous telemetry training logging.
 """
 
+from collections import deque
 from datetime import datetime, timezone
 import difflib
 import json
+import logging
 import os
 from pathlib import Path
 import queue
 import re
+import sys
 import threading
 import time
-from typing import Tuple, Optional, Dict, Any
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("aivco.arbiter")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_TELEMETRY_FILE = BASE_DIR / "data" / "arbiter_training_log.jsonl"
@@ -25,9 +29,11 @@ DEFAULT_TELEMETRY_FILE = BASE_DIR / "data" / "arbiter_training_log.jsonl"
 
 _telemetry_queue: queue.Queue = queue.Queue(maxsize=50000)
 _custom_telemetry_path: Optional[Path] = None
+_telemetry_error_logged: bool = False
 
 
-def _telemetry_worker():
+def _telemetry_worker() -> None:
+    global _telemetry_error_logged
     while True:
         try:
             item = _telemetry_queue.get(timeout=0.05)
@@ -38,7 +44,7 @@ def _telemetry_worker():
                 except queue.Empty:
                     break
 
-            grouped = {}
+            grouped: Dict[Path, List[Dict[str, Any]]] = {}
             for entry, target_path in batch:
                 grouped.setdefault(target_path, []).append(entry)
 
@@ -48,8 +54,10 @@ def _telemetry_worker():
                     with open(target_path, "a", encoding="utf-8") as f:
                         for entry in entries:
                             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if not _telemetry_error_logged:
+                        _telemetry_error_logged = True
+                        sys.stderr.write(f"[aivco-arbiter] Telemetry write warning: {exc}\n")
 
             for _ in batch:
                 _telemetry_queue.task_done()
@@ -59,7 +67,9 @@ def _telemetry_worker():
             pass
 
 
-_worker_thread = threading.Thread(target=_telemetry_worker, daemon=True, name="ArbiterTelemetryWorker")
+_worker_thread = threading.Thread(
+    target=_telemetry_worker, daemon=True, name="ArbiterTelemetryWorker"
+)
 _worker_thread.start()
 
 
@@ -70,11 +80,10 @@ def set_telemetry_filepath(filepath: Optional[str]) -> None:
 
 
 def flush_telemetry(timeout: float = 2.0) -> None:
-    """Drains the telemetry queue up to timeout seconds."""
-    try:
-        _telemetry_queue.join()
-    except Exception:
-        pass
+    """Drains the telemetry queue up to timeout seconds without hanging indefinitely."""
+    deadline = time.perf_counter() + max(0.05, timeout)
+    while not _telemetry_queue.empty() and time.perf_counter() < deadline:
+        time.sleep(0.01)
 
 
 def log_arbiter_telemetry(
@@ -85,7 +94,11 @@ def log_arbiter_telemetry(
     filepath: Optional[str] = None,
 ) -> None:
     """Non-blocking asynchronous append to arbiter_training_log.jsonl."""
-    target_path = Path(filepath) if filepath else (_custom_telemetry_path or DEFAULT_TELEMETRY_FILE)
+    target_path = (
+        Path(filepath)
+        if filepath
+        else (_custom_telemetry_path or DEFAULT_TELEMETRY_FILE)
+    )
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "prompt": prompt,
@@ -96,55 +109,309 @@ def log_arbiter_telemetry(
     try:
         _telemetry_queue.put_nowait((entry, target_path))
     except queue.Full:
-        pass
+        try:
+            _telemetry_queue.get_nowait()
+            _telemetry_queue.task_done()
+            _telemetry_queue.put_nowait((entry, target_path))
+        except Exception:
+            pass
 
 
-# ── Executive Context Broker Helpers ─────────────────────────────────────────
+# ── Patterns & Provider Alias Dictionaries ────────────────────────────────────
 
 IDENTITY_PATTERN = re.compile(
     r"\b(about\s+me|who\s+am\s+i|know\s+(?:a?bout|abt)\s+me|my\s+profile|tell\s+(?:me\s+)?about\s+me|who\s+i\s+am)\b",
     re.IGNORECASE,
 )
-FRONTEND_PATTERN = re.compile(
-    r"\b(web(?:site|asite)|e-?commer(?:ce|ice)|clon(?:e|ing|ed)|claong|dashboard|html|web\s*app|store|spotify|netflix|nelflix|youtube|ui(?:\s+only)?|interface|landing\s+page|working\s+app|build\s+it|make\s+it)\b",
+
+ATTRIBUTION_PATTERN = re.compile(
+    r"^(?:which|what)\s+(?:ai\s+)?model\s+(?:did\s+you\s+use|made\s+(?:this|that|it)|built\s+(?:this|that|it)|generated\s+(?:this|that|it)|was\s+used)"
+    r"|\b(?:for\s+(?:the\s+)?[\w\s\-]+?\s*(?:clone|website|webasite|app|code|store|dashboard)?\s*which\s+(?:ai\s+)?model\s+(?:did\s+you\s+use|was\s+used))\b"
+    r"|^who\s+(?:built|made|generated)\s+(?:this|that|it)\??$",
     re.IGNORECASE,
 )
+
+BACKEND_SCRIPT_GUARD = re.compile(
+    r"\b(python|pyhton|tkinter|cli|terminal|bash|powershell|fastapi|django|flask|sql|postgresql|pytorch|pandas|numpy|scikit|c\+\+|rust)\b",
+    re.IGNORECASE,
+)
+
+FRONTEND_PATTERN = re.compile(
+    r"\b(web(?:site|asite)|e-?commer(?:ce|ice)|clon(?:e|ing|ed)|claong|dashboard|html|web\s*app|store|spotify|netflix|nelflix|youtube|ui(?:\s+only)?|interface|landing\s+page|working\s+app|build\s+it|make\s+it|three\.js|canvas)\b",
+    re.IGNORECASE,
+)
+
 CODING_PATTERN = re.compile(
-    r"\b(py(?:thon|hton)|script|scirpt|tkinter|gui|algorithm|api|backend|endpoint|fastapi|function)\b",
+    r"\b(py(?:thon|hton)|script|scirpt|tkinter|gui|algorithm|api|backend|endpoint|fastapi|function|class|sql|regex|debug|refactor)\b",
+    re.IGNORECASE,
+)
+
+ITERATIVE_REFINEMENT_PATTERN = re.compile(
+    r"^(?:now\s+|please\s+|can\s+you\s+)?(?:add|change|update|modify|make\s+it|fix|remove|replace|put|include|switch\s+the\s+theme|make\s+the)\b",
     re.IGNORECASE,
 )
 
 KNOWN_PROVIDER_ALIASES: Dict[str, str] = {
-    # Claude
-    "claude": "claude", "cladue": "claude", "claud": "claude", "cloude": "claude",
-    "calude": "claude", "claudeai": "claude", "claude_web": "claude",
-    # ChatGPT
-    "chatgpt": "chatgpt", "chat gpt": "chatgpt", "gpt": "chatgpt", "chagpt": "chatgpt",
-    "chatgtp": "chatgpt", "openai": "chatgpt", "gpt4": "chatgpt", "chatgpt_web": "chatgpt",
+    # Claude (Brain 4 Web)
+    "claude": "claude",
+    "cladue": "claude",
+    "claud": "claude",
+    "cloude": "claude",
+    "calude": "claude",
+    "claudeai": "claude",
+    "claude_web": "claude",
+    "claudeto": "claude",
+    "cladueto": "claude",
+    # ChatGPT (Brain 4 Web)
+    "chatgpt": "chatgpt",
+    "chat gpt": "chatgpt",
+    "gpt": "chatgpt",
+    "chagpt": "chatgpt",
+    "chatgtp": "chatgpt",
+    "openai": "chatgpt",
+    "gpt4": "chatgpt",
+    "gpt4o": "chatgpt",
+    "chatgpt_web": "chatgpt",
+    "gptto": "chatgpt",
+    "chatgptto": "chatgpt",
     # Gemini Cloud API (Tier 3 Fast Cloud API Key)
-    "gemini": "gemini", "gemeni": "gemini", "gmini": "gemini", "gemni": "gemini",
-    "gemini api": "gemini", "gemeni api": "gemini", "gemini key": "gemini", "gemeni key": "gemini",
-    "gemini pro": "gemini", "gemini flash": "gemini", "gemeni pro": "gemini", "gemeni flash": "gemini",
-    "gemini-flash": "gemini", "gemini-pro": "gemini",
+    "gemini": "gemini",
+    "gemeni": "gemini",
+    "gmini": "gemini",
+    "gemni": "gemini",
+    "gemini api": "gemini",
+    "gemeni api": "gemini",
+    "gmini api": "gemini",
+    "gemini key": "gemini",
+    "gemeni key": "gemini",
+    "gemini pro": "gemini",
+    "gemini flash": "gemini",
+    "gemeni pro": "gemini",
+    "gemeni flash": "gemini",
+    "gemini-flash": "gemini",
+    "gemini-pro": "gemini",
     # Gemini Web (Browser Account Automation)
-    "gemini web": "gemini_web", "gemini_web": "gemini_web", "gemini browser": "gemini_web",
-    "gemeni web": "gemini_web", "gemeni browser": "gemini_web",
-    # Grok
-    "grok": "grok", "gork": "grok", "xai": "grok", "grok_web": "grok",
-    # Fast API / Local
-    "groq": "groq", "grq": "groq",
-    "local": "local_llama", "local_llama": "local_llama", "llama": "local_llama",
-    "kernel": "kernel", "aivco-kernel": "kernel",
+    "gemini web": "gemini_web",
+    "gemini_web": "gemini_web",
+    "gemini browser": "gemini_web",
+    "gemeni web": "gemini_web",
+    "gemeni browser": "gemini_web",
+    # Grok (Brain 4 Web)
+    "grok": "grok",
+    "gork": "grok",
+    "xai": "grok",
+    "grok_web": "grok",
+    # Groq (Tier 2 Fast Cloud API)
+    "groq": "groq",
+    "grq": "groq",
+    "groq api": "groq",
+    "llama": "groq",
+    # Local / Kernel
+    "local": "local_llama",
+    "local_llama": "local_llama",
+    "ollama": "local_llama",
+    "kernel": "kernel",
+    "aivco-kernel": "kernel",
 }
 
 CANONICAL_PROVIDERS: Dict[str, List[str]] = {
-    "claude": ["claude"],
-    "chatgpt": ["chatgpt", "gpt"],
-    "gemini": ["gemini", "gemeni", "gemini api", "gemeni api"],
+    "claude": ["claude", "cladue", "cloude"],
+    "chatgpt": ["chatgpt", "gpt", "openai"],
+    "gemini": ["gemini", "gemeni", "gemini api", "gemeni api", "gemini pro"],
     "gemini_web": ["gemini web", "gemeni web", "gemini browser"],
-    "grok": ["grok", "xai"],
-    "groq": ["groq"],
+    "grok": ["grok", "gork", "xai"],
+    "groq": ["groq", "groq api"],
+    "local_llama": ["local", "ollama"],
 }
+
+WEB_PROVIDERS = frozenset(
+    {"claude", "chatgpt", "gemini_web", "grok", "claude_web", "chatgpt_web", "grok_web"}
+)
+
+
+# ── Session Attribution & Artifact Ledger ────────────────────────────────────
+
+class SessionTurnRecord:
+    __slots__ = (
+        "turn_id",
+        "prompt",
+        "target_tier",
+        "actual_provider",
+        "cascaded_from",
+        "has_html_artifact",
+        "html_code",
+        "response",
+        "timestamp",
+    )
+
+    def __init__(
+        self,
+        turn_id: int,
+        prompt: str,
+        target_tier: str,
+        actual_provider: str,
+        cascaded_from: Optional[str] = None,
+        has_html_artifact: bool = False,
+        html_code: str = "",
+        response: str = "",
+    ):
+        self.turn_id = turn_id
+        self.prompt = prompt
+        self.target_tier = target_tier
+        self.actual_provider = actual_provider
+        self.cascaded_from = cascaded_from
+        self.has_html_artifact = has_html_artifact
+        self.html_code = html_code
+        self.response = response
+        self.timestamp = time.time()
+
+
+class SessionExecutionLedger:
+    """
+    Tracks recent execution turns, actual model attribution, and active HTML artifacts
+    so AIVCO never hallucinates which model built a deliverable and supports iterative edits.
+    """
+
+    PROVIDER_DISPLAY_NAMES = {
+        "claude": "Claude 3.7 Sonnet (via AIVCO Web AI Bridge)",
+        "chatgpt": "ChatGPT / GPT-4o (via AIVCO Web AI Bridge)",
+        "gemini_web": "Gemini Advanced (via AIVCO Web AI Bridge)",
+        "grok": "Grok 3 (via AIVCO Web AI Bridge)",
+        "gemini": "Google Gemini 2.5 Pro/Flash (Tier 3 Cloud API)",
+        "groq": "Llama 3.3 70B Versatile (via Groq Tier 2 Fast API)",
+        "local_llama": "Local Quantized GGUF SLM (Tier 1 Offline Engine)",
+        "kernel": "AIVCO Cognitive Kernel (Stage 0 Deterministic Engine)",
+    }
+
+    def __init__(self, max_turns: int = 12):
+        self._lock = threading.Lock()
+        self._turns: Deque[SessionTurnRecord] = deque(maxlen=max_turns)
+        self._turn_counter: int = 0
+
+    def record_turn(
+        self,
+        prompt: str,
+        target_tier: str,
+        actual_provider: Optional[str] = None,
+        cascaded_from: Optional[str] = None,
+        response_markdown: str = "",
+    ) -> SessionTurnRecord:
+        provider = (actual_provider or target_tier or "groq").strip().lower()
+        if ":" in provider:
+            provider = provider.split(":", 1)[1].strip()
+        provider = KNOWN_PROVIDER_ALIASES.get(provider, provider)
+
+        cascaded = (cascaded_from or "").strip().lower()
+        if ":" in cascaded:
+            cascaded = cascaded.split(":", 1)[1].strip()
+        cascaded = KNOWN_PROVIDER_ALIASES.get(cascaded, cascaded) if cascaded else None
+
+        html_code = ""
+        has_html = False
+        if response_markdown and "<!doctype html" in response_markdown.lower():
+            has_html = True
+            m = re.search(r"```html\s*([\s\S]*?)```", response_markdown, re.IGNORECASE)
+            html_code = m.group(1).strip() if m else response_markdown.strip()
+
+        with self._lock:
+            self._turn_counter += 1
+            rec = SessionTurnRecord(
+                turn_id=self._turn_counter,
+                prompt=prompt,
+                target_tier=target_tier,
+                actual_provider=provider,
+                cascaded_from=cascaded if cascaded != provider else None,
+                has_html_artifact=has_html,
+                html_code=html_code,
+                response=response_markdown,
+            )
+            self._turns.append(rec)
+            return rec
+
+    def get_last_turn(self) -> Optional[SessionTurnRecord]:
+        with self._lock:
+            return self._turns[-1] if self._turns else None
+
+    def get_recent_turns(self, n: int = 3) -> List[SessionTurnRecord]:
+        with self._lock:
+            return list(self._turns)[-n:]
+
+    def get_recent_history_context(self, n: int = 3, max_chars_per_turn: int = 500) -> str:
+        """
+        Returns a compact conversation history buffer of the last n turns
+        to give Tier 2/3 stateless APIs short-term conversational continuity.
+        """
+        with self._lock:
+            turns = [t for t in self._turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
+            if not turns:
+                return ""
+            blocks = []
+            for t in turns:
+                resp = t.response or ""
+                if "<!doctype html" in resp.lower():
+                    resp = re.sub(
+                        r"```html[\s\S]*?```",
+                        "[Complete HTML Application Artifact Rendered]",
+                        resp,
+                        flags=re.IGNORECASE,
+                    )
+                clean_resp = resp.strip()
+                if len(clean_resp) > max_chars_per_turn:
+                    clean_resp = clean_resp[:max_chars_per_turn].rsplit(" ", 1)[0] + "..."
+                blocks.append(f"User: {t.prompt}\nAssistant: {clean_resp}")
+            return "\n\n".join(blocks)
+
+    def get_last_artifact_turn(self) -> Optional[SessionTurnRecord]:
+        with self._lock:
+            for rec in reversed(self._turns):
+                if rec.has_html_artifact and rec.html_code:
+                    return rec
+            return None
+
+    def format_attribution_answer(self, query: str = "") -> str:
+        last: Optional[SessionTurnRecord] = None
+        if query:
+            q_lower = query.lower()
+            with self._lock:
+                # Look for matching keywords (e.g. "netflix", "clone") in prompt
+                stop_words = {"for", "the", "which", "what", "model", "did", "you", "use", "was", "used", "made", "built", "generate", "generated"}
+                words = [w for w in re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", q_lower) if w not in stop_words]
+                if words:
+                    for rec in reversed(self._turns):
+                        if any(w in rec.prompt.lower() for w in words):
+                            last = rec
+                            break
+
+        if not last:
+            last = self.get_last_turn()
+
+        if not last:
+            return (
+                "No previous deliverable has been generated in this session yet. "
+                "AIVCO routes frontend architecture to Claude/ChatGPT Web Bridge and fast logic/API tasks to Groq (Llama 3.3 70B) and Gemini Pro."
+            )
+        friendly = self.PROVIDER_DISPLAY_NAMES.get(
+            last.actual_provider, last.actual_provider.upper()
+        )
+        if last.cascaded_from and last.cascaded_from != last.actual_provider:
+            orig = self.PROVIDER_DISPLAY_NAMES.get(
+                last.cascaded_from, last.cascaded_from.upper()
+            )
+            return (
+                f"For your previous request (`\"{last.prompt[:80]}\"`), AIVCO initially targeted **{orig}**, "
+                f"detected a rate limit/cooldown, and automatically cascaded execution to **{friendly}**."
+            )
+        return (
+            f"For your previous request (`\"{last.prompt[:80]}\"`), AIVCO used **{friendly}**."
+        )
+
+    def clear(self) -> None:
+        with self._lock:
+            self._turns.clear()
+            self._turn_counter = 0
+
+
+session_ledger = SessionExecutionLedger()
 
 
 # ── Live Provider Health & Circuit Breaker ───────────────────────────────────
@@ -158,21 +425,30 @@ class ProviderHealthRecord:
         self.avg_latency_ms: float = 0.0
         self.last_failure_reason: str = ""
 
-    def is_available(self, extension_connected: bool = True) -> bool:
-        if self.name in ("claude", "chatgpt", "gemini_web", "grok", "claude_web", "chatgpt_web", "grok_web"):
-            if not extension_connected:
-                return False
-        if time.time() < self.cooldown_until:
+    def is_available(self, extension_connected: bool = True, now: Optional[float] = None) -> bool:
+        if self.name in WEB_PROVIDERS and not extension_connected:
+            return False
+        current_time = now if now is not None else time.time()
+        if current_time < self.cooldown_until:
             return False
         return True
 
 
 class ProviderHealthRegistry:
     """
-    Live Provider Health & Circuit Breaker.
-    Prevents repeated dispatches to rate-limited, cloudflare-challenged, or disconnected providers.
+    Thread-safe Live Provider Health & Circuit Breaker with Exponential Backoff
+    and Rolling Latency tie-breaking.
     """
-    DEFAULT_PROVIDERS = ["claude", "chatgpt", "gemini_web", "grok", "gemini", "groq"]
+
+    DEFAULT_PROVIDERS = [
+        "claude",
+        "chatgpt",
+        "gemini_web",
+        "grok",
+        "gemini",
+        "groq",
+        "local_llama",
+    ]
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -182,15 +458,12 @@ class ProviderHealthRegistry:
         self._has_active_cooldown: bool = False
 
     def _normalize(self, provider: str) -> str:
-        prov = (provider or "").strip().lower()
-        prov = prov.replace("-", "_")
-        if prov in ("gemini_web", "claude_web", "chatgpt_web", "grok_web"):
+        prov = (provider or "").strip().lower().replace("-", "_")
+        if prov in WEB_PROVIDERS:
             return prov
-        if prov.startswith("web_account:") or prov.startswith("web-account:"):
-            prov = prov.split(":", 1)[1]
-        if prov in KNOWN_PROVIDER_ALIASES:
-            return KNOWN_PROVIDER_ALIASES[prov]
-        return prov
+        if ":" in prov:
+            prov = prov.split(":", 1)[1].strip()
+        return KNOWN_PROVIDER_ALIASES.get(prov, prov)
 
     def get_record(self, provider: str) -> ProviderHealthRecord:
         norm = self._normalize(provider)
@@ -212,18 +485,21 @@ class ProviderHealthRegistry:
             rec.healthy = False
             self._has_active_cooldown = True
 
-            if "rate_limit" in reason_lower or "rate limit" in reason_lower or "cloudflare" in reason_lower:
-                rec.cooldown_until = now + 600.0  # 10 minutes
-            elif "timeout" in reason_lower or "disconnected" in reason_lower or "disconnect" in reason_lower:
-                rec.cooldown_until = now + 120.0  # 2 minutes
+            # Exponential backoff scaling capped at 30 minutes (1800s)
+            multiplier = min(3, 2 ** max(0, rec.consecutive_failures - 1))
+            if any(k in reason_lower for k in ("rate_limit", "rate limit", "cloudflare", "quota", "429")):
+                base_cd = 600.0  # 10 min base for rate limit
+                rec.cooldown_until = now + min(1800.0, base_cd * multiplier)
+            elif any(k in reason_lower for k in ("timeout", "disconnected", "disconnect", "unavailable")):
+                base_cd = 120.0  # 2 min base for timeout/bridge drop
+                rec.cooldown_until = now + min(600.0, base_cd * multiplier)
             else:
-                if rec.consecutive_failures >= 2:
-                    rec.cooldown_until = now + 60.0
-                else:
-                    rec.cooldown_until = now + 15.0
+                base_cd = 60.0 if rec.consecutive_failures >= 2 else 15.0
+                rec.cooldown_until = now + min(300.0, base_cd * multiplier)
 
     def record_success(self, provider: str, latency_ms: float = 0.0) -> None:
         norm = self._normalize(provider)
+        now = time.time()
         with self._lock:
             if norm not in self._registry:
                 self._registry[norm] = ProviderHealthRecord(norm)
@@ -233,53 +509,75 @@ class ProviderHealthRegistry:
             rec.healthy = True
             rec.last_failure_reason = ""
             if latency_ms > 0:
-                if rec.avg_latency_ms <= 0:
-                    rec.avg_latency_ms = latency_ms
-                else:
-                    rec.avg_latency_ms = 0.7 * rec.avg_latency_ms + 0.3 * latency_ms
+                rec.avg_latency_ms = (
+                    latency_ms
+                    if rec.avg_latency_ms <= 0
+                    else (0.7 * rec.avg_latency_ms + 0.3 * latency_ms)
+                )
+            self._has_active_cooldown = any(
+                now < r.cooldown_until for r in self._registry.values()
+            )
 
     def is_available(self, provider: str, extension_connected: bool = True) -> bool:
-        if not self._has_active_cooldown and extension_connected:
-            return True
         norm = self._normalize(provider)
+        if not self._has_active_cooldown and (norm not in WEB_PROVIDERS or extension_connected):
+            return True
+        now = time.time()
         with self._lock:
-            rec = self._registry.get(norm)
-            if not rec:
-                rec = ProviderHealthRecord(norm)
-                self._registry[norm] = rec
-            return rec.is_available(extension_connected)
+            rec = self._registry.setdefault(norm, ProviderHealthRecord(norm))
+            return rec.is_available(extension_connected=extension_connected, now=now)
 
     def get_best_available_provider(
         self,
-        preferred_chain: list[str],
+        preferred_chain: List[str],
         extension_connected: bool = True,
     ) -> str:
-        if not self._has_active_cooldown and extension_connected:
-            return self._normalize(preferred_chain[0]) if preferred_chain else "groq"
+        if not preferred_chain:
+            return "groq"
+
+        first_norm = self._normalize(preferred_chain[0])
+        if not self._has_active_cooldown and (first_norm not in WEB_PROVIDERS or extension_connected):
+            return first_norm
 
         now = time.time()
         with self._lock:
             has_any_cd = False
+            available_candidates: List[str] = []
+
             for p in preferred_chain:
                 norm = self._normalize(p)
-                rec = self._registry.get(norm)
-                if not rec:
-                    rec = ProviderHealthRecord(norm)
-                    self._registry[norm] = rec
+                rec = self._registry.setdefault(norm, ProviderHealthRecord(norm))
 
-                if norm in ("claude", "chatgpt", "gemini_web", "grok", "claude_web", "chatgpt_web", "grok_web"):
-                    if not extension_connected:
-                        continue
+                if norm in WEB_PROVIDERS and not extension_connected:
+                    continue
 
                 if now < rec.cooldown_until:
                     has_any_cd = True
                     continue
 
-                return norm
+                available_candidates.append(norm)
 
-            self._has_active_cooldown = has_any_cd
+            self._has_active_cooldown = any(
+                now < r.cooldown_until for r in self._registry.values()
+            )
 
-        return self._normalize(preferred_chain[-1]) if preferred_chain else "groq"
+            if available_candidates:
+                return available_candidates[0]
+
+            # All preferred candidates are in cooldown or disconnected:
+            # Pick the non-disconnected candidate whose cooldown expires soonest.
+            fallback_pool = [
+                self._normalize(p)
+                for p in preferred_chain
+                if not (self._normalize(p) in WEB_PROVIDERS and not extension_connected)
+            ]
+            if fallback_pool:
+                return min(
+                    fallback_pool,
+                    key=lambda x: self._registry[x].cooldown_until,
+                )
+
+        return "groq"
 
     def reset_all(self) -> None:
         with self._lock:
@@ -294,39 +592,59 @@ class ProviderHealthRegistry:
 provider_health = ProviderHealthRegistry()
 
 
+# ── Fuzzy Provider Directive Extraction ──────────────────────────────────────
+
 DIRECTIVE_TRIGGER_CHECK = re.compile(
     r"\b(?:use|ask|tell|run|search|via|with|on|in|switch\s+to|@)\b|^[a-zA-Z0-9_\-]+:\s*",
     re.IGNORECASE,
 )
+
 TRIGGER_PATTERN = re.compile(
     r"^(?:(?:use|ask|tell|run|search|via|with|on|in)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)(?:\s*(?:to\s+(?:search\s+)?|for\s+|:\s*|\s+-\s*|\s+–\s*)|\s+)(.*)$",
     re.IGNORECASE,
 )
 
+SAFE_MERGED_TO_PREFIXES = frozenset(
+    {"claude", "cladue", "claud", "cloude", "calude", "chatgpt", "chagpt", "chatgtp", "gpt", "gemini", "gemeni", "gmini", "grok", "gork", "groq"}
+)
+
 
 def match_provider_token(token: str) -> Optional[str]:
-    """Matches a token to a provider canonical name using aliases and SequenceMatcher."""
+    """Matches a token to a canonical provider name using exact aliases and safe SequenceMatcher."""
     t = token.lower().strip()
+    if not t:
+        return None
     if t in KNOWN_PROVIDER_ALIASES:
         return KNOWN_PROVIDER_ALIASES[t]
+
+    # Guard against common English words ending in 'to' (like 'photo', 'auto', 'into', 'onto')
+    if t.endswith("to") and len(t) >= 5:
+        stem = t[:-2]
+        if stem in SAFE_MERGED_TO_PREFIXES:
+            return KNOWN_PROVIDER_ALIASES.get(stem)
+
     lt = len(t)
-    if lt < 3 or lt > 12:
+    if lt < 3 or lt > 12 or t[0] not in ("c", "g", "o", "x", "l", "k"):
         return None
+
+    best_can: Optional[str] = None
+    best_ratio: float = 0.0
     for can, targets in CANONICAL_PROVIDERS.items():
         for target in targets:
             if abs(lt - len(target)) <= 2:
-                if difflib.SequenceMatcher(None, t, target).ratio() >= 0.78:
-                    return can
-    return None
+                ratio = difflib.SequenceMatcher(None, t, target).ratio()
+                if ratio >= 0.78 and ratio > best_ratio:
+                    best_ratio = ratio
+                    best_can = can
+    return best_can
 
 
 def extract_fuzzy_provider_directive(prompt: str) -> Tuple[Optional[str], str]:
     """
     Sub-millisecond fuzzy typo-tolerant provider directive extraction.
-    Detects provider commands at start or inside prompt (e.g. 'use cladue to', 'use claudeto',
-    'ask gpt to', 'use chagpt') and strips ONLY the routing prefix cleanly.
+    Detects provider commands at the start or end of a prompt and strips ONLY the routing prefix/suffix.
     """
-    raw = prompt.strip()
+    raw = (prompt or "").strip()
     if not raw or not DIRECTIVE_TRIGGER_CHECK.search(raw):
         return None, raw
 
@@ -338,48 +656,43 @@ def extract_fuzzy_provider_directive(prompt: str) -> Tuple[Optional[str], str]:
             return prov, ""
 
     # Check 2: Prefix directives: (use|ask|tell|run|via|with|search)? @?(provider)(to|:|-) rest
-    # Also handles merged 'to' (e.g. claudeto, cladueto, chagptto, gptto)
     m_pref = TRIGGER_PATTERN.match(raw)
     if m_pref:
         token = m_pref.group(1).strip()
         rest = m_pref.group(2).strip()
-
-        # Check merged 'to' (e.g. claudeto -> base 'claude', rest)
-        if token.lower().endswith("to") and token.lower() not in KNOWN_PROVIDER_ALIASES:
-            base_token = token[:-2]
-            prov = match_provider_token(base_token)
-            if prov:
-                return prov, rest
-
         prov = match_provider_token(token)
         if prov:
             return prov, rest
 
-    # Check 3: Short standalone (e.g. 'use cladue', 'ask gpt', 'chagpt')
-    m_standalone = re.match(r"^(?:(?:use|ask|tell)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)[.?!]*$", raw, re.IGNORECASE)
+    # Check 3: Short standalone ("use cladue", "ask gpt", "chagpt")
+    m_standalone = re.match(
+        r"^(?:(?:use|ask|tell)\s+)?@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)[.?!]*$",
+        raw,
+        re.IGNORECASE,
+    )
     if m_standalone:
         token = m_standalone.group(1).strip()
-        if token.lower().endswith("to") and token.lower() not in KNOWN_PROVIDER_ALIASES:
-            base_token = token[:-2]
-            prov = match_provider_token(base_token)
-            if prov:
-                return prov, ""
         prov = match_provider_token(token)
         if prov:
             return prov, ""
 
-    # Check 4: Inline trailing directive: '... using cladue', '... with chagpt'
-    m_inline = re.search(r"\b(?:using|with|via|in|on)\s+@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)[.?!]*$", raw, re.IGNORECASE)
+    # Check 4: Inline trailing directive ("... using cladue", "... with chagpt")
+    m_inline = re.search(
+        r"\b(?:using|with|via|in|on)\s+@?([a-zA-Z0-9_\-]+(?:\s+(?:web|browser|api|key|pro|flash))?)[.?!]*$",
+        raw,
+        re.IGNORECASE,
+    )
     if m_inline:
-        prov = match_provider_token(m_inline.group(1).strip())
+        candidate_token = m_inline.group(1).strip()
+        prov = match_provider_token(candidate_token)
         if prov:
-            clean = raw[:m_inline.start()].strip()
+            clean = raw[: m_inline.start()].strip()
             return prov, clean
 
     return None, raw
 
 
-# ── Domain Feature Blueprints ───────────────────────────────────────────────
+# ── Domain Feature Blueprints ────────────────────────────────────────────────
 
 VIDEO_STREAMING_BLUEPRINT = """DOMAIN FEATURE BLUEPRINT (VIDEO & STREAMING PLATFORM):
 - Hero Billboard: Large cinematic backdrop with title logo, metadata badges (4K Ultra HD, Dolby Vision, Match 98%), summary synopsis, and interactive "Play Trailer" modal embed.
@@ -413,13 +726,52 @@ COMMAND_CENTER_BLUEPRINT = """DOMAIN FEATURE BLUEPRINT (AIVCO COMMAND CENTER & D
 - Aesthetic: High-tech obsidian glassmorphism (#0A0F1D, electric cyan #00F0FF and violet #8B5CF6 glow accents), backdrop-filter blur, custom inline SVG telemetry icons."""
 
 
-def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_context: str = "") -> str:
+def _is_true_frontend_intent(text: str) -> bool:
+    """
+    Ensures backend/desktop requests like 'write a python tkinter gui app' or 'build a fastapi app'
+    are NOT misclassified as single-file HTML websites unless HTML/web is explicitly requested.
+    """
+    lower = text.lower()
+    if BACKEND_SCRIPT_GUARD.search(lower):
+        explicit_web = any(
+            w in lower
+            for w in (
+                "html",
+                "website",
+                "webasite",
+                "web app",
+                "webpage",
+                "css",
+                "three.js",
+                "ecommerce",
+                "e-commerce",
+                "ecommerice",
+                "netflix",
+                "nelflix",
+                "spotify",
+                "youtube",
+                "landing page",
+                "storefront",
+                "ui only",
+            )
+        )
+        return explicit_web
+    return bool(FRONTEND_PATTERN.search(text) or KernelCognitiveArbiter._FAST_WEB.search(text))
+
+
+def synthesize_elite_prompt(
+    raw_intent: str, target_tier: str = "", memory_context: str = ""
+) -> str:
     """
     Transforms casual or typo-laden operator requests into elite, production-grade
     engineering specifications before dispatching to AI providers.
     """
-    clean_intent = raw_intent.strip()
+    clean_intent = (raw_intent or "").strip()
     if not clean_intent:
+        return clean_intent
+
+    tier_norm = (target_tier or "").strip().lower()
+    if tier_norm == "kernel":
         return clean_intent
 
     # 1. Identity / Personal queries
@@ -430,14 +782,39 @@ def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_conte
             "technical stack, active engineering projects, academic background, and design preferences."
         )
 
-    # 2. Frontend / Web App / UI / Clone queries
-    if FRONTEND_PATTERN.search(clean_intent):
+    # 2. Iterative Refinement on active HTML artifact
+    last_artifact = session_ledger.get_last_artifact_turn()
+    if (
+        last_artifact
+        and ITERATIVE_REFINEMENT_PATTERN.search(clean_intent)
+        and len(clean_intent) < 300
+    ):
+        return (
+            f"ITERATIVE REFINEMENT DIRECTIVE: {clean_intent}\n\n"
+            "PREVIOUS ACTIVE APPLICATION BASELINE:\n"
+            f"```html\n{last_artifact.html_code[:12000]}\n```\n\n"
+            "EXECUTIVE AUTONOMY MANDATE:\n"
+            "- Preserve all working state, styles, and features from the baseline above.\n"
+            "- Apply the requested modification cleanly and output the COMPLETE updated `<!DOCTYPE html>` file inside a single ```html code block."
+        )
+
+    # 3. Frontend / Web App / UI / Clone queries
+    if _is_true_frontend_intent(clean_intent):
         lower_intent = clean_intent.lower()
-        if re.search(r"\b(netflix|nelflix|youtube|video|stream(?:ing)?|cinema|movie)\b", lower_intent):
+        if re.search(
+            r"\b(netflix|nelflix|youtube|video|stream(?:ing)?|cinema|movie)\b",
+            lower_intent,
+        ):
             blueprint = VIDEO_STREAMING_BLUEPRINT
-        elif re.search(r"\b(spotify|music|audio|player|song|sound|playlist|track)\b", lower_intent):
+        elif re.search(
+            r"\b(spotify|music|audio|player|song|sound|playlist|track)\b",
+            lower_intent,
+        ):
             blueprint = MUSIC_AUDIO_BLUEPRINT
-        elif re.search(r"\b(ecommerce|e-?commer(?:ce|ice)|store|shop|brand|sell|tshimhchet|cart|checkout|product)\b", lower_intent):
+        elif re.search(
+            r"\b(ecommerce|e-?commer(?:ce|ice)|store|shop|brand|sell|tshimhchet|cart|checkout|product)\b",
+            lower_intent,
+        ):
             blueprint = ECOMMERCE_BLUEPRINT
         else:
             blueprint = COMMAND_CENTER_BLUEPRINT
@@ -449,7 +826,8 @@ def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_conte
             "1. NEVER ask the operator clarifying questions (e.g., never ask 'which framework?', 'what platform?', or 'would you like starter code?').\n"
             "2. NEVER reply with a high-level text roadmap, folder tree scaffold, or architecture outline when the operator asks to build, make, or clone an app, website, or UI.\n"
             "3. Act as an autonomous, decisive CTO/CEO: immediately choose the best single-file HTML5/CSS3/JS architecture and output the COMPLETE, fully functional, self-contained `<!DOCTYPE html>` application inside a single ```html code block so it renders immediately in AIVCO's Live Preview drawer.\n"
-            "4. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn.\n\n"
+            "4. Write 100% pure vanilla JavaScript inside `<script>` tags—NEVER output TypeScript syntax (`interface`, `type X =`, `as HTMLElement`, or `: number` parameter types) inside an HTML `<script>` block.\n"
+            "5. Even if the operator writes typos (e.g., 'claong website of nelflix', 'buikd', 'amek'), infer the exact target product and build the complete working clone on the first turn.\n\n"
             "ELITE ENGINEERING SPECIFICATION:\n"
             "- Architect and output a complete, self-contained, single-file `<!DOCTYPE html>` application (HTML5 + modern CSS3 + vanilla JavaScript).\n"
             "- Design Aesthetic: Bespoke, human-crafted editorial or dark obsidian/glassmorphic UI with custom inline SVG artwork, micro-interactions, responsive CSS Grid/Flexbox layout, and zero broken external image links.\n"
@@ -457,13 +835,17 @@ def synthesize_elite_prompt(raw_intent: str, target_tier: str = "", memory_conte
             "- Output Contract: Do NOT use the Artifacts sandbox tool or external file cards. Output the ENTIRE runnable code directly inline inside a single ```html ... ``` fenced code block."
         )
 
-    # 3. Coding / Script / Backend queries
+    # 4. Coding / Script / Backend queries
     if CODING_PATTERN.search(clean_intent):
         return (
             f"USER OBJECTIVE: {clean_intent}\n\n"
+            "EXECUTIVE AUTONOMY MANDATE (ZERO HAND-HOLDING):\n"
+            "- Do NOT ask clarifying questions or output empty folder scaffolds.\n"
+            "- Deliver complete, production-grade, well-structured, and immediately runnable code inside standard markdown fenced code blocks.\n"
+            "- Handle edge cases, include clear inline documentation, and provide a concise architectural breakdown.\n\n"
             "ELITE ENGINEERING SPECIFICATION:\n"
-            "- Deliver clean, production-grade, well-structured, and immediately runnable code inside standard markdown fenced code blocks.\n"
-            "- Handle edge cases, include clear inline documentation, and provide a concise architectural breakdown."
+            "- Deliver clean, production-ready code with complete logic and zero placeholders.\n"
+            "- Output immediately runnable script in standard markdown fenced code blocks."
         )
 
     return clean_intent
@@ -475,19 +857,27 @@ def compress_memory_context(memory_context: str, max_chars: int = 500) -> str:
     (max ~150 tokens) containing key operator directives, rules, and project context.
     """
     if not memory_context or not memory_context.strip():
-        return "Operator: Sir/AIvco | System: AIVCO Personal AI Architecture."
+        return "Operator: Parikshit Koirala (Sir/AIvco) | System: AIVCO Personal AI Architecture."
 
     lines = []
     for raw_line in memory_context.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        # Strip list markers
         clean_line = re.sub(r"^[-*•✓\s]+", "", line).strip()
-        if any(key in clean_line.lower() for key in (
-            "operator address", "operating rules", "brevity protocol",
-            "active project", "tech stack", "role", "preferred"
-        )):
+        if any(
+            key in clean_line.lower()
+            for key in (
+                "operator address",
+                "operating rules",
+                "brevity protocol",
+                "active project",
+                "tech stack",
+                "role",
+                "preferred",
+                "parikshit",
+            )
+        ):
             lines.append(clean_line)
 
     if not lines:
@@ -500,23 +890,30 @@ def compress_memory_context(memory_context: str, max_chars: int = 500) -> str:
 
     summary = " | ".join(lines[:5])
     if len(summary) > max_chars:
-        summary = summary[:max_chars - 3].rsplit(" ", 1)[0] + "..."
-    return summary or "Operator: Sir/AIvco | System: AIVCO Personal AI Architecture."
+        summary = summary[: max_chars - 3].rsplit(" ", 1)[0] + "..."
+    return summary or "Operator: Parikshit Koirala (Sir/AIvco) | System: AIVCO Personal AI Architecture."
 
 
-def build_executive_envelope(prompt: str, target_tier: str, memory_context: str) -> str:
+def build_executive_envelope(
+    prompt: str, target_tier: str, memory_context: str
+) -> str:
     """
-    Wraps prompt with an Executive Context Envelope for Brain 4 Web AI models.
-    For Tier 2/3 Cloud API models, keeps the user message clean while memory is passed via system context.
+    Wraps prompt with an Executive Context Envelope for Brain 4 Web AI models,
+    and upgrades frontend/coding specifications for Tier 2/3 Cloud APIs.
     """
     tier_norm = (target_tier or "").lower()
     compact_memory_summary = compress_memory_context(memory_context)
 
-    # Brain 4 Web AI (Claude, ChatGPT, Gemini Web, Grok via Extension)
-    is_web_ai = any(k in tier_norm for k in ("claude", "chatgpt", "gemini_web", "gemini-web", "grok", "brain4")) or tier_norm == "web"
+    is_web_ai = (
+        any(
+            k in tier_norm
+            for k in ("claude", "chatgpt", "gemini_web", "gemini-web", "grok", "brain4")
+        )
+        or tier_norm == "web"
+    )
     if is_web_ai:
         synthesized_prompt = synthesize_elite_prompt(prompt, target_tier, memory_context)
-        envelope = (
+        return (
             "[AIVCO EXECUTIVE BRIEF]\n"
             f"Operator Context: {compact_memory_summary}\n"
             "Execution Contract: Deliver production-grade, complete implementation. "
@@ -528,9 +925,16 @@ def build_executive_envelope(prompt: str, target_tier: str, memory_context: str)
             "USER DIRECTIVE:\n"
             f"{synthesized_prompt}"
         )
-        return envelope
 
-    # Tier 2 Fast Cloud API (Groq, Gemini) / Kernel / Local
+    # For Tier 2/3 Cloud APIs (Groq/Gemini), keep simple prompts clean as required by unit tests,
+    # unless the user is explicitly asking to build a Frontend Clone / Website or refining an active HTML artifact.
+    is_refinement = bool(
+        session_ledger.get_last_artifact_turn()
+        and ITERATIVE_REFINEMENT_PATTERN.search(prompt)
+    )
+    if tier_norm in ("groq", "gemini") and (_is_true_frontend_intent(prompt) or is_refinement):
+        return synthesize_elite_prompt(prompt, target_tier, memory_context)
+
     return prompt
 
 
@@ -546,23 +950,80 @@ def compute_vector_scores(prompt: str) -> Dict[str, float]:
     """
     clean = (prompt or "").strip().lower()
     if not clean:
-        return {"ui_density": 0.0, "logic_depth": 0.0, "context_need": 0.0, "speed_priority": 1.0}
+        return {
+            "ui_density": 0.0,
+            "logic_depth": 0.0,
+            "context_need": 0.0,
+            "speed_priority": 1.0,
+        }
 
-    # 1. Context Need (Zero-LLM kernel queries)
+    # 1. Context Need (Zero-LLM kernel queries & attribution queries)
     context_need = 0.0
-    if KernelCognitiveArbiter._FAST_KERNEL.search(clean) or IDENTITY_PATTERN.search(clean):
+    if (
+        KernelCognitiveArbiter._FAST_KERNEL.search(clean)
+        or IDENTITY_PATTERN.search(clean)
+        or ATTRIBUTION_PATTERN.search(clean)
+    ):
         context_need = 1.0
-    elif any(k in clean for k in ("who am i", "my profile", "system status", "kernel status", "tasks left", "clear screen", "clear memory")):
+    elif any(
+        k in clean
+        for k in (
+            "who am i",
+            "my profile",
+            "system status",
+            "kernel status",
+            "dataset stats",
+            "tasks left",
+            "clear screen",
+            "clear memory",
+        )
+    ):
         context_need = 1.0
 
-    # 2. UI Density (Full-stack HTML/JS apps, complete game engines, websites, dashboards, clones)
+    # 2. UI Density (Full-stack HTML/JS apps, complete game engines, websites, dashboards, clones, or iterative refinements)
     ui_density = 0.0
-    if KernelCognitiveArbiter._FAST_WEB.search(clean):
-        ui_density = 0.95
-    elif FRONTEND_PATTERN.search(clean):
-        if any(k in clean for k in ("clone", "claong", "single-file", "complete website", "dashboard", "ecommerce", "store", "player", "game", "canvas", "three.js", "netflix", "nelflix", "youtube", "spotify")):
+    is_refinement = bool(
+        session_ledger.get_last_artifact_turn()
+        and ITERATIVE_REFINEMENT_PATTERN.search(clean)
+    )
+    if _is_true_frontend_intent(clean) or is_refinement:
+        if is_refinement:
             ui_density = 0.90
-        elif any(k in clean for k in ("website", "webasite", "web page", "html", "app", "interface", "ui only", "working app")):
+        elif KernelCognitiveArbiter._FAST_WEB.search(clean):
+            ui_density = 0.95
+        elif any(
+            k in clean
+            for k in (
+                "clone",
+                "claong",
+                "single-file",
+                "complete website",
+                "dashboard",
+                "ecommerce",
+                "store",
+                "player",
+                "game",
+                "canvas",
+                "three.js",
+                "netflix",
+                "nelflix",
+                "youtube",
+                "spotify",
+            )
+        ):
+            ui_density = 0.90
+        elif any(
+            k in clean
+            for k in (
+                "website",
+                "webasite",
+                "web page",
+                "html",
+                "web app",
+                "ui only",
+                "working app",
+            )
+        ):
             ui_density = 0.80
         else:
             ui_density = 0.70
@@ -572,11 +1033,21 @@ def compute_vector_scores(prompt: str) -> Dict[str, float]:
     if KernelCognitiveArbiter._FAST_API.search(clean):
         logic_depth = 0.90
     elif CODING_PATTERN.search(clean):
-        if ui_density < 0.70:
-            logic_depth = 0.85
-        else:
-            logic_depth = 0.60
-    elif any(k in clean for k in ("binary search", "algorithm", "regex", "sql", "fastapi", "refactor", "debug", "benchmark", "sort")):
+        logic_depth = 0.85 if ui_density < 0.70 else 0.60
+    elif any(
+        k in clean
+        for k in (
+            "binary search",
+            "algorithm",
+            "regex",
+            "sql",
+            "fastapi",
+            "refactor",
+            "debug",
+            "benchmark",
+            "sort",
+        )
+    ):
         logic_depth = 0.80
 
     # 4. Speed Priority
@@ -597,12 +1068,14 @@ def compute_vector_scores(prompt: str) -> Dict[str, float]:
 # ── Kernel Cognitive Arbiter Class ───────────────────────────────────────────
 
 class KernelCognitiveArbiter:
-    # 1. Direct Kernel / System / Memory Patterns (< 5ms resolution)
+    # 1. Direct Kernel / System / Memory / Attribution Patterns (< 5ms resolution)
     KERNEL_PATTERNS = [
         r"^(who am i|my profile|system status|kernel status|dataset stats|tasks left)\??$",
         r"^(clear|reset|clean) (screen|memory|chat|context)$",
         r"^(open|launch) (terminal|code|browser|dashboard)$",
         r"^(what is|calc) \d+[\+\-\*\/]\d+",
+        r"^(?:which|what)\s+(?:ai\s+)?model\s+(?:did\s+you\s+use|made\s+(?:this|that|it)|built\s+(?:this|that|it)|generated\s+(?:this|that|it))",
+        r"\b(?:for\s+(?:the\s+)?[\w\s\-]+?\s*(?:clone|website|app|code)\s+which\s+model\s+did\s+you\s+use)\b",
     ]
 
     # 2. Brain 4 Web AI Patterns (Complex full-stack HTML/JS apps, complete game engines, massive code)
@@ -611,7 +1084,7 @@ class KernelCognitiveArbiter:
         r"(build|make|maek|create|write)\s+(?:me\s+)?(?:a|an)?\s*(?:(?:full|complete|interactive|tactical|working)\s+)*(?:clon(?:e|ing)|claong)?\s*(?:website|webasite|web\s*page|dashboard|clone|claong|app|store|e-?commer(?:ce|ice))",
         r"(build|make|maek|create|write)\s+(?:it|a\s+working\s+app|a\s+working\s+clone)",
         r"<!doctype html>",
-        r"tactical dashboard|starting xi|probability calculator",
+        r"tactical dashboard|starting xi|probability calculator|pitch board",
         r"(spotify|netflix|nelflix|youtube|amazon)\s+(?:clon(?:e|ing)|claong)",
         r"(?:clon(?:e|ing)|claong)\s+(?:website|webasite|app)?\s*(?:of|for)?\s*(spotify|netflix|nelflix|youtube|amazon)",
         r"\b(?:ui\s+only|working\s+app)\b",
@@ -625,15 +1098,19 @@ class KernelCognitiveArbiter:
         r"\b(why|how does|architecture of)\b",
     ]
 
-    # Pre-compiled individual patterns
     _COMPILED_KERNEL = [re.compile(p, re.IGNORECASE) for p in KERNEL_PATTERNS]
     _COMPILED_WEB = [re.compile(p, re.IGNORECASE) for p in WEB_AI_PATTERNS]
     _COMPILED_API = [re.compile(p, re.IGNORECASE) for p in API_FAST_PATTERNS]
 
-    # Pre-compiled combined patterns for sub-millisecond execution
-    _FAST_KERNEL = re.compile("|".join(f"(?:{p})" for p in KERNEL_PATTERNS), re.IGNORECASE)
-    _FAST_WEB = re.compile("|".join(f"(?:{p})" for p in WEB_AI_PATTERNS), re.IGNORECASE)
-    _FAST_API = re.compile("|".join(f"(?:{p})" for p in API_FAST_PATTERNS), re.IGNORECASE)
+    _FAST_KERNEL = re.compile(
+        "|".join(f"(?:{p})" for p in KERNEL_PATTERNS), re.IGNORECASE
+    )
+    _FAST_WEB = re.compile(
+        "|".join(f"(?:{p})" for p in WEB_AI_PATTERNS), re.IGNORECASE
+    )
+    _FAST_API = re.compile(
+        "|".join(f"(?:{p})" for p in API_FAST_PATTERNS), re.IGNORECASE
+    )
 
     compute_vector_scores = staticmethod(compute_vector_scores)
 
@@ -648,85 +1125,88 @@ class KernelCognitiveArbiter:
         """
         Deterministically arbitrates prompt intent in <5ms using multi-vector capability scoring
         and live provider health registry circuit breakers.
-
-        Returns:
-            Tuple[str, str]: (target_tier, notification_message)
-            Tiers: 'kernel', 'claude' (Brain 4 Web), 'chatgpt' (Brain 4 Web), 'gemini', 'groq', etc.
         """
         t0 = time.perf_counter()
 
-        # If user explicitly locked a pill in UI, respect override
-        if target_override and target_override.strip().lower() not in ["auto", "auto (arbiter)", ""]:
+        if target_override and target_override.strip().lower() not in [
+            "auto",
+            "auto (arbiter)",
+            "",
+        ]:
             tier = target_override
             rationale = f"[aivco-kernel] Manual override active: Routing to {target_override}."
         else:
-            clean = prompt.strip().lower()
+            clean = (prompt or "").strip().lower()
 
-            # Fast-path 1: Kernel-native (<0.003ms)
-            if cls._FAST_KERNEL.search(clean):
+            # Fast-path 1: Kernel-native or Model Attribution query (<0.005ms)
+            if cls._FAST_KERNEL.search(clean) or ATTRIBUTION_PATTERN.search(clean):
                 tier = "kernel"
                 rationale = ""
             else:
-                # Check explicit fuzzy provider directive only if directive triggers present
                 prov_directive = None
+                stripped_intent = prompt
                 if DIRECTIVE_TRIGGER_CHECK.search(prompt):
-                    prov_directive, _ = extract_fuzzy_provider_directive(prompt)
+                    prov_directive, stripped_intent = extract_fuzzy_provider_directive(
+                        prompt
+                    )
 
                 if prov_directive:
                     if prov_directive == "kernel":
                         tier = "kernel"
                         rationale = ""
+                    elif provider_health.is_available(
+                        prov_directive, extension_connected=extension_connected
+                    ):
+                        tier = prov_directive
+                        rationale = f"[aivco-kernel] Operator directive detected: Routing to {tier}..."
                     else:
-                        if provider_health.is_available(prov_directive, extension_connected=extension_connected):
-                            tier = prov_directive
-                            rationale = f"[aivco-kernel] Operator directive detected: Routing to {tier}..."
-                        else:
-                            scores = compute_vector_scores(prompt)
-                            if scores["ui_density"] >= 0.7:
-                                chain = ["claude", "chatgpt", "gemini", "groq"]
-                            else:
-                                chain = ["groq", "gemini"]
-                            tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
-                            rationale = f"[aivco-kernel] Operator directive '{prov_directive}' on cooldown/unavailable. Auto-routed to {tier}."
-                elif cls._FAST_WEB.search(clean):
+                        scores = compute_vector_scores(stripped_intent or prompt)
+                        chain = (
+                            ["claude", "chatgpt", "gemini", "groq"]
+                            if scores["ui_density"] >= 0.7
+                            else ["groq", "gemini"]
+                        )
+                        tier = provider_health.get_best_available_provider(
+                            chain, extension_connected=extension_connected
+                        )
+                        rationale = (
+                            f"[aivco-kernel] Operator directive '{prov_directive}' on cooldown/unavailable. "
+                            f"Auto-routed to {tier}."
+                        )
+                elif cls._FAST_WEB.search(clean) and _is_true_frontend_intent(clean):
                     chain = ["claude", "chatgpt", "gemini", "groq"]
-                    tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
-                    if tier == "claude":
-                        rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
-                    elif tier == "chatgpt":
-                        rationale = "[aivco-kernel] Heavy frontend query detected. Claude on cooldown/unavailable; routing to Brain 4 (ChatGPT Web Bridge)..."
-                    elif tier == "gemini":
-                        rationale = "[aivco-kernel] Heavy frontend query detected. Web bridge on cooldown/unavailable; routing to Tier 3 (Gemini Pro API)..."
-                    else:
-                        rationale = "[aivco-kernel] Heavy frontend query detected. Cascading to Tier 2 (Groq Fast API)..."
+                    tier = provider_health.get_best_available_provider(
+                        chain, extension_connected=extension_connected
+                    )
+                    rationale = cls._format_frontend_rationale(tier)
                 elif cls._FAST_API.search(clean):
                     chain = ["groq", "gemini", "claude"]
-                    tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                    tier = provider_health.get_best_available_provider(
+                        chain, extension_connected=extension_connected
+                    )
                     rationale = f"[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 ({tier.upper()})..."
                 else:
-                    # Multi-Vector Capability Matrix Scoring
                     scores = compute_vector_scores(prompt)
-                    if scores["context_need"] >= 0.8:
+                    if scores["context_need"] >= 0.8 and not DIRECTIVE_TRIGGER_CHECK.search(prompt):
                         tier = "kernel"
                         rationale = ""
                     elif scores["ui_density"] >= 0.7:
                         chain = ["claude", "chatgpt", "gemini", "groq"]
-                        tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
-                        if tier == "claude":
-                            rationale = "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
-                        elif tier == "chatgpt":
-                            rationale = "[aivco-kernel] Heavy frontend query detected. Claude on cooldown/unavailable; routing to Brain 4 (ChatGPT Web Bridge)..."
-                        elif tier == "gemini":
-                            rationale = "[aivco-kernel] Heavy frontend query detected. Web bridge on cooldown/unavailable; routing to Tier 3 (Gemini Pro API)..."
-                        else:
-                            rationale = "[aivco-kernel] Heavy frontend query detected. Cascading to Tier 2 (Groq Fast API)..."
+                        tier = provider_health.get_best_available_provider(
+                            chain, extension_connected=extension_connected
+                        )
+                        rationale = cls._format_frontend_rationale(tier)
                     elif scores["logic_depth"] >= 0.7:
                         chain = ["groq", "gemini", "claude"]
-                        tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                        tier = provider_health.get_best_available_provider(
+                            chain, extension_connected=extension_connected
+                        )
                         rationale = f"[aivco-kernel] Analytical/coding query detected. Routing to Tier 2 ({tier.upper()})..."
                     else:
                         chain = ["groq", "gemini"]
-                        tier = provider_health.get_best_available_provider(chain, extension_connected=extension_connected)
+                        tier = provider_health.get_best_available_provider(
+                            chain, extension_connected=extension_connected
+                        )
                         rationale = f"[aivco-kernel] General query detected. Routing to Tier 2 ({tier.upper()})..."
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
@@ -736,128 +1216,202 @@ class KernelCognitiveArbiter:
 
         return tier, rationale
 
+    @staticmethod
+    def _format_frontend_rationale(tier: str) -> str:
+        if tier == "claude":
+            return "[aivco-kernel] Heavy frontend/application query detected. Escalating to Brain 4 (Claude Web Bridge)..."
+        if tier == "chatgpt":
+            return "[aivco-kernel] Heavy frontend query detected. Claude on cooldown/unavailable; routing to Brain 4 (ChatGPT Web Bridge)..."
+        if tier == "gemini":
+            return "[aivco-kernel] Heavy frontend query detected. Web bridge on cooldown/unavailable; routing to Tier 3 (Gemini Pro API)..."
+        return "[aivco-kernel] Heavy frontend query detected. Cascading to Tier 2 (Groq Fast API)..."
+
     @classmethod
     def flush_telemetry(cls, timeout: float = 2.0) -> None:
-        """Flushes pending telemetry writes to disk."""
         flush_telemetry(timeout=timeout)
 
 
-# ── Pre-Delivery Code Quality Gate & TypeScript-in-HTML Sanitizer ────────────
+# ── Pre-Delivery Code Quality Gate & Brace-Balanced TypeScript Sanitizer ─────
+
+def _strip_balanced_ts_blocks(code: str, keyword: str) -> str:
+    """
+    Safely removes `interface Foo { ... }` or `type Foo = { ... };` blocks
+    with arbitrary nested `{ ... }` braces so inner braces never leave syntax errors.
+    """
+    pattern = re.compile(
+        rf"\b{keyword}\s+[A-Za-z0-9_$]+(?:\s*<[^>]*>)?(?:\s+extends\s+[^{{=]+)?\s*(?:=\s*)?\{{",
+        re.MULTILINE,
+    )
+    out: List[str] = []
+    idx = 0
+    n = len(code)
+    while idx < n:
+        m = pattern.search(code, idx)
+        if not m:
+            out.append(code[idx:])
+            break
+        out.append(code[idx : m.start()])
+        # Walk balanced braces starting at the opening '{'
+        brace_start = m.end() - 1
+        depth = 0
+        pos = brace_start
+        in_str: Optional[str] = None
+        escaped = False
+        while pos < n:
+            ch = code[pos]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif in_str:
+                if ch == in_str:
+                    in_str = None
+            elif ch in ("'", '"', "`"):
+                in_str = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    pos += 1
+                    break
+            pos += 1
+        # Consume optional trailing semicolon and whitespace
+        while pos < n and code[pos] in (" ", "\t", ";"):
+            pos += 1
+        idx = pos
+    return "".join(out)
+
+
+def _strip_param_types_in_list(raw_params: str) -> str:
+    """
+    Splits a parameter list at top-level commas (respecting nested parens/brackets/braces)
+    and strips top-level `: Type` annotations while preserving default values (`= val`).
+    """
+    if ":" not in raw_params:
+        return raw_params
+
+    parts: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    for ch in raw_params:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+
+    cleaned_parts: List[str] = []
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        # Find top-level ':' and '='
+        colon_idx = -1
+        eq_idx = -1
+        d = 0
+        for i, ch in enumerate(p):
+            if ch in "([{<":
+                d += 1
+            elif ch in ")]}>":
+                d = max(0, d - 1)
+            elif d == 0:
+                if ch == ":" and colon_idx == -1 and eq_idx == -1:
+                    colon_idx = i
+                elif ch == "=" and eq_idx == -1:
+                    eq_idx = i
+                    break
+        if colon_idx != -1:
+            name_part = p[:colon_idx].rstrip("?").strip()
+            if eq_idx != -1:
+                default_val = p[eq_idx + 1 :].strip()
+                cleaned_parts.append(f"{name_part} = {default_val}")
+            else:
+                cleaned_parts.append(name_part)
+        else:
+            cleaned_parts.append(p)
+
+    return ", ".join(cleaned_parts)
+
 
 def sanitize_script_content(js_code: str) -> str:
     """
     Sanitizes inline JavaScript by stripping accidental TypeScript syntax:
-    - type / interface declarations
-    - type assertions ('as HTMLElement', 'as any', etc.)
-    - non-null assertions ('!.addEventListener')
-    - parameter and variable type annotations
+    - nested interface / type declarations (brace-balanced)
+    - single-line type aliases (`type ID = string | number;`)
+    - type assertions (`as HTMLElement`, `as unknown as Foo`, `as any`)
+    - generic call arguments (`querySelector<HTMLElement>(...)`)
+    - non-null assertions (`el!.addEventListener`)
+    - variable, function parameter, and return type annotations
     """
     if not js_code or not isinstance(js_code, str):
         return js_code or ""
 
-    # 1. Strip interface declarations: interface Foo { ... }
+    # 1. Strip brace-balanced interface and object type declarations
+    js_code = _strip_balanced_ts_blocks(js_code, "interface")
+    js_code = _strip_balanced_ts_blocks(js_code, "type")
+
+    # 2. Strip single-line union/primitive type aliases: type Mode = 'dark' | 'light';
     js_code = re.sub(
-        r"interface\s+[A-Za-z0-9_$]+(?:\s+extends\s+[^{]+)?\s*\{[\s\S]*?\}",
+        r"^\s*(?:export\s+)?type\s+[A-Za-z0-9_$]+(?:\s*<[^>]*>)?\s*=\s*[^;\n]+;?[ \t]*$",
         "",
         js_code,
+        flags=re.MULTILINE,
     )
 
-    # 2. Strip type declarations: type Foo = ...;
+    # 3. Strip generic type arguments on DOM/function calls: document.querySelector<HTMLElement>('...')
     js_code = re.sub(
-        r"type\s+[A-Za-z0-9_$]+\s*=\s*\{[\s\S]*?\};?",
-        "",
-        js_code,
-    )
-    js_code = re.sub(
-        r"type\s+[A-Za-z0-9_$]+\s*=\s*[^;\n]+;",
-        "",
+        r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*<\s*[A-Za-z_$][A-Za-z0-9_$<>\[\],\s|&]*>\s*\(",
+        r"\1(",
         js_code,
     )
 
-    # 3. Strip type assertions: " as HTMLElement", " as HTMLInputElement", " as HTMLButtonElement", " as any", etc.
-    js_code = re.sub(
-        r"\s+as\s+[A-Za-z0-9_$]+(?:<[^>]+>)?(?:\[\])?",
-        "",
-        js_code,
-    )
+    # 4. Strip type assertions (handles chained `as unknown as HTMLElement`)
+    for _ in range(2):
+        js_code = re.sub(
+            r"\s+as\s+(?:const|[A-Za-z_$][A-Za-z0-9_$.]*(?:<[^>]+>)?(?:\[\])*)",
+            "",
+            js_code,
+        )
 
-    # 4. Strip non-null assertions: "element!.addEventListener", "container!.innerHTML", "el!;"
-    js_code = re.sub(
-        r"([a-zA-Z0-9_$\]\)])!([.\[(])",
-        r"\1\2",
-        js_code,
-    )
-    js_code = re.sub(
-        r"([a-zA-Z0-9_$\]\)])!\s*;",
-        r"\1;",
-        js_code,
-    )
+    # 5. Strip non-null assertions: `element!.addEventListener`, `container!.innerHTML`, `el!;`
+    js_code = re.sub(r"([a-zA-Z0-9_$\]\)])!([.\[(])", r"\1\2", js_code)
+    js_code = re.sub(r"([a-zA-Z0-9_$\]\)])!\s*(?=[;,)\]\n])", r"\1", js_code)
 
-    # 5. Strip return type annotations on functions: function foo(...): Type {
+    # 6. Strip variable type annotations on a single line: const x: number = ..., let data: Item[] = ...
     js_code = re.sub(
-        r"\)\s*:\s*[A-Za-z0-9_$<>[\]|&?\s]+\s*\{",
-        ") {",
-        js_code,
-    )
-
-    # 6. Strip variable type annotations: const x: number = ..., let y: Item[] = ...
-    js_code = re.sub(
-        r"\b(const|let|var)\s+([a-zA-Z0-9_$]+)\s*:\s*[A-Za-z0-9_$<>[\]|&?\s]+(?=\s*=)",
+        r"\b(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*[A-Za-z_$][A-Za-z0-9_$<>[\]|&,\s]*?(?=\s*=)",
         r"\1 \2",
         js_code,
     )
 
-    # 7. Function parameters type annotations: function foo(param: Type, ...)
-    def _clean_params(m):
-        fn_name = m.group(1)
-        raw_params = m.group(2)
-        cleaned = []
-        for p in raw_params.split(","):
-            p_strip = p.strip()
-            if not p_strip:
-                continue
-            if ":" in p_strip:
-                p_name, rest = p_strip.split(":", 1)
-                p_name = p_name.strip()
-                if "=" in rest:
-                    val = rest.split("=", 1)[1].strip()
-                    cleaned.append(f"{p_name} = {val}")
-                else:
-                    cleaned.append(p_name)
-            else:
-                cleaned.append(p_strip)
-        return f"function {fn_name}({', '.join(cleaned)})"
+    # 7. Strip function parameter types and return types: function foo(a: number, b: string = 'x'): void {
+    def _clean_fn_decl(m: re.Match) -> str:
+        fn_name = m.group(1) or ""
+        params = _strip_param_types_in_list(m.group(2) or "")
+        space = f" {fn_name}" if fn_name else ""
+        return f"function{space}({params}) {{"
 
     js_code = re.sub(
-        r"function\s*([a-zA-Z0-9_$]*)\s*\(([^)]*)\)",
-        _clean_params,
+        r"\bfunction\s*([A-Za-z_$][A-Za-z0-9_$]*)?\s*\(([^()]*)\)\s*(?::\s*[A-Za-z_$][A-Za-z0-9_$<>[\]|&?\s]*)?\s*\{",
+        _clean_fn_decl,
         js_code,
     )
 
-    # 8. Arrow function return types and parameters: (a: number, b: number): number =>
-    js_code = re.sub(
-        r"\(([^)]*)\)\s*:\s*[A-Za-z0-9_$<>[\]|&?\s]+\s*=>",
-        r"(\1) =>",
-        js_code,
-    )
-
-    def _clean_arrow_params(m):
-        raw_params = m.group(1)
-        cleaned = []
-        for p in raw_params.split(","):
-            p_strip = p.strip()
-            if not p_strip:
-                continue
-            if ":" in p_strip:
-                p_name = p_strip.split(":", 1)[0].strip()
-                cleaned.append(p_name)
-            else:
-                cleaned.append(p_strip)
-        return f"({', '.join(cleaned)}) =>"
+    # 8. Strip arrow function parameter types and return types: (a: number, b: string): number =>
+    def _clean_arrow_decl(m: re.Match) -> str:
+        params = _strip_param_types_in_list(m.group(1) or "")
+        return f"({params}) =>"
 
     js_code = re.sub(
-        r"\(([^)]+:[^)]+)\)\s*=>",
-        _clean_arrow_params,
+        r"\(([^()\n]*:[^()\n]*)\)\s*(?::\s*[A-Za-z_$][A-Za-z0-9_$<>[\]|&?\s]*)?\s*=>",
+        _clean_arrow_decl,
         js_code,
     )
 
@@ -866,16 +1420,23 @@ def sanitize_script_content(js_code: str) -> str:
 
 def sanitize_and_validate_code_output(markdown_text: str) -> str:
     """
-    Quality gate that cleans TypeScript syntax out of plain <script> blocks
-    and ensures balanced HTML structure and markdown code fences.
+    Pre-delivery quality gate that strips accidental TypeScript syntax out of plain <script> blocks
+    (while leaving JSON/importmap/babel scripts untouched) and balances HTML & markdown fences.
     """
     if not markdown_text or not isinstance(markdown_text, str):
         return markdown_text or ""
 
-    def _clean_script_tag(match):
+    def _clean_script_tag(match: re.Match) -> str:
         open_tag = match.group(1)
         body = match.group(2)
         close_tag = match.group(3)
+        open_lower = open_tag.lower()
+        # Do not touch non-JS script blocks (e.g., application/json, importmap, ld+json, text/babel)
+        if "type=" in open_lower and not any(
+            js_t in open_lower
+            for js_t in ("text/javascript", "application/javascript", "module")
+        ):
+            return match.group(0)
         return f"{open_tag}\n{sanitize_script_content(body)}\n{close_tag}"
 
     sanitized = re.sub(
@@ -885,18 +1446,18 @@ def sanitize_and_validate_code_output(markdown_text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Ensure unclosed ```html block or missing </html> is closed
     if "```html" in sanitized.lower():
         lower_san = sanitized.lower()
         if "<html" in lower_san and "</html>" not in lower_san:
             last_fence = sanitized.rfind("```")
-            if last_fence > sanitized.lower().find("```html"):
-                sanitized = sanitized[:last_fence] + "\n</html>\n" + sanitized[last_fence:]
+            if last_fence > lower_san.find("```html"):
+                sanitized = (
+                    sanitized[:last_fence] + "\n</html>\n" + sanitized[last_fence:]
+                )
             else:
                 sanitized += "\n</html>\n```"
         else:
-            fence_count = sanitized.count("```")
-            if fence_count % 2 != 0:
+            if sanitized.count("```") % 2 != 0:
                 sanitized += "\n```"
 
     return sanitized
