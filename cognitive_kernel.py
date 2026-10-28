@@ -41,6 +41,8 @@ from kernel.arbiter import (
     provider_health,
     sanitize_and_validate_code_output,
     ATTRIBUTION_PATTERN,
+    IDENTITY_PATTERN,
+    META_CONVERSATION_EXCLUDE,
     session_ledger,
 )
 
@@ -116,11 +118,19 @@ class KernelEvaluation:
 # --- Natural language patterns for memory-backed answers ---
 
 _WHO_AM_I = re.compile(
-    r"\b(who\s+am\s+i|my\s+(name|identity)|what\s+is\s+my\s+name|"
-    r"tell\s+me\s+about\s+myself|introduce\s+yourself\s+to\s+me|"
-    r"about\s+me|my\s+profile)\b",
+    r"^(?:who\s+am\s+i|who\s+the\s+hell\s+am\s+i|tell\s+(?:me\s+)?a?bout\s+me|(?:what\s+do\s+you\s+)?know\s+(?:me\s+|a?bout\s+me)|what\s+do\s+you\s+know\s+about\s+me|my\s+profile|full\s+profile)[?.!]*$",
     re.IGNORECASE,
 )
+
+STANDALONE_RULE_PREFIX = re.compile(
+    r"^(?:remember\s+that|new\s+rule\s*:|from\s+now\s+on\s+always|always\s+respond|never\s+use\b)",
+    re.IGNORECASE,
+)
+
+TASK_CODING_ANALYSIS_VERBS = frozenset({
+    "review", "roast", "analyze", "compare", "write", "build", "make",
+    "create", "explain", "summarize", "debug", "refactor", "use", "ask", "tell",
+})
 
 _TECH_STACK = re.compile(
     r"\b(my\s+tech\s+(stack|skills?|tools?)|what\s+(do\s+i|can\s+i)\s+(use|know|code|program)|"
@@ -196,7 +206,21 @@ def _intercept_operator_directives(prompt: str, memory: "MultiLayerMemory") -> O
     Mutates MultiLayerMemory immediately and returns a confirmation string.
     Returns None if not a directive.
     """
-    lower = prompt.lower()
+    clean = (prompt or "").strip()
+    words = clean.lower().split()
+    if not words:
+        return None
+
+    # Strict Standalone Rule Gate:
+    # A prompt may ONLY be intercepted as a standalone rule-setting command if ALL of the following hold:
+    # - Word count is <= 15 words (and < 100 characters).
+    # - Does NOT contain or start with task/coding/analysis verbs (review, roast, analyze, etc.)
+    if len(words) > 15 or len(clean) >= 100:
+        return None
+    if words[0] in TASK_CODING_ANALYSIS_VERBS or any(v in words[:3] for v in TASK_CODING_ANALYSIS_VERBS):
+        return None
+
+    lower = clean.lower()
     directives_found: list[str] = []
 
     # 1. Address / Name Override
@@ -470,7 +494,7 @@ def process_kernel_command(prompt: str, memory: Optional["MultiLayerMemory"] = N
     Handles model attribution queries and session reset instructions deterministically.
     """
     clean = (prompt or "").strip()
-    if not clean:
+    if not clean or META_CONVERSATION_EXCLUDE.search(clean):
         return None
 
     # 1. Model Attribution queries
@@ -500,6 +524,18 @@ def evaluate_query(user_prompt: str, memory: "MultiLayerMemory") -> dict:
     """
     prompt = user_prompt.strip()
     lower = prompt.lower()
+
+    # ---- Meta-conversation guard (summarize, what chatgpt was trying to say, etc.) ----
+    if META_CONVERSATION_EXCLUDE.search(prompt):
+        task_type, recommended_tier = _arbiter_select_tier(prompt)
+        return KernelEvaluation(
+            can_answer_locally=False,
+            confidence=0.0,
+            local_response=None,
+            recommended_tier=recommended_tier,
+            reason=f"Conversational meta-query detected. Routing to LLM with history ({recommended_tier}).",
+            task_type=task_type,
+        ).__dict__
 
     # ---- Stage 0: Intercept Model Attribution & Kernel Session Commands (<1ms, 0 tokens) ----
     cmd_resp = process_kernel_command(prompt, memory)
@@ -650,14 +686,23 @@ def evaluate_query(user_prompt: str, memory: "MultiLayerMemory") -> dict:
             ).__dict__
 
     # ---- Stage 1: Learned facts cache ----
+    clean_p = prompt.strip()
+    words_p = clean_p.lower().split()
+    is_task_prompt = (
+        len(words_p) > 15
+        or len(clean_p) >= 100
+        or (bool(words_p) and words_p[0] in TASK_CODING_ANALYSIS_VERBS)
+        or any(v in words_p[:3] for v in TASK_CODING_ANALYSIS_VERBS)
+    )
+
     learned = getattr(memory, "learned_facts", None)
-    if learned:
+    if learned and not is_task_prompt:
         prompt_words = set(re.findall(r"\b\w+\b", lower))
         best_score = 0
         best_fact = None
         for entry in learned:
             trigger_phrase = entry.get("trigger", "").strip().lower()
-            if trigger_phrase and (trigger_phrase in lower or lower in trigger_phrase):
+            if trigger_phrase and (trigger_phrase == lower or (len(trigger_phrase.split()) > 1 and trigger_phrase in lower)):
                 best_score = 100
                 best_fact = entry
                 break
@@ -665,10 +710,10 @@ def evaluate_query(user_prompt: str, memory: "MultiLayerMemory") -> dict:
             if not triggers:
                 continue
             overlap = len(triggers & prompt_words)
-            if overlap > 0 and overlap > best_score:
+            if overlap >= 2 and overlap > best_score:
                 best_score = overlap
                 best_fact = entry
-        if best_fact and (best_score >= 100 or best_score >= 2 or (len(best_fact.get("trigger_keywords", [])) == 1 and best_score >= 1)):
+        if best_fact and best_score >= 2:
             # Increment hit count
             best_fact["hit_count"] = best_fact.get("hit_count", 0) + 1
             try:
@@ -769,8 +814,16 @@ def learn_from_turn(
     if dir_res:
         extractions.append(dir_res)
 
+    words = prompt.lower().split()
+    is_task_prompt = (
+        len(words) > 15
+        or len(prompt) >= 100
+        or (bool(words) and words[0] in TASK_CODING_ANALYSIS_VERBS)
+        or any(v in words[:3] for v in TASK_CODING_ANALYSIS_VERBS)
+    )
+
     # ---- Preference / rule learning ----
-    if _PREF_REMEMBER.search(prompt):
+    if not is_task_prompt and _PREF_REMEMBER.search(prompt):
         # Store full statement as a preference fact
         _upsert_learned_fact(
             memory=memory,

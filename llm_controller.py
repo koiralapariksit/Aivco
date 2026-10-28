@@ -159,6 +159,7 @@ class LLMController:
         system_prompt: str,
         user_prompt: str,
         model: str = "openai/gpt-oss-120b",
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         api_key = os.environ.get("GROQ_API_KEY", "").strip()
         if not api_key:
@@ -170,12 +171,20 @@ class LLMController:
             "Content-Type": "application/json",
             "User-Agent": "AIVCO/2.0",
         }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            for turn in history:
+                r = turn.get("role", "user")
+                c = turn.get("content", "")
+                if c:
+                    messages.append({"role": r, "content": c})
+        messages.append({"role": "user", "content": user_prompt})
+
         body = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
         }
 
         try:
@@ -193,6 +202,7 @@ class LLMController:
         system_prompt: str,
         user_prompt: str,
         model: str = "gemini-flash-latest",
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key:
@@ -203,16 +213,26 @@ class LLMController:
             "Content-Type": "application/json",
             "User-Agent": "AIVCO/2.0",
         }
+        contents = []
+        if history:
+            for turn in history:
+                role = "user" if turn.get("role") == "user" else "model"
+                c = turn.get("content", "")
+                if c:
+                    contents.append({
+                        "role": role,
+                        "parts": [{"text": c}],
+                    })
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_prompt}],
+        })
+
         body = {
             "systemInstruction": {
                 "parts": [{"text": system_prompt}]
             },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": user_prompt}],
-                }
-            ],
+            "contents": contents,
         }
 
         try:
@@ -234,6 +254,7 @@ class LLMController:
         user_prompt: str,
         extra_headers: Optional[Dict[str, str]] = None,
         timeout: int = 40,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -246,6 +267,12 @@ class LLMController:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if history:
+            for turn in history:
+                r = turn.get("role", "user")
+                c = turn.get("content", "")
+                if c:
+                    messages.append({"role": r, "content": c})
         messages.append({"role": "user", "content": user_prompt})
 
         body = {"model": model, "messages": messages}
@@ -259,11 +286,16 @@ class LLMController:
         except Exception as exc:
             raise ModelGenerationError(f"OpenAI-compatible request to {endpoint_url} failed: {exc}") from exc
 
-    def _generate_claude(self, system_prompt: str, user_prompt: str) -> str:
-        res, _ = self._generate_claude_with_meta(system_prompt, user_prompt)
+    def _generate_claude(self, system_prompt: str, user_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        res, _ = self._generate_claude_with_meta(system_prompt, user_prompt, history=history)
         return res
 
-    def _generate_claude_with_meta(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    def _generate_claude_with_meta(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> tuple[str, str]:
         # 1. Anthropic Direct API
         ant_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
         if ant_key:
@@ -275,11 +307,20 @@ class LLMController:
                     "content-type": "application/json",
                     "User-Agent": "AIVCO/2.0",
                 }
+                messages = []
+                if history:
+                    for turn in history:
+                        r = turn.get("role", "user")
+                        c = turn.get("content", "")
+                        if c:
+                            messages.append({"role": r, "content": c})
+                messages.append({"role": "user", "content": user_prompt})
+
                 body = {
                     "model": "claude-3-7-sonnet-20250219",
                     "max_tokens": 1500,
                     "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_prompt}],
+                    "messages": messages,
                 }
                 req_data = json.dumps(body).encode("utf-8")
                 req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
@@ -302,6 +343,7 @@ class LLMController:
                     system_prompt,
                     user_prompt,
                     extra_headers={"HTTP-Referer": "https://aivco.org", "X-Title": "AIVCO"},
+                    history=history,
                 )
                 if res:
                     return res, "openrouter:claude-3.7-sonnet"
@@ -313,11 +355,16 @@ class LLMController:
         res = universal_web_agent.query("claude", user_prompt)
         return res, "web-account:claude"
 
-    def _generate_chatgpt(self, system_prompt: str, user_prompt: str) -> str:
-        res, _ = self._generate_chatgpt_with_meta(system_prompt, user_prompt)
+    def _generate_chatgpt(self, system_prompt: str, user_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        res, _ = self._generate_chatgpt_with_meta(system_prompt, user_prompt, history=history)
         return res
 
-    def _generate_chatgpt_with_meta(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    def _generate_chatgpt_with_meta(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> tuple[str, str]:
         openai_key = os.environ.get("OPENAI_API_KEY")
         if openai_key:
             try:
@@ -327,6 +374,7 @@ class LLMController:
                     "gpt-4o",
                     system_prompt,
                     user_prompt,
+                    history=history,
                 )
                 if res:
                     return res, "gpt-4o"
@@ -343,6 +391,7 @@ class LLMController:
                     system_prompt,
                     user_prompt,
                     extra_headers={"HTTP-Referer": "https://aivco.org", "X-Title": "AIVCO"},
+                    history=history,
                 )
                 if res:
                     return res, "openrouter:gpt-4o"
@@ -354,11 +403,16 @@ class LLMController:
         res = universal_web_agent.query("chatgpt", user_prompt)
         return res, "web-account:chatgpt"
 
-    def _generate_grok(self, system_prompt: str, user_prompt: str) -> str:
-        res, _ = self._generate_grok_with_meta(system_prompt, user_prompt)
+    def _generate_grok(self, system_prompt: str, user_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        res, _ = self._generate_grok_with_meta(system_prompt, user_prompt, history=history)
         return res
 
-    def _generate_grok_with_meta(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    def _generate_grok_with_meta(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> tuple[str, str]:
         xai_key = os.environ.get("XAI_API_KEY")
         if xai_key:
             try:
@@ -368,6 +422,7 @@ class LLMController:
                     "grok-3",
                     system_prompt,
                     user_prompt,
+                    history=history,
                 )
                 if res:
                     return res, "grok-3"
@@ -384,6 +439,7 @@ class LLMController:
                     system_prompt,
                     user_prompt,
                     extra_headers={"HTTP-Referer": "https://aivco.org", "X-Title": "AIVCO"},
+                    history=history,
                 )
                 if res:
                     return res, "openrouter:grok-3"
@@ -401,6 +457,7 @@ class LLMController:
         user_prompt: str = "",
         task_type: str = "general",
         force_provider: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
         **kwargs,
     ) -> dict:
         """
@@ -414,6 +471,14 @@ class LLMController:
 
         # Rule 1: Forced Provider Selection
         effective_force = force_provider or (task_type if task_type in ("claude", "chatgpt", "grok", "gemini_web", "claude_web", "chatgpt_web", "grok_web", "gemini", "groq", "local_llama", "local") else None)
+
+        def _invoke(fn, prov_name):
+            if history is not None and prov_name in ("groq", "gemini", "claude", "chatgpt", "grok"):
+                try:
+                    return fn(system_prompt, user_prompt, history=history)
+                except TypeError:
+                    return fn(system_prompt, user_prompt)
+            return fn(system_prompt, user_prompt)
 
         WEB_PROVIDERS = ("claude", "chatgpt", "grok", "gemini_web", "gemini-web", "claude_web", "chatgpt_web", "grok_web")
         if effective_force in WEB_PROVIDERS:
@@ -431,14 +496,14 @@ class LLMController:
             except Exception:
                 # Brain 4 Web failed / timed out / rate-limited: auto-cascade to Groq API -> Gemini API
                 try:
-                    response = self._generate_groq(system_prompt, user_prompt)
+                    response = _invoke(self._generate_groq, "groq")
                     return {
                         "response": response,
                         "provider_used": f"groq (fallback from {target})",
                         "fallback_triggered": True,
                     }
                 except AIVCOModelError:
-                    response = self._generate_gemini(system_prompt, user_prompt)
+                    response = _invoke(self._generate_gemini, "gemini")
                     return {
                         "response": response,
                         "provider_used": f"gemini (fallback from {target})",
@@ -456,7 +521,7 @@ class LLMController:
             except AIVCOModelError as local_err:
                 # Privacy block eliminated: operator requires cloud fallback (Groq -> Gemini) to execute
                 try:
-                    response = self._generate_groq(system_prompt, user_prompt)
+                    response = _invoke(self._generate_groq, "groq")
                     return {
                         "response": response,
                         "provider_used": "groq (fallback from local)",
@@ -464,7 +529,7 @@ class LLMController:
                     }
                 except AIVCOModelError as groq_err:
                     try:
-                        response = self._generate_gemini(system_prompt, user_prompt)
+                        response = _invoke(self._generate_gemini, "gemini")
                         return {
                             "response": response,
                             "provider_used": "gemini (fallback from local)",
@@ -477,7 +542,7 @@ class LLMController:
 
         if effective_force == "gemini":
             try:
-                response = self._generate_gemini(system_prompt, user_prompt)
+                response = _invoke(self._generate_gemini, "gemini")
                 return {
                     "response": response,
                     "provider_used": "gemini",
@@ -486,7 +551,7 @@ class LLMController:
             except AIVCOModelError:
                 # Fallback to Groq if Gemini fails
                 try:
-                    response = self._generate_groq(system_prompt, user_prompt)
+                    response = _invoke(self._generate_groq, "groq")
                     return {
                         "response": response,
                         "provider_used": "groq (fallback from gemini)",
@@ -502,7 +567,7 @@ class LLMController:
 
         if effective_force == "groq":
             try:
-                response = self._generate_groq(system_prompt, user_prompt)
+                response = _invoke(self._generate_groq, "groq")
                 return {
                     "response": response,
                     "provider_used": "groq",
@@ -511,7 +576,7 @@ class LLMController:
             except AIVCOModelError:
                 # Fallback to Gemini if Groq fails
                 try:
-                    response = self._generate_gemini(system_prompt, user_prompt)
+                    response = _invoke(self._generate_gemini, "gemini")
                     return {
                         "response": response,
                         "provider_used": "gemini (fallback from groq)",
@@ -543,7 +608,7 @@ class LLMController:
         errors = []
         for idx, (provider_name, provider_fn) in enumerate(chain):
             try:
-                response = provider_fn(system_prompt, user_prompt)
+                response = _invoke(provider_fn, provider_name)
                 return {
                     "response": response,
                     "provider_used": provider_name,

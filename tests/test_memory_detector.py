@@ -138,3 +138,38 @@ def test_conservative_negative_sentences():
     ]
     for text in negatives:
         assert d.detect(text) == []
+
+
+def test_adversarial_review_and_roast_not_swallowed_by_learned_rule(tmp_path):
+    from cognitive_kernel import evaluate_query, learn_from_turn
+    from memory.multi_layer_memory import MultiLayerMemory
+
+    mem_file = tmp_path / "test_adversarial_mem.json"
+    memory = MultiLayerMemory(storage_path=str(mem_file))
+    # Populate a learned rule that previously caused false positives
+    memory.learned_facts = [
+        {
+            "trigger": "python",
+            "trigger_keywords": ["python", "script", "code"],
+            "fact": "always use type hints",
+            "fact_type": "taught_rule",
+            "hit_count": 0,
+        }
+    ]
+
+    p1 = "Review this asynchronous Python script for race conditions... ensure zero memory leakage..."
+    p2 = "Roast this tech stack and architecture plan..."
+
+    # 1. Verify evaluate_query does not swallow task prompts as learned rules
+    res1 = evaluate_query(p1, memory)
+    assert res1["can_answer_locally"] is False, f"Swallowed prompt 1 as local: {res1}"
+    assert res1.get("local_response") is None or "[Learned Rule]" not in res1.get("local_response", "")
+
+    res2 = evaluate_query(p2, memory)
+    assert res2["can_answer_locally"] is False, f"Swallowed prompt 2 as local: {res2}"
+    assert res2.get("local_response") is None or "[Learned Rule]" not in res2.get("local_response", "")
+
+    # 2. Verify learn_from_turn does not extract false rules from task prompts
+    extractions = learn_from_turn(p1, "Here is the code review.", memory)
+    assert not any("type hints" in str(e).lower() for e in extractions)
+    assert not any("ensure zero memory leakage" in str(e).lower() for e in extractions)

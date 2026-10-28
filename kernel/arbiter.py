@@ -120,14 +120,17 @@ def log_arbiter_telemetry(
 # ── Patterns & Provider Alias Dictionaries ────────────────────────────────────
 
 IDENTITY_PATTERN = re.compile(
-    r"\b(about\s+me|who\s+am\s+i|know\s+(?:a?bout|abt)\s+me|my\s+profile|tell\s+(?:me\s+)?about\s+me|who\s+i\s+am)\b",
+    r"^(?:who\s+am\s+i|who\s+the\s+hell\s+am\s+i|tell\s+(?:me\s+)?a?bout\s+me|(?:what\s+do\s+you\s+)?know\s+(?:me\s+|a?bout\s+me)|what\s+do\s+you\s+know\s+about\s+me|my\s+profile|full\s+profile)[?.!]*$",
+    re.IGNORECASE,
+)
+
+META_CONVERSATION_EXCLUDE = re.compile(
+    r"\b(trying\s+to\s+say|summarize|in\s+short|above\s+chat|previous|what\s+did|chatgpt|chatpgt|claude|gpt|gemini|grok)\b",
     re.IGNORECASE,
 )
 
 ATTRIBUTION_PATTERN = re.compile(
-    r"^(?:which|what)\s+(?:ai\s+)?model\s+(?:did\s+you\s+use|made\s+(?:this|that|it)|built\s+(?:this|that|it)|generated\s+(?:this|that|it)|was\s+used)"
-    r"|\b(?:for\s+(?:the\s+)?[\w\s\-]+?\s*(?:clone|website|webasite|app|code|store|dashboard)?\s*which\s+(?:ai\s+)?model\s+(?:did\s+you\s+use|was\s+used))\b"
-    r"|^who\s+(?:built|made|generated)\s+(?:this|that|it)\??$",
+    r"^(?:which|what)\s+(?:ai\s+)?model\s+(?:did\s+you\s+use|made|built|generated|was\s+used)|for\s+.*?\s+which\s+model\s+did\s+you\s+use|^who\s+(?:built|made|generated)\s+(?:this|that|it)\??$",
     re.IGNORECASE,
 )
 
@@ -360,6 +363,46 @@ class SessionExecutionLedger:
                     clean_resp = clean_resp[:max_chars_per_turn].rsplit(" ", 1)[0] + "..."
                 blocks.append(f"User: {t.prompt}\nAssistant: {clean_resp}")
             return "\n\n".join(blocks)
+
+    def get_chat_history_messages(self, max_turns: int = 6, max_chars: int = 3500) -> List[Dict[str, str]]:
+        """
+        Returns a list of {"role": "user", "content": ...} and {"role": "assistant", "content": ...}
+        dictionaries for the last max_turns turns.
+        Replaces massive raw HTML blocks in history with "[Generated Single-File HTML Application]"
+        so token budgets stay lean while preserving full conversational text.
+        """
+        messages: List[Dict[str, str]] = []
+        with self._lock:
+            turns = [t for t in self._turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-max_turns:]
+            total_chars = 0
+            for t in turns:
+                u_text = t.prompt.strip()
+                resp = (t.response or "").strip()
+                if "<!doctype html" in resp.lower():
+                    resp = re.sub(
+                        r"```html[\s\S]*?```",
+                        "[Generated Single-File HTML Application]",
+                        resp,
+                        flags=re.IGNORECASE,
+                    )
+                    resp = re.sub(
+                        r"<!DOCTYPE html[\s\S]*?</html>",
+                        "[Generated Single-File HTML Application]",
+                        resp,
+                        flags=re.IGNORECASE,
+                    )
+                if len(resp) > 800:
+                    resp = resp[:800].rsplit(" ", 1)[0] + "..."
+
+                total_chars += len(u_text) + len(resp)
+                if total_chars > max_chars and messages:
+                    break
+
+                messages.append({"role": "user", "content": u_text})
+                if resp:
+                    messages.append({"role": "assistant", "content": resp})
+
+        return messages
 
     def get_last_artifact_turn(self) -> Optional[SessionTurnRecord]:
         with self._lock:
@@ -775,7 +818,7 @@ def synthesize_elite_prompt(
         return clean_intent
 
     # 1. Identity / Personal queries
-    if IDENTITY_PATTERN.search(clean_intent):
+    if IDENTITY_PATTERN.search(clean_intent) and not META_CONVERSATION_EXCLUDE.search(clean_intent):
         return (
             "Analyze the provided Operator Context in the Executive Brief and provide a comprehensive, "
             "structured executive summary of who the operator (Parikshit Koirala / AIvco) is, including "
@@ -1139,7 +1182,7 @@ class KernelCognitiveArbiter:
             clean = (prompt or "").strip().lower()
 
             # Fast-path 1: Kernel-native or Model Attribution query (<0.005ms)
-            if cls._FAST_KERNEL.search(clean) or ATTRIBUTION_PATTERN.search(clean):
+            if (cls._FAST_KERNEL.search(clean) or ATTRIBUTION_PATTERN.search(clean)) and not META_CONVERSATION_EXCLUDE.search(clean):
                 tier = "kernel"
                 rationale = ""
             else:

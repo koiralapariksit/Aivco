@@ -37,6 +37,7 @@ from cognitive_kernel import (
     provider_health,
     sanitize_and_validate_code_output,
     ATTRIBUTION_PATTERN,
+    META_CONVERSATION_EXCLUDE,
     session_ledger,
 )
 from browser_agent import browser_agent, search_web, universal_web_agent
@@ -433,6 +434,7 @@ async def execute_web_failover(
             user_prompt=elite_prompt,
             task_type="general",
             force_provider="groq",
+            history=session_ledger.get_chat_history_messages(),
         )
         resp_text = gen_res.get("response", "")
         used_prov = gen_res.get("provider_used", "groq")
@@ -559,7 +561,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
         }
 
     # ── Stage 0-Arbiter: Auto-Mode Kernel Direct Execution (<10ms) ───────────
-    if (is_auto_mode and not active_model_override and target_tier == "kernel") or ATTRIBUTION_PATTERN.search(raw_prompt):
+    if not META_CONVERSATION_EXCLUDE.search(raw_prompt) and ((is_auto_mode and not active_model_override and target_tier == "kernel") or ATTRIBUTION_PATTERN.search(raw_prompt)):
         # Direct Model Attribution query (<1ms, 0 tokens)
         if ATTRIBUTION_PATTERN.search(raw_prompt):
             attr_ans = session_ledger.format_attribution_answer(raw_prompt)
@@ -803,6 +805,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
                 user_prompt=clean_search_q,
                 task_type="deep" if target_prov == "gemini" else "general",
                 force_provider=target_prov,
+                history=session_ledger.get_chat_history_messages(),
             )
             resp_text = gen_res.get("response", "")
             used_prov = gen_res.get("provider_used", target_prov)
@@ -991,6 +994,7 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
             user_prompt=clean_prompt,
             task_type=task_type,
             force_provider=force_provider,
+            history=session_ledger.get_chat_history_messages(),
         )
         latency_ms = round((time.time() - t0) * 1000)
         provider = gen_res.get("provider_used", "unknown")

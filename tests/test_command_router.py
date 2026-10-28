@@ -979,3 +979,73 @@ def test_backend_tkinter_not_misclassified_as_html():
 
 
 
+
+
+def test_followup_about_me_summary_not_hijacked_by_stage0(tmp_path):
+    from kernel.arbiter import KernelCognitiveArbiter, META_CONVERSATION_EXCLUDE
+    from cognitive_kernel import evaluate_query
+    from memory.multi_layer_memory import MultiLayerMemory
+
+    mem_file = tmp_path / "test_followup_mem.json"
+    memory = MultiLayerMemory(storage_path=str(mem_file))
+    memory.set_core_fact("preferred_address", "Sir")
+
+    prompt = "what was chatpgt trying to say about me summarize that in short"
+
+    # Must match meta conversation exclude
+    assert META_CONVERSATION_EXCLUDE.search(prompt) is not None
+
+    # Stage 0 evaluate_query must NOT answer locally with the static identity template
+    res = evaluate_query(prompt, memory)
+    assert res["can_answer_locally"] is False
+    assert res.get("local_response") is None
+    assert res["recommended_tier"] != "aivco-kernel"
+
+    # KernelCognitiveArbiter must NOT arbitrate to "kernel"
+    tier, _ = KernelCognitiveArbiter.arbitrate(prompt)
+    assert tier != "kernel"
+
+
+def test_multi_turn_chat_history_summarization():
+    from kernel.arbiter import session_ledger
+    from llm_controller import LLMController
+
+    session_ledger.clear()
+    session_ledger.record_turn(
+        prompt="3 2 1",
+        target_tier="kernel",
+        actual_provider="kernel",
+        response_markdown="Good morning, sir.",
+    )
+
+    history = session_ledger.get_chat_history_messages()
+    assert len(history) == 2
+    assert history[0] == {"role": "user", "content": "3 2 1"}
+    assert history[1] == {"role": "assistant", "content": "Good morning, sir."}
+
+    ctrl = LLMController()
+    captured_messages = []
+
+    def fake_openai(endpoint_url, api_key, model, system_prompt, user_prompt, extra_headers=None, timeout=40, history=None):
+        msgs = []
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        if history:
+            msgs.extend(history)
+        msgs.append({"role": "user", "content": user_prompt})
+        captured_messages.extend(msgs)
+        return "Chat summary: counted down and greeted."
+
+    ctrl._call_openai_compatible = fake_openai
+    ctrl._generate_groq = lambda sys_p, usr_p, model="x", history=None: fake_openai("", "", model, sys_p, usr_p, history=history)
+
+    res = ctrl.route_and_generate(
+        system_prompt="You are AIVCO.",
+        user_prompt="summarize all the above chat",
+        force_provider="groq",
+        history=history,
+    )
+    assert "Chat summary" in res["response"]
+    assert any(m.get("content") == "3 2 1" for m in captured_messages)
+    assert any(m.get("content") == "Good morning, sir." for m in captured_messages)
+    assert any(m.get("content") == "summarize all the above chat" for m in captured_messages)
