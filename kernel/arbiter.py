@@ -135,6 +135,11 @@ ATTRIBUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+PIN_SHORTCUT_PATTERN = re.compile(
+    r"^(?:remember\s+to\s+pin|pin)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+
 LIVE_SEARCH_PATTERN = re.compile(
     r"\b(today|yesterday|latest|recent|current|news|score|scores|match|matches|game|games|result|results|standing|standings|live|2025|2026|last\s+(?:match|game|night)|next\s+(?:match|game))\b",
     re.IGNORECASE,
@@ -240,6 +245,21 @@ WEB_PROVIDERS = frozenset(
 
 # ── Session Attribution & Artifact Ledger ────────────────────────────────────
 
+def sanitize_project_id(project_id: str) -> str:
+    """
+    Sanitizes project_id strictly to alphanumeric characters, dashes, and underscores.
+    Raises ValueError on directory traversal attempts or invalid/empty names.
+    """
+    if not isinstance(project_id, str):
+        raise ValueError("Invalid project_id: must be a string")
+    if ".." in project_id or "/" in project_id or "\\" in project_id:
+        raise ValueError(f"Invalid project_id: path traversal or separator detected in '{project_id}'")
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", project_id).lower().strip("-_")
+    if not sanitized:
+        raise ValueError(f"Invalid project_id: '{project_id}' contains no valid characters")
+    return sanitized
+
+
 def ensure_project_storage(
     project_id: str,
     instructions: Optional[str] = None,
@@ -252,9 +272,19 @@ def ensure_project_storage(
       data/projects/<project_id>/instructions.txt (if supplied)
       data/projects/<project_id>/chat_history.jsonl
       data/projects/<project_id>/last_app.html
+      data/projects/<project_id>/pinned.json
+      data/projects/<project_id>/recap.json
     """
-    safe_pid = re.sub(r"[^a-zA-Z0-9_\-]", "_", project_id).strip("_") or "default"
-    root = (base_dir or PROJECTS_DIR) / safe_pid
+    safe_pid = sanitize_project_id(project_id)
+    target_base = (base_dir or PROJECTS_DIR).resolve()
+    target_base.mkdir(parents=True, exist_ok=True)
+    root = (target_base / safe_pid).resolve()
+
+    try:
+        root.relative_to(target_base)
+    except ValueError:
+        raise ValueError(f"Path traversal detected: {project_id}")
+
     root.mkdir(parents=True, exist_ok=True)
     (root / "files").mkdir(exist_ok=True)
     if instructions is not None:
@@ -265,6 +295,12 @@ def ensure_project_storage(
     html_file = root / "last_app.html"
     if not html_file.exists():
         html_file.touch()
+    pinned_file = root / "pinned.json"
+    if not pinned_file.exists():
+        pinned_file.write_text("[]\n", encoding="utf-8")
+    recap_file = root / "recap.json"
+    if not recap_file.exists():
+        recap_file.write_text("[]\n", encoding="utf-8")
     return root
 
 
@@ -365,15 +401,23 @@ class SessionExecutionLedger:
         self._projects_dir: Path = projects_dir or PROJECTS_DIR
 
     def _sanitize_project_id(self, project_id: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9_\-]", "_", project_id).strip("_") or "default"
+        return sanitize_project_id(project_id)
 
     def get_project_dir(self, project_id: str) -> Path:
-        return self._projects_dir / self._sanitize_project_id(project_id)
+        safe_pid = sanitize_project_id(project_id)
+        target_base = self._projects_dir.resolve()
+        target_base.mkdir(parents=True, exist_ok=True)
+        proj_dir = (target_base / safe_pid).resolve()
+        try:
+            proj_dir.relative_to(target_base)
+        except ValueError:
+            raise ValueError(f"Path traversal detected: {project_id}")
+        return proj_dir
 
     def ensure_project_storage(self, project_id: str, instructions: Optional[str] = None) -> Path:
         return ensure_project_storage(project_id, instructions=instructions, base_dir=self._projects_dir)
 
-    def _is_project_mode(self, mode: str, project_id: Optional[str]) -> bool:
+    def _is_project_mode(self, mode: str = "casual", project_id: Optional[str] = None) -> bool:
         return (mode == "project" or bool(project_id)) and bool(project_id and project_id.strip())
 
     def _get_or_load_project_turns(self, project_id: str) -> Deque[SessionTurnRecord]:
@@ -401,6 +445,138 @@ class SessionExecutionLedger:
 
         self._project_ledgers[safe_pid] = d
         return d
+
+    def _load_all_project_turns(self, project_id: str) -> List[SessionTurnRecord]:
+        safe_pid = self._sanitize_project_id(project_id)
+        proj_dir = self.get_project_dir(safe_pid)
+        history_file = proj_dir / "chat_history.jsonl"
+        turns: List[SessionTurnRecord] = []
+        if history_file.exists():
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            turns.append(SessionTurnRecord.from_dict(json.loads(line)))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        return turns
+
+    def list_pins(self, project_id: str) -> List[str]:
+        try:
+            safe_pid = self._sanitize_project_id(project_id)
+            proj_dir = self.get_project_dir(safe_pid)
+        except ValueError:
+            return []
+        pinned_file = proj_dir / "pinned.json"
+        if not pinned_file.exists():
+            return []
+        try:
+            data = json.loads(pinned_file.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            return []
+        return []
+
+    def pin(self, project_id: str, text: str) -> bool:
+        if not text or not isinstance(text, str):
+            return False
+        clean_text = text.strip()
+        if not clean_text:
+            return False
+        clean_text = clean_text[:120].strip()
+
+        safe_pid = self._sanitize_project_id(project_id)
+        proj_dir = self.get_project_dir(safe_pid)
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        pinned_file = proj_dir / "pinned.json"
+
+        pins = self.list_pins(safe_pid)
+        if clean_text in pins:
+            return True
+        if len(pins) >= 10:
+            return False
+
+        pins.append(clean_text)
+        pinned_file.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+        return True
+
+    def unpin(self, project_id: str, index: int) -> bool:
+        if not isinstance(index, int):
+            return False
+        safe_pid = self._sanitize_project_id(project_id)
+        proj_dir = self.get_project_dir(safe_pid)
+        pinned_file = proj_dir / "pinned.json"
+
+        pins = self.list_pins(safe_pid)
+        if 0 <= index < len(pins):
+            pins.pop(index)
+            pinned_file.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+            return True
+        return False
+
+    def _compress_recap_lines(self, lines: List[str], max_chars: int = 800) -> List[str]:
+        if not lines:
+            return []
+
+        def fits(cand: List[str]) -> bool:
+            return len(json.dumps(cand)) <= max_chars and len("\n".join(cand)) <= max_chars
+
+        if fits(lines):
+            return lines
+
+        for n in range(2, len(lines) + 1):
+            milestone = f"[Early turns 1-{n}: initial setup, backend schemas, and UI scaffold]"
+            cand = [milestone] + lines[n:]
+            if fits(cand):
+                return cand
+
+        return [f"[Early turns 1-{len(lines)}: initial setup, backend schemas, and UI scaffold]"]
+
+    def _sync_project_recap(self, project_id: str) -> None:
+        safe_pid = self._sanitize_project_id(project_id)
+        proj_dir = self.get_project_dir(safe_pid)
+        recap_file = proj_dir / "recap.json"
+
+        turns = self._load_all_project_turns(safe_pid)
+        t_count = len(turns)
+        if t_count <= 6:
+            if not recap_file.exists():
+                recap_file.write_text("[]\n", encoding="utf-8")
+            return
+
+        evicted = turns[: t_count - 6]
+        raw_lines: List[str] = []
+        for t in evicted:
+            p_text = (t.prompt or "").strip()[:80].strip()
+            prov = t.actual_provider or "groq"
+            app_flag = " [app built]" if t.has_html_artifact else ""
+            raw_lines.append(f"{p_text} -> {prov}{app_flag}")
+
+        compressed = self._compress_recap_lines(raw_lines, max_chars=800)
+        recap_file.write_text(json.dumps(compressed, indent=2), encoding="utf-8")
+
+    def get_recap_entries(self, project_id: str) -> List[str]:
+        try:
+            safe_pid = self._sanitize_project_id(project_id)
+            proj_dir = self.get_project_dir(safe_pid)
+        except ValueError:
+            return []
+        recap_file = proj_dir / "recap.json"
+        if not recap_file.exists():
+            return []
+        try:
+            data = json.loads(recap_file.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            return []
+        return []
 
     def record_turn(
         self,
@@ -456,10 +632,24 @@ class SessionExecutionLedger:
                 with open(history_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec.to_dict()) + "\n")
 
-                # If an HTML artifact is present, write directly to last_app.html
+                # Natural language pin shortcut
+                m_pin = PIN_SHORTCUT_PATTERN.match(prompt.strip())
+                if m_pin:
+                    pin_text = m_pin.group(1).strip()
+                    try:
+                        self.pin(safe_pid, pin_text)
+                    except Exception:
+                        pass
+
+                # If an HTML artifact is present, write directly to last_app.html and update last_app_note.txt
                 if has_html and html_code:
                     artifact_file = proj_dir / "last_app.html"
                     artifact_file.write_text(html_code, encoding="utf-8")
+                    note_file = proj_dir / "last_app_note.txt"
+                    note_file.write_text(f"App updated on turn {rec.turn_id} by {provider}\n", encoding="utf-8")
+
+                # Sync deterministic rolling recap
+                self._sync_project_recap(safe_pid)
 
                 return rec
             else:
@@ -548,7 +738,30 @@ class SessionExecutionLedger:
         with self._lock:
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
-                turns_source = self._get_or_load_project_turns(project_id)
+                safe_pid = self._sanitize_project_id(project_id)
+                proj_dir = self.get_project_dir(safe_pid)
+
+                # 1. Read instructions (max 2000 chars)
+                instr_file = proj_dir / "instructions.txt"
+                instr_text = instr_file.read_text(encoding="utf-8").strip()[:2000] if instr_file.exists() else ""
+
+                # 2. Read pins (max 600 chars)
+                pins_list = self.list_pins(safe_pid)
+                pins_text = "\n".join(f"- {p}" for p in pins_list)[:600] if pins_list else "(None)"
+
+                # 3. Read recap (max 800 chars)
+                recap_list = self.get_recap_entries(safe_pid)
+                recap_text = "\n".join(f"- {r}" for r in recap_list)[:800] if recap_list else "(None)"
+
+                context_blocks = [
+                    f"[PROJECT CONTEXT & INSTRUCTIONS]\n{instr_text or '(None)'}",
+                    f"[PINNED DECISIONS]\n{pins_text}",
+                    f"[PROJECT RECAP]\n{recap_text}",
+                ]
+                context_msg = "\n\n".join(context_blocks)
+                messages.append({"role": "system", "content": context_msg})
+
+                turns_source = self._get_or_load_project_turns(safe_pid)
             else:
                 turns_source = self._turns
 
@@ -574,7 +787,7 @@ class SessionExecutionLedger:
                     resp = resp[:800].rsplit(" ", 1)[0] + "..."
 
                 total_chars += len(u_text) + len(resp)
-                if total_chars > max_chars and messages:
+                if total_chars > max_chars and len(messages) > (1 if self._is_project_mode(mode, project_id) else 0):
                     break
 
                 messages.append({"role": "user", "content": u_text})

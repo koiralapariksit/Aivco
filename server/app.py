@@ -50,7 +50,7 @@ from kernel.cognitive_kernel import (
     LIVE_SEARCH_PATTERN,
     session_ledger,
 )
-from kernel.arbiter import ensure_project_storage
+from kernel.arbiter import ensure_project_storage, sanitize_project_id, PIN_SHORTCUT_PATTERN
 from agents.browser_agent import browser_agent, search_web, universal_web_agent
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -135,6 +135,16 @@ class MemoryAddRequest(BaseModel):
 class ProjectCreateRequest(BaseModel):
     name: str
     instructions: Optional[str] = None
+
+
+class ProjectPinRequest(BaseModel):
+    project_id: str
+    text: str
+
+
+class ProjectUnpinRequest(BaseModel):
+    project_id: str
+    index: int
 
 
 class VaultLoginRequest(BaseModel):
@@ -574,6 +584,32 @@ def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
     # ── Explicit desktop browser command ─────────────────────────────────────
     if detected.get("is_desktop_browser_request"):
         return plan("browser", browser_target=detected.get("browser_target") or "google")
+
+    # ── Natural Language Pin Shortcut (Project Mode) ───────────────────────
+    m_pin = PIN_SHORTCUT_PATTERN.match(raw_prompt.strip())
+    if m_pin:
+        pin_text = m_pin.group(1).strip()
+        if mode == "project" and project_id:
+            try:
+                safe_pid = sanitize_project_id(project_id)
+                ok = session_ledger.pin(safe_pid, pin_text)
+                if ok:
+                    resp = f"[Pinned Decision Saved] \"{pin_text[:120].strip()}\" has been pinned to project '{safe_pid}'."
+                else:
+                    resp = f"[Pinned Decision Limit] Could not pin decision. Maximum 10 items reached for project '{safe_pid}'."
+            except Exception as e:
+                resp = f"[Pinned Decision Error] {e}"
+            return plan(
+                "command",
+                provider="aivco-kernel",
+                local_response=resp,
+            )
+        else:
+            return plan(
+                "command",
+                provider="aivco-kernel",
+                local_response="[Pinned Decision Notice] Pinned decisions are only available in Project Mode. Please select or create a project first.",
+            )
 
     # ── CommandController (slash commands etc.) ──────────────────────────────
     # NOTE: CommandController.handle() both decides and runs; its result is
@@ -1379,9 +1415,77 @@ def create_project(req: ProjectCreateRequest) -> Dict[str, Any]:
     if not pid:
         pid = f"proj-{int(time.time())}"
 
-    tiered_memory.register_project(project_id=pid, title=name)
-    session_ledger.ensure_project_storage(pid, instructions=req.instructions)
-    return {"ok": True, "project_id": pid, "title": name}
+    safe_pid = sanitize_project_id(pid)
+    tiered_memory.register_project(project_id=safe_pid, title=name)
+    session_ledger.ensure_project_storage(safe_pid, instructions=req.instructions)
+    return {"ok": True, "project_id": safe_pid, "title": name}
+
+
+@app.post("/api/projects/pin")
+def pin_project_decision(req: ProjectPinRequest) -> Dict[str, Any]:
+    try:
+        safe_pid = sanitize_project_id(req.project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Pin text cannot be empty.")
+
+    ok = session_ledger.pin(safe_pid, text)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Could not pin item: max 10 pins reached or invalid text.")
+
+    return {"ok": True, "project_id": safe_pid, "pinned": text[:120].strip(), "pins": session_ledger.list_pins(safe_pid)}
+
+
+@app.post("/api/projects/unpin")
+def unpin_project_decision(req: ProjectUnpinRequest) -> Dict[str, Any]:
+    try:
+        safe_pid = sanitize_project_id(req.project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    ok = session_ledger.unpin(safe_pid, req.index)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Invalid pin index {req.index}.")
+
+    return {"ok": True, "project_id": safe_pid, "pins": session_ledger.list_pins(safe_pid)}
+
+
+@app.get("/api/projects/{project_id}/pins")
+def get_project_pins(project_id: str) -> Dict[str, Any]:
+    try:
+        safe_pid = sanitize_project_id(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    pins = session_ledger.list_pins(safe_pid)
+    return {"project_id": safe_pid, "pins": pins}
+
+
+@app.get("/api/projects/{project_id}/context")
+def get_project_context(project_id: str) -> Dict[str, Any]:
+    try:
+        safe_pid = sanitize_project_id(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    proj_dir = session_ledger.get_project_dir(safe_pid)
+    instr_file = proj_dir / "instructions.txt"
+    instr = instr_file.read_text(encoding="utf-8").strip() if instr_file.exists() else ""
+    pins = session_ledger.list_pins(safe_pid)
+    recap = session_ledger.get_recap_entries(safe_pid)
+    html_file = proj_dir / "last_app.html"
+    has_artifact = html_file.exists() and bool(html_file.read_text(encoding="utf-8").strip())
+
+    return {
+        "project_id": safe_pid,
+        "instructions": instr,
+        "recap": recap,
+        "pins": pins,
+        "has_artifact": has_artifact,
+    }
 
 
 @app.post("/api/dataset/approve")
