@@ -50,6 +50,7 @@ from kernel.cognitive_kernel import (
     LIVE_SEARCH_PATTERN,
     session_ledger,
 )
+from kernel.arbiter import ensure_project_storage
 from agents.browser_agent import browser_agent, search_web, universal_web_agent
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -102,6 +103,8 @@ class ChatRequest(BaseModel):
     tier: Optional[int] = 2
     auto_route: Optional[bool] = True
     attachments: Optional[List[Dict[str, Any]]] = None
+    mode: str = "casual"
+    project_id: Optional[str] = None
 
 
 class DatasetApproveRequest(BaseModel):
@@ -131,6 +134,7 @@ class MemoryAddRequest(BaseModel):
 
 class ProjectCreateRequest(BaseModel):
     name: str
+    instructions: Optional[str] = None
 
 
 class VaultLoginRequest(BaseModel):
@@ -469,6 +473,8 @@ def finish_turn(
     system_content: str,
     health_ms: Optional[int] = None,
     health_provider: Optional[str] = None,
+    mode: str = "casual",
+    project_id: Optional[str] = None,
 ) -> None:
     """Single place for end-of-turn bookkeeping: health, learning, ledger, dataset."""
     if health_ms is not None:
@@ -480,6 +486,8 @@ def finish_turn(
         actual_provider=actual_provider,
         cascaded_from=cascaded_from,
         response_markdown=response,
+        mode=mode,
+        project_id=project_id,
     )
     dataset_logger.log(
         source=source,
@@ -529,6 +537,11 @@ def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
 
     detected = detect_explicit_model_and_intent(raw_prompt)
 
+    mode = (req.mode or "casual").strip().lower()
+    project_id = req.project_id.strip() if req.project_id else None
+    if mode != "project" and not project_id:
+        mode = "casual"
+
     base: Dict[str, Any] = {
         "action": None,
         "provider": None,
@@ -539,6 +552,8 @@ def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
         "clean_prompt": detected.get("clean_prompt") or raw_prompt,
         "handshake": handshake_msg,
         "initial_tier": target_tier,
+        "mode": mode,
+        "project_id": project_id,
     }
 
     def plan(action: str, **kw) -> Dict[str, Any]:
@@ -582,7 +597,9 @@ def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
             return plan(
                 "command",
                 provider="aivco-kernel",
-                local_response=session_ledger.format_attribution_answer(raw_prompt),
+                local_response=session_ledger.format_attribution_answer(
+                    raw_prompt, mode=mode, project_id=project_id
+                ),
             )
 
         # TODO: move this rule into cognitive_kernel later
@@ -763,7 +780,7 @@ async def _run_browser(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict
 async def _run_command(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
     """Procedural direct answers (commands, attribution, clear, math): no bookkeeping."""
     if plan.get("clear_session"):
-        session_ledger.clear()
+        session_ledger.clear(mode=plan.get("mode", "casual"), project_id=plan.get("project_id"))
     return _reply(plan, t0, plan["local_response"], plan["provider"], "Procedural", 0)
 
 
@@ -780,6 +797,8 @@ async def _run_local(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[s
         source="aivco_kernel",
         task_type="kernel",
         system_content=f"AIVCO Cognitive Kernel — Stage {plan['kernel_stage']} zero-LLM local resolution.",
+        mode=plan.get("mode", "casual"),
+        project_id=plan.get("project_id"),
     )
     return _reply(plan, t0, local_res, "aivco-kernel", "Semantic", 0, min_lat=plan.get("min_lat", 1))
 
@@ -790,6 +809,8 @@ async def execute_web_failover(
     raw_prompt: str,
     handshake_msg: str,
     t0: float,
+    mode: str = "casual",
+    project_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Cascades to Tier 2 Groq/Gemini when Brain 4 web provider fails or hits rate limit."""
     provider_health.record_failure(target_tier, reason="unavailable")
@@ -806,7 +827,7 @@ async def execute_web_failover(
         "Follow all operator directives strictly.\n\n"
         f"{EXECUTIVE_AUTONOMY_MANDATE}"
     )
-    elite_prompt = synthesize_elite_prompt(clean_prompt, "groq", tiered_context)
+    elite_prompt = synthesize_elite_prompt(clean_prompt, "groq", tiered_context, mode=mode, project_id=project_id)
     try:
         gen_res = await asyncio.to_thread(
             llm_controller.route_and_generate,
@@ -814,7 +835,7 @@ async def execute_web_failover(
             user_prompt=elite_prompt,
             task_type="general",
             force_provider="groq",
-            history=session_ledger.get_chat_history_messages(),
+            history=session_ledger.get_chat_history_messages(mode=mode, project_id=project_id),
         )
         resp_text = gen_res.get("response", "")
         used_prov = gen_res.get("provider_used", "groq")
@@ -836,6 +857,8 @@ async def execute_web_failover(
         source=f"failover_{target_tier}_to_{used_prov}",
         task_type="web_agent_failover",
         system_content=system_prompt[:500],
+        mode=mode,
+        project_id=project_id,
     )
     return {
         "response": final_res,
@@ -866,7 +889,10 @@ async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> 
         except Exception:
             pass
 
-    prompt_to_send = build_executive_envelope(prompt_to_send, provider, _assemble_context(cloud_safe=True))
+    prompt_to_send = build_executive_envelope(
+        prompt_to_send, provider, _assemble_context(cloud_safe=True),
+        mode=plan.get("mode", "casual"), project_id=plan.get("project_id"),
+    )
     web_res = await universal_web_agent.dispatch_prompt_async(
         provider,
         prompt_to_send,
@@ -879,7 +905,10 @@ async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> 
                 provider,
                 reason="rate_limit" if "rate" in (web_res or "").lower() else "timeout",
             )
-        return await execute_web_failover(provider, clean_prompt, raw_prompt, plan["handshake"], t0)
+        return await execute_web_failover(
+            provider, clean_prompt, raw_prompt, plan["handshake"], t0,
+            mode=plan.get("mode", "casual"), project_id=plan.get("project_id"),
+        )
 
     latency_ms = max(10, round((time.time() - t0) * 1000))
     web_res = sanitize_and_validate_code_output(web_res)
@@ -897,6 +926,8 @@ async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> 
             else f"AIVCO ExtensionBridgeRouter -> {provider} Chrome Extension execution."
         ),
         health_ms=None if escalated else latency_ms,
+        mode=plan.get("mode", "casual"),
+        project_id=plan.get("project_id"),
     )
     return {
         "response": web_res,
@@ -930,7 +961,9 @@ async def _run_web_search(plan: Dict[str, Any], raw_prompt: str, t0: float) -> D
             user_prompt=clean_search_q,
             task_type=plan["task_type"],
             force_provider=target_prov,
-            history=session_ledger.get_chat_history_messages(),
+            history=session_ledger.get_chat_history_messages(
+                mode=plan.get("mode", "casual"), project_id=plan.get("project_id")
+            ),
         )
         resp_text = gen_res.get("response", "")
         used_prov = gen_res.get("provider_used", target_prov)
@@ -956,6 +989,8 @@ async def _run_web_search(plan: Dict[str, Any], raw_prompt: str, t0: float) -> D
         task_type="web_search",
         system_content=system_prompt[:500],
         health_ms=health_ms,
+        mode=plan.get("mode", "casual"),
+        project_id=plan.get("project_id"),
     )
     prov_label = used_prov
     if "gemini" in used_prov and not used_prov.startswith("tier"):
@@ -969,7 +1004,10 @@ async def _run_web_search(plan: Dict[str, Any], raw_prompt: str, t0: float) -> D
 async def _run_web_fallback(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str, Any]:
     fallback_target = plan["provider"]
     clean_prompt = plan["clean_prompt"]
-    enveloped = build_executive_envelope(clean_prompt, fallback_target, _assemble_context(cloud_safe=True))
+    enveloped = build_executive_envelope(
+        clean_prompt, fallback_target, _assemble_context(cloud_safe=True),
+        mode=plan.get("mode", "casual"), project_id=plan.get("project_id"),
+    )
     web_res = await asyncio.to_thread(universal_web_agent.query, fallback_target, enveloped)
     finish_turn(
         raw_prompt=raw_prompt,
@@ -981,6 +1019,8 @@ async def _run_web_fallback(plan: Dict[str, Any], raw_prompt: str, t0: float) ->
         source=f"web_agent_{fallback_target}",
         task_type="web_agent_fallback",
         system_content=f"AIVCO UniversalWebAgent -> {fallback_target} web fallback.",
+        mode=plan.get("mode", "casual"),
+        project_id=plan.get("project_id"),
     )
     return _reply(plan, t0, web_res, f"web-account:{fallback_target}", "Brain 4 (Web Agent)", 4, min_lat=10)
 
@@ -1002,11 +1042,16 @@ async def _run_llm(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str
         f"{EXECUTIVE_AUTONOMY_MANDATE}"
     )
     # Short-term conversational continuity context (last 3 turns)
-    recent_history = session_ledger.get_recent_history_context(n=3)
+    recent_history = session_ledger.get_recent_history_context(
+        n=3, mode=plan.get("mode", "casual"), project_id=plan.get("project_id")
+    )
     if recent_history:
         system_prompt += f"\n\nRECENT CONVERSATION HISTORY:\n{recent_history}"
 
-    elite_prompt = synthesize_elite_prompt(plan["clean_prompt"], force_provider or task_type, tiered_context)
+    elite_prompt = synthesize_elite_prompt(
+        plan["clean_prompt"], force_provider or task_type, tiered_context,
+        mode=plan.get("mode", "casual"), project_id=plan.get("project_id"),
+    )
 
     try:
         gen_res = await asyncio.to_thread(
@@ -1015,7 +1060,9 @@ async def _run_llm(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str
             user_prompt=elite_prompt,
             task_type=task_type,
             force_provider=force_provider,
-            history=session_ledger.get_chat_history_messages(),
+            history=session_ledger.get_chat_history_messages(
+                mode=plan.get("mode", "casual"), project_id=plan.get("project_id")
+            ),
         )
         latency_ms = round((time.time() - t0) * 1000)
         provider = gen_res.get("provider_used", "unknown")
@@ -1033,6 +1080,8 @@ async def _run_llm(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str
             task_type=task_type,
             system_content=system_prompt[:500],
             health_ms=latency_ms,
+            mode=plan.get("mode", "casual"),
+            project_id=plan.get("project_id"),
         )
         return _reply(plan, t0, response_text, provider_label, "Episodic", tier_num, min_lat=0)
     except ModelUnavailableError as exc:
@@ -1321,7 +1370,7 @@ def add_memory(req: MemoryAddRequest) -> Dict[str, Any]:
 
 @app.post("/api/projects/create")
 def create_project(req: ProjectCreateRequest) -> Dict[str, Any]:
-    """Create a new project and switch active project to it."""
+    """Create a new project, ensure project storage on disk, and switch active project to it."""
     name = req.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Project name cannot be empty.")
@@ -1331,6 +1380,7 @@ def create_project(req: ProjectCreateRequest) -> Dict[str, Any]:
         pid = f"proj-{int(time.time())}"
 
     tiered_memory.register_project(project_id=pid, title=name)
+    session_ledger.ensure_project_storage(pid, instructions=req.instructions)
     return {"ok": True, "project_id": pid, "title": name}
 
 

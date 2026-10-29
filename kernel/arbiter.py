@@ -23,6 +23,7 @@ logger = logging.getLogger("aivco.arbiter")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_TELEMETRY_FILE = BASE_DIR / "data" / "arbiter_training_log.jsonl"
+PROJECTS_DIR = BASE_DIR / "data" / "projects"
 
 
 # ── Asynchronous Telemetry Logger Queue & Daemon Worker ───────────────────────
@@ -239,6 +240,34 @@ WEB_PROVIDERS = frozenset(
 
 # ── Session Attribution & Artifact Ledger ────────────────────────────────────
 
+def ensure_project_storage(
+    project_id: str,
+    instructions: Optional[str] = None,
+    base_dir: Optional[Path] = None,
+) -> Path:
+    """
+    Initializes and validates the persistent on-disk storage directory for a project:
+      data/projects/<project_id>/
+      data/projects/<project_id>/files/
+      data/projects/<project_id>/instructions.txt (if supplied)
+      data/projects/<project_id>/chat_history.jsonl
+      data/projects/<project_id>/last_app.html
+    """
+    safe_pid = re.sub(r"[^a-zA-Z0-9_\-]", "_", project_id).strip("_") or "default"
+    root = (base_dir or PROJECTS_DIR) / safe_pid
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "files").mkdir(exist_ok=True)
+    if instructions is not None:
+        (root / "instructions.txt").write_text(instructions, encoding="utf-8")
+    chat_file = root / "chat_history.jsonl"
+    if not chat_file.exists():
+        chat_file.touch()
+    html_file = root / "last_app.html"
+    if not html_file.exists():
+        html_file.touch()
+    return root
+
+
 class SessionTurnRecord:
     __slots__ = (
         "turn_id",
@@ -262,6 +291,7 @@ class SessionTurnRecord:
         has_html_artifact: bool = False,
         html_code: str = "",
         response: str = "",
+        timestamp: Optional[float] = None,
     ):
         self.turn_id = turn_id
         self.prompt = prompt
@@ -271,13 +301,48 @@ class SessionTurnRecord:
         self.has_html_artifact = has_html_artifact
         self.html_code = html_code
         self.response = response
-        self.timestamp = time.time()
+        self.timestamp = timestamp if timestamp is not None else time.time()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "turn_id": self.turn_id,
+            "prompt": self.prompt,
+            "target_tier": self.target_tier,
+            "actual_provider": self.actual_provider,
+            "cascaded_from": self.cascaded_from,
+            "has_html_artifact": self.has_html_artifact,
+            "html_code": self.html_code,
+            "response": self.response,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionTurnRecord":
+        return cls(
+            turn_id=data.get("turn_id", 0),
+            prompt=data.get("prompt", ""),
+            target_tier=data.get("target_tier", ""),
+            actual_provider=data.get("actual_provider", ""),
+            cascaded_from=data.get("cascaded_from"),
+            has_html_artifact=data.get("has_html_artifact", False),
+            html_code=data.get("html_code", ""),
+            response=data.get("response", ""),
+            timestamp=data.get("timestamp", time.time()),
+        )
 
 
 class SessionExecutionLedger:
     """
-    Tracks recent execution turns, actual model attribution, and active HTML artifacts
-    so AIVCO never hallucinates which model built a deliverable and supports iterative edits.
+    Tracks execution turns, model attribution, and active HTML artifacts.
+    Supports two operating modes:
+    1. Casual Mode (mode="casual" or missing project_id):
+       - Ephemeral in-memory rolling deque(maxlen=12).
+       - Never writes to or reads from disk.
+    2. Project Mode (mode="project" with valid project_id):
+       - Persists all turns to data/projects/<project_id>/chat_history.jsonl (append-only).
+       - Persists latest HTML artifact to data/projects/<project_id>/last_app.html.
+       - Survives server restarts by restoring turns on demand.
+       - Fully isolated across project IDs and from Casual Mode.
     """
 
     PROVIDER_DISPLAY_NAMES = {
@@ -291,10 +356,51 @@ class SessionExecutionLedger:
         "kernel": "AIVCO Cognitive Kernel (Stage 0 Deterministic Engine)",
     }
 
-    def __init__(self, max_turns: int = 12):
+    def __init__(self, max_turns: int = 12, projects_dir: Optional[Path] = None):
         self._lock = threading.Lock()
+        self._max_turns: int = max_turns
         self._turns: Deque[SessionTurnRecord] = deque(maxlen=max_turns)
         self._turn_counter: int = 0
+        self._project_ledgers: Dict[str, Deque[SessionTurnRecord]] = {}
+        self._projects_dir: Path = projects_dir or PROJECTS_DIR
+
+    def _sanitize_project_id(self, project_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_\-]", "_", project_id).strip("_") or "default"
+
+    def get_project_dir(self, project_id: str) -> Path:
+        return self._projects_dir / self._sanitize_project_id(project_id)
+
+    def ensure_project_storage(self, project_id: str, instructions: Optional[str] = None) -> Path:
+        return ensure_project_storage(project_id, instructions=instructions, base_dir=self._projects_dir)
+
+    def _is_project_mode(self, mode: str, project_id: Optional[str]) -> bool:
+        return (mode == "project" or bool(project_id)) and bool(project_id and project_id.strip())
+
+    def _get_or_load_project_turns(self, project_id: str) -> Deque[SessionTurnRecord]:
+        safe_pid = self._sanitize_project_id(project_id)
+        if safe_pid in self._project_ledgers:
+            return self._project_ledgers[safe_pid]
+
+        d: Deque[SessionTurnRecord] = deque(maxlen=self._max_turns)
+        proj_dir = self.get_project_dir(safe_pid)
+        history_file = proj_dir / "chat_history.jsonl"
+        if history_file.exists():
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            d.append(SessionTurnRecord.from_dict(data))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        self._project_ledgers[safe_pid] = d
+        return d
 
     def record_turn(
         self,
@@ -303,6 +409,8 @@ class SessionExecutionLedger:
         actual_provider: Optional[str] = None,
         cascaded_from: Optional[str] = None,
         response_markdown: str = "",
+        mode: str = "casual",
+        project_id: Optional[str] = None,
     ) -> SessionTurnRecord:
         provider = (actual_provider or target_tier or "groq").strip().lower()
         if ":" in provider:
@@ -322,35 +430,89 @@ class SessionExecutionLedger:
             html_code = m.group(1).strip() if m else response_markdown.strip()
 
         with self._lock:
-            self._turn_counter += 1
-            rec = SessionTurnRecord(
-                turn_id=self._turn_counter,
-                prompt=prompt,
-                target_tier=target_tier,
-                actual_provider=provider,
-                cascaded_from=cascaded if cascaded != provider else None,
-                has_html_artifact=has_html,
-                html_code=html_code,
-                response=response_markdown,
-            )
-            self._turns.append(rec)
-            return rec
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                safe_pid = self._sanitize_project_id(project_id)
+                proj_turns = self._get_or_load_project_turns(safe_pid)
+                turn_id = (proj_turns[-1].turn_id + 1) if proj_turns else 1
 
-    def get_last_turn(self) -> Optional[SessionTurnRecord]:
+                rec = SessionTurnRecord(
+                    turn_id=turn_id,
+                    prompt=prompt,
+                    target_tier=target_tier,
+                    actual_provider=provider,
+                    cascaded_from=cascaded if cascaded != provider else None,
+                    has_html_artifact=has_html,
+                    html_code=html_code,
+                    response=response_markdown,
+                )
+                proj_turns.append(rec)
+
+                # Persist turn append-only to disk
+                proj_dir = self.get_project_dir(safe_pid)
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                (proj_dir / "files").mkdir(exist_ok=True)
+                history_file = proj_dir / "chat_history.jsonl"
+                with open(history_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec.to_dict()) + "\n")
+
+                # If an HTML artifact is present, write directly to last_app.html
+                if has_html and html_code:
+                    artifact_file = proj_dir / "last_app.html"
+                    artifact_file.write_text(html_code, encoding="utf-8")
+
+                return rec
+            else:
+                # Casual mode: purely in-memory
+                self._turn_counter += 1
+                rec = SessionTurnRecord(
+                    turn_id=self._turn_counter,
+                    prompt=prompt,
+                    target_tier=target_tier,
+                    actual_provider=provider,
+                    cascaded_from=cascaded if cascaded != provider else None,
+                    has_html_artifact=has_html,
+                    html_code=html_code,
+                    response=response_markdown,
+                )
+                self._turns.append(rec)
+                return rec
+
+    def get_last_turn(self, mode: str = "casual", project_id: Optional[str] = None) -> Optional[SessionTurnRecord]:
         with self._lock:
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                turns = self._get_or_load_project_turns(project_id)
+                return turns[-1] if turns else None
             return self._turns[-1] if self._turns else None
 
-    def get_recent_turns(self, n: int = 3) -> List[SessionTurnRecord]:
+    def get_recent_turns(self, n: int = 3, mode: str = "casual", project_id: Optional[str] = None) -> List[SessionTurnRecord]:
         with self._lock:
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                turns = self._get_or_load_project_turns(project_id)
+                return list(turns)[-n:]
             return list(self._turns)[-n:]
 
-    def get_recent_history_context(self, n: int = 3, max_chars_per_turn: int = 500) -> str:
+    def get_recent_history_context(
+        self,
+        n: int = 3,
+        max_chars_per_turn: int = 500,
+        mode: str = "casual",
+        project_id: Optional[str] = None,
+    ) -> str:
         """
         Returns a compact conversation history buffer of the last n turns
         to give Tier 2/3 stateless APIs short-term conversational continuity.
         """
         with self._lock:
-            turns = [t for t in self._turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                turns_source = self._get_or_load_project_turns(project_id)
+            else:
+                turns_source = self._turns
+
+            turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
             if not turns:
                 return ""
             blocks = []
@@ -369,7 +531,13 @@ class SessionExecutionLedger:
                 blocks.append(f"User: {t.prompt}\nAssistant: {clean_resp}")
             return "\n\n".join(blocks)
 
-    def get_chat_history_messages(self, max_turns: int = 6, max_chars: int = 3500) -> List[Dict[str, str]]:
+    def get_chat_history_messages(
+        self,
+        max_turns: int = 6,
+        max_chars: int = 3500,
+        mode: str = "casual",
+        project_id: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
         """
         Returns a list of {"role": "user", "content": ...} and {"role": "assistant", "content": ...}
         dictionaries for the last max_turns turns.
@@ -378,7 +546,13 @@ class SessionExecutionLedger:
         """
         messages: List[Dict[str, str]] = []
         with self._lock:
-            turns = [t for t in self._turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-max_turns:]
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                turns_source = self._get_or_load_project_turns(project_id)
+            else:
+                turns_source = self._turns
+
+            turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-max_turns:]
             total_chars = 0
             for t in turns:
                 u_text = t.prompt.strip()
@@ -409,29 +583,70 @@ class SessionExecutionLedger:
 
         return messages
 
-    def get_last_artifact_turn(self) -> Optional[SessionTurnRecord]:
+    def get_last_artifact_turn(
+        self,
+        mode: str = "casual",
+        project_id: Optional[str] = None,
+    ) -> Optional[SessionTurnRecord]:
         with self._lock:
-            for rec in reversed(self._turns):
-                if rec.has_html_artifact and rec.html_code:
-                    return rec
-            return None
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                safe_pid = self._sanitize_project_id(project_id)
+                proj_dir = self.get_project_dir(safe_pid)
+                artifact_file = proj_dir / "last_app.html"
+                if artifact_file.exists():
+                    code = artifact_file.read_text(encoding="utf-8").strip()
+                    if code:
+                        turns = self._get_or_load_project_turns(safe_pid)
+                        for rec in reversed(turns):
+                            if rec.has_html_artifact and rec.html_code:
+                                return rec
+                        return SessionTurnRecord(
+                            turn_id=0,
+                            prompt="[Project Saved Artifact]",
+                            target_tier="project",
+                            actual_provider="project",
+                            has_html_artifact=True,
+                            html_code=code,
+                            response=code,
+                        )
+                turns = self._get_or_load_project_turns(safe_pid)
+                for rec in reversed(turns):
+                    if rec.has_html_artifact and rec.html_code:
+                        return rec
+                return None
+            else:
+                for rec in reversed(self._turns):
+                    if rec.has_html_artifact and rec.html_code:
+                        return rec
+                return None
 
-    def format_attribution_answer(self, query: str = "") -> str:
+    def format_attribution_answer(
+        self,
+        query: str = "",
+        mode: str = "casual",
+        project_id: Optional[str] = None,
+    ) -> str:
         last: Optional[SessionTurnRecord] = None
-        if query:
-            q_lower = query.lower()
-            with self._lock:
-                # Look for matching keywords (e.g. "netflix", "clone") in prompt
+        with self._lock:
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                turns_source = self._get_or_load_project_turns(project_id)
+            else:
+                turns_source = self._turns
+
+            if query:
+                q_lower = query.lower()
                 stop_words = {"for", "the", "which", "what", "model", "did", "you", "use", "was", "used", "made", "built", "generate", "generated"}
                 words = [w for w in re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", q_lower) if w not in stop_words]
                 if words:
-                    for rec in reversed(self._turns):
+                    for rec in reversed(turns_source):
                         if any(w in rec.prompt.lower() for w in words):
                             last = rec
                             break
 
-        if not last:
-            last = self.get_last_turn()
+            if not last:
+                last = turns_source[-1] if turns_source else None
 
         if not last:
             return (
@@ -453,10 +668,16 @@ class SessionExecutionLedger:
             f"For your previous request (`\"{last.prompt[:80]}\"`), AIVCO used **{friendly}**."
         )
 
-    def clear(self) -> None:
+    def clear(self, mode: str = "casual", project_id: Optional[str] = None) -> None:
         with self._lock:
-            self._turns.clear()
-            self._turn_counter = 0
+            if self._is_project_mode(mode, project_id):
+                assert project_id is not None
+                safe_pid = self._sanitize_project_id(project_id)
+                if safe_pid in self._project_ledgers:
+                    self._project_ledgers[safe_pid].clear()
+            else:
+                self._turns.clear()
+                self._turn_counter = 0
 
 
 session_ledger = SessionExecutionLedger()
@@ -808,7 +1029,11 @@ def _is_true_frontend_intent(text: str) -> bool:
 
 
 def synthesize_elite_prompt(
-    raw_intent: str, target_tier: str = "", memory_context: str = ""
+    raw_intent: str,
+    target_tier: str = "",
+    memory_context: str = "",
+    mode: str = "casual",
+    project_id: Optional[str] = None,
 ) -> str:
     """
     Transforms casual or typo-laden operator requests into elite, production-grade
@@ -831,7 +1056,7 @@ def synthesize_elite_prompt(
         )
 
     # 2. Iterative Refinement on active HTML artifact
-    last_artifact = session_ledger.get_last_artifact_turn()
+    last_artifact = session_ledger.get_last_artifact_turn(mode=mode, project_id=project_id)
     if (
         last_artifact
         and ITERATIVE_REFINEMENT_PATTERN.search(clean_intent)
@@ -954,7 +1179,11 @@ def compress_memory_context(memory_context: str, max_chars: int = 500) -> str:
 
 
 def build_executive_envelope(
-    prompt: str, target_tier: str, memory_context: str
+    prompt: str,
+    target_tier: str,
+    memory_context: str = "",
+    mode: str = "casual",
+    project_id: Optional[str] = None,
 ) -> str:
     """
     Wraps prompt with an Executive Context Envelope for Brain 4 Web AI models,
@@ -971,7 +1200,9 @@ def build_executive_envelope(
         or tier_norm == "web"
     )
     if is_web_ai:
-        synthesized_prompt = synthesize_elite_prompt(prompt, target_tier, memory_context)
+        synthesized_prompt = synthesize_elite_prompt(
+            prompt, target_tier, memory_context, mode=mode, project_id=project_id
+        )
         return (
             "[AIVCO EXECUTIVE BRIEF]\n"
             f"Operator Context: {compact_memory_summary}\n"
@@ -988,11 +1219,13 @@ def build_executive_envelope(
     # For Tier 2/3 Cloud APIs (Groq/Gemini), keep simple prompts clean as required by unit tests,
     # unless the user is explicitly asking to build a Frontend Clone / Website or refining an active HTML artifact.
     is_refinement = bool(
-        session_ledger.get_last_artifact_turn()
+        session_ledger.get_last_artifact_turn(mode=mode, project_id=project_id)
         and ITERATIVE_REFINEMENT_PATTERN.search(prompt)
     )
     if tier_norm in ("groq", "gemini") and (_is_true_frontend_intent(prompt) or is_refinement):
-        return synthesize_elite_prompt(prompt, target_tier, memory_context)
+        return synthesize_elite_prompt(
+            prompt, target_tier, memory_context, mode=mode, project_id=project_id
+        )
 
     return prompt
 
