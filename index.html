@@ -612,6 +612,34 @@
       const [searchQuery, setSearchQuery] = useState('');
       const [showHudRing, setShowHudRing] = useState(true);
 
+      // Casual / Project Mode & Active Project State (Persisted in localStorage)
+      const [chatMode, setChatMode] = useState(() => {
+        try {
+          return localStorage.getItem('aivco_chat_mode') || 'casual';
+        } catch (_) {
+          return 'casual';
+        }
+      });
+
+      const [activeProjectId, setActiveProjectId] = useState(() => {
+        try {
+          return localStorage.getItem('aivco_active_project_id') || 'aivco';
+        } catch (_) {
+          return 'aivco';
+        }
+      });
+
+      const [availableProjects, setAvailableProjects] = useState([]);
+      const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+      const [newProjectName, setNewProjectName] = useState('');
+      const [newProjectSlug, setNewProjectSlug] = useState('');
+      const [newProjectInstructions, setNewProjectInstructions] = useState('');
+
+      // Pinned Decisions Drawer State
+      const [showPinnedDrawer, setShowPinnedDrawer] = useState(false);
+      const [pinnedList, setPinnedList] = useState([]);
+      const [isPinning, setIsPinning] = useState(false);
+
       // HUD Toast Notifications State
       const [toasts, setToasts] = useState([]);
       const [isLaunchingBrowser, setIsLaunchingBrowser] = useState(false);
@@ -807,15 +835,57 @@
         }
       };
 
+      const fetchAvailableProjects = useCallback(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/api/memory/projects`);
+          if (res.ok) {
+            const data = await res.json();
+            const list = data.projects || [];
+            setAvailableProjects(list);
+            if (list.length > 0) {
+              const currentValid = list.some(p => p.project_id === activeProjectId);
+              if (!currentValid && !localStorage.getItem('aivco_active_project_id')) {
+                const defId = data.active_project || list[0].project_id;
+                setActiveProjectId(defId);
+              }
+            }
+          }
+        } catch (err) {
+          console.error("Fetch projects error:", err);
+        }
+      }, [activeProjectId]);
+
+      const fetchPins = useCallback(async (projId) => {
+        const targetId = projId || activeProjectId;
+        if (!targetId) return;
+        try {
+          const res = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(targetId)}/pins`);
+          if (res.ok) {
+            const data = await res.json();
+            setPinnedList(data.pins || []);
+          }
+        } catch (err) {
+          console.error("Fetch pins error:", err);
+        }
+      }, [activeProjectId]);
+
       useEffect(() => {
         fetchHealth();
         fetchState();
+        fetchAvailableProjects();
         const poll = setInterval(() => {
           fetchHealth();
           fetchState();
+          fetchAvailableProjects();
         }, 5000);
         return () => clearInterval(poll);
-      }, []);
+      }, [fetchAvailableProjects]);
+
+      useEffect(() => {
+        if (chatMode === 'project' && activeProjectId) {
+          fetchPins(activeProjectId);
+        }
+      }, [chatMode, activeProjectId, fetchPins]);
 
       useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -931,7 +1001,9 @@
               prompt: prompt || 'Analyze attached files',
               target_model: modelTarget,
               auto_route: modelTarget === 'auto',
-              attachments: attachments.map(a => ({ name: a.name, content: a.content }))
+              attachments: attachments.map(a => ({ name: a.name, content: a.content })),
+              mode: chatMode,
+              project_id: chatMode === 'project' ? (activeProjectId || null) : null
             })
           });
 
@@ -955,6 +1027,9 @@
           setMessages(m => [...m, botMsg]);
           setLastReply({ provider: data.provider, latency: data.lat, src: data.src });
           fetchState();
+          if (chatMode === 'project' && activeProjectId) {
+            fetchPins(activeProjectId);
+          }
 
           // Auto-open artifact if response contains HTML document or ```html code block
           if (data.response) {
@@ -1124,18 +1199,126 @@
         }
       };
 
-      const handleCreateProject = async () => {
-        const name = prompt('Enter new project name:');
-        if (!name || !name.trim()) return;
+      const handleModeChange = (newMode) => {
+        setChatMode(newMode);
+        try {
+          localStorage.setItem('aivco_chat_mode', newMode);
+        } catch (_) {}
+        if (newMode === 'project') {
+          fetchAvailableProjects();
+          if (activeProjectId) {
+            fetchPins(activeProjectId);
+          }
+        }
+      };
+
+      const handleProjectSelect = (pid) => {
+        setActiveProjectId(pid);
+        try {
+          localStorage.setItem('aivco_active_project_id', pid);
+        } catch (_) {}
+        fetchPins(pid);
+      };
+
+      const handleProjectNameChange = (name) => {
+        setNewProjectName(name);
+        const slug = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
+        setNewProjectSlug(slug);
+      };
+
+      const handleCreateProject = () => {
+        setNewProjectName('');
+        setNewProjectSlug('');
+        setNewProjectInstructions('');
+        setShowNewProjectModal(true);
+      };
+
+      const handleCreateProjectSubmit = async (e) => {
+        if (e) e.preventDefault();
+        const slug = (newProjectSlug || newProjectName || '').toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
+        if (!slug) {
+          showToast('Please enter a valid project name.', 'error', 3000);
+          return;
+        }
+        const instructions = (newProjectInstructions || '').trim().slice(0, 2000);
         try {
           const res = await fetch(`${API_BASE}/api/projects/create`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: name.trim() })
+            body: JSON.stringify({
+              project_id: slug,
+              name: newProjectName.trim() || slug,
+              instructions: instructions || null
+            })
           });
-          if (res.ok) fetchState();
-        } catch (e) {
-          console.error('Create project error:', e);
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || 'Failed to create project');
+          }
+          const data = await res.json();
+          const createdId = data.project_id || slug;
+          showToast(`Project '${createdId}' created successfully!`, 'success', 4000);
+          setShowNewProjectModal(false);
+          setNewProjectName('');
+          setNewProjectSlug('');
+          setNewProjectInstructions('');
+          handleModeChange('project');
+          handleProjectSelect(createdId);
+          await fetchAvailableProjects();
+          fetchState();
+        } catch (err) {
+          showToast(`Error creating project: ${err.message}`, 'error', 4000);
+        }
+      };
+
+      const handlePinText = async (text) => {
+        if (chatMode !== 'project') {
+          showToast('Switch to Project Mode to pin decisions.', 'info', 3000);
+          return;
+        }
+        if (!activeProjectId) {
+          showToast('Please select or create a project first.', 'error', 3000);
+          return;
+        }
+        const cleanSnippet = (text || '').trim().slice(0, 120);
+        if (!cleanSnippet) return;
+        try {
+          setIsPinning(true);
+          const res = await fetch(`${API_BASE}/api/projects/pin`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project_id: activeProjectId, text: cleanSnippet })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            setPinnedList(data.pins || []);
+            showToast(`📌 Pinned: "${cleanSnippet.slice(0, 40)}..."`, 'success', 3000);
+          } else {
+            const err = await res.json();
+            showToast(err.detail || 'Failed to pin item.', 'error', 4000);
+          }
+        } catch (err) {
+          showToast(`Error pinning: ${err.message}`, 'error', 4000);
+        } finally {
+          setIsPinning(false);
+        }
+      };
+
+      const handleUnpin = async (index) => {
+        if (!activeProjectId) return;
+        try {
+          const res = await fetch(`${API_BASE}/api/projects/unpin`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project_id: activeProjectId, index })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            setPinnedList(data.pins || []);
+            showToast('Pin removed.', 'info', 2000);
+          }
+        } catch (err) {
+          showToast(`Error removing pin: ${err.message}`, 'error', 4000);
         }
       };
 
@@ -1181,30 +1364,103 @@
           </div>
 
           
-          {/* Top Bar: Live Status Badges for all 4 Brains */}
-          <header className="h-12 border-b border-border bg-surface/90 px-4 flex items-center justify-between z-20 text-xs font-mono select-none">
-            {/* Left: Branding & Core Mode */}
+          {/* Top Bar: Mode Switcher, Projects & Readiness Badges */}
+          <header className="h-12 border-b border-border bg-surface/90 px-4 flex items-center justify-between z-20 text-xs font-mono select-none gap-2">
+            {/* Left: Branding & Glassmorphic Mode Switcher */}
             <div className="flex items-center gap-3">
               <div className="w-6 h-6 rounded border border-argon flex items-center justify-center font-bold text-argon shadow-[0_0_10px_rgba(86,226,245,0.3)]">
                 A
               </div>
-              <span className="font-bold tracking-widest text-slate-100">AIVCO // ARGON</span>
-              <span className="text-slate-600">|</span>
-              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-argon/10 border border-argon/30 text-argon">
-                <span className="w-1.5 h-1.5 rounded-full bg-argon animate-pulse"></span>
-                <span>4-BRAIN ARCHITECTURE</span>
+              <span className="font-bold tracking-widest text-slate-100 hidden sm:inline">AIVCO</span>
+              <span className="text-slate-600 hidden sm:inline">|</span>
+
+              {/* Glassmorphic Mode Switcher */}
+              <div className="flex items-center gap-1.5 bg-slate-900/90 border border-border/80 rounded-lg p-0.5 shadow-inner backdrop-blur-md">
+                <div className="flex items-center rounded bg-slate-950/80 p-0.5 border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => handleModeChange('casual')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                      chatMode === 'casual'
+                        ? 'bg-argon text-obsidian shadow-[0_0_8px_rgba(86,226,245,0.4)]'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Casual Mode: 100% Ephemeral in RAM"
+                  >
+                    <span>⚡</span>
+                    <span>Casual</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleModeChange('project')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                      chatMode === 'project'
+                        ? 'bg-amber-400 text-obsidian shadow-[0_0_8px_rgba(251,191,36,0.4)]'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Project Mode: Persistent Disk Ledger, Pinned Decisions & Recaps"
+                  >
+                    <span>📁</span>
+                    <span>Project</span>
+                  </button>
+                </div>
+
+                {chatMode === 'project' ? (
+                  <div className="flex items-center gap-1.5 animate-slide-in pl-1">
+                    <select
+                      value={activeProjectId}
+                      onChange={(e) => handleProjectSelect(e.target.value)}
+                      className="bg-slate-950 border border-amber-400/40 rounded px-2 py-1 text-[11px] font-mono text-amber-200 outline-none focus:border-amber-400 cursor-pointer max-w-[130px] truncate"
+                      title="Active Project"
+                    >
+                      {availableProjects.length > 0 ? (
+                        availableProjects.map((p) => (
+                          <option key={p.project_id} value={p.project_id}>
+                            {p.title || p.project_id}
+                          </option>
+                        ))
+                      ) : (
+                        <option value={activeProjectId}>{activeProjectId}</option>
+                      )}
+                    </select>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowNewProjectModal(true)}
+                      className="px-2 py-1 rounded bg-amber-400/10 border border-amber-400/40 text-amber-300 hover:bg-amber-400/25 transition-all text-[11px] font-bold cursor-pointer flex items-center gap-1"
+                      title="Create New Project"
+                    >
+                      <span>+</span>
+                      <span className="hidden md:inline">New Project</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowPinnedDrawer(s => !s)}
+                      className={`px-2.5 py-1 rounded border transition-all text-[11px] font-bold cursor-pointer flex items-center gap-1 ${
+                        showPinnedDrawer
+                          ? 'bg-amber-400 text-obsidian border-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.3)]'
+                          : 'bg-slate-950 border-amber-400/40 text-amber-300 hover:border-amber-400'
+                      }`}
+                      title="Toggle Pinned Decisions Drawer"
+                    >
+                      <span>📌</span>
+                      <span>Pinned ({pinnedList.length})</span>
+                    </button>
+                  </div>
+                ) : (
+                  <span className="text-[10px] text-slate-500 font-mono px-1.5 hidden lg:inline">
+                    RAM Session
+                  </span>
+                )}
               </div>
             </div>
 
             {/* Center: Live 4-Brain Readiness Badges */}
-            <div className="flex items-center gap-3 hidden md:flex text-[11px]">
+            <div className="flex items-center gap-2.5 hidden xl:flex text-[11px]">
               <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-border">
                 <span className="w-2 h-2 rounded-full bg-argon"></span>
                 <span className="text-slate-300">Brain 1: Kernel</span>
-              </div>
-              <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-border/50 opacity-40" title="Local Brain 2 disabled to conserve system RAM">
-                <span className="w-2 h-2 rounded-full bg-slate-600"></span>
-                <span className="text-slate-400 font-mono">T1: Disabled (RAM Safe)</span>
               </div>
               <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-border">
                 <span className={`w-2 h-2 rounded-full ${health.tier2_groq ? 'bg-amber-400' : 'bg-rose-500'}`}></span>
@@ -1216,7 +1472,7 @@
               </div>
               <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-border">
                 <span className="w-2 h-2 rounded-full bg-purple-400"></span>
-                <span className="text-slate-300">Brain 4: Web/Browser</span>
+                <span className="text-slate-300">Brain 4: Web</span>
               </div>
             </div>
 
@@ -1327,15 +1583,23 @@
                 </div>
                 
                 <select 
-                  value={state.active_project} 
+                  value={activeProjectId || state.active_project} 
                   onChange={(e) => {
-                    handleSendChat(`project use ${e.target.value}`);
+                    handleProjectSelect(e.target.value);
                   }}
                   className="w-full bg-slate-900 border border-border rounded px-2 py-1 text-xs font-mono text-slate-200 outline-none focus:border-argon"
                 >
-                  {Object.keys(state.projects || {}).map(pid => (
-                    <option key={pid} value={pid}>{pid.toUpperCase()} {pid === state.active_project ? '★' : ''}</option>
-                  ))}
+                  {availableProjects.length > 0 ? (
+                    availableProjects.map(p => (
+                      <option key={p.project_id} value={p.project_id}>
+                        {(p.title || p.project_id).toUpperCase()} {p.project_id === activeProjectId ? '★' : ''}
+                      </option>
+                    ))
+                  ) : (
+                    Object.keys(state.projects || {}).map(pid => (
+                      <option key={pid} value={pid}>{pid.toUpperCase()} {pid === activeProjectId ? '★' : ''}</option>
+                    ))
+                  )}
                 </select>
 
                 {/* 4 Circular SVG Gauges */}
@@ -1506,10 +1770,20 @@
                               <button
                                 type="button"
                                 onClick={() => handleCopyMessage(m.id, m.text)}
-                                className={`hover:text-argon transition-colors flex items-center gap-1 font-bold ${isCopied ? 'text-emerald-400' : ''}`}
+                                className={`hover:text-argon transition-colors flex items-center gap-1 font-bold cursor-pointer ${isCopied ? 'text-emerald-400' : ''}`}
                                 title="Copy Message Text"
                               >
                                 {isCopied ? '✓ COPIED!' : '📋 COPY MESSAGE'}
+                              </button>
+
+                              <span>|</span>
+                              <button
+                                type="button"
+                                onClick={() => handlePinText(m.text)}
+                                className="hover:text-amber-400 text-slate-400 transition-colors flex items-center gap-1 font-bold cursor-pointer"
+                                title="Pin decision to Project"
+                              >
+                                <span>📌</span> PIN
                               </button>
 
                               {m.role === 'assistant' && (
@@ -2134,6 +2408,151 @@
                     Save Engram
                   </button>
                 </div>
+              </div>
+            </div>
+          )}
+
+
+          {/* Pinned Decisions Drawer (Project Mode) */}
+          {chatMode === 'project' && showPinnedDrawer && (
+            <div className="fixed top-14 right-4 z-40 w-84 max-w-full glass-bracket bg-[#0A1017]/95 border border-amber-400/50 rounded-xl shadow-[0_0_30px_rgba(251,191,36,0.15)] flex flex-col font-mono text-xs backdrop-blur-md animate-slide-in">
+              {/* Drawer Header */}
+              <div className="flex items-center justify-between p-3 border-b border-border/80 bg-slate-900/60 rounded-t-xl">
+                <div className="flex items-center gap-2 text-amber-300 font-bold">
+                  <span>📌</span>
+                  <span>PINNED DECISIONS ({pinnedList.length}/10)</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowPinnedDrawer(false)}
+                  className="text-slate-400 hover:text-white px-1.5 py-0.5 rounded cursor-pointer text-sm"
+                  title="Close Drawer"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Project context indicator */}
+              <div className="px-3 py-1.5 bg-amber-400/5 border-b border-amber-400/20 text-[10px] text-amber-200/80 flex items-center justify-between">
+                <span>Project: <strong className="text-amber-300">{activeProjectId}</strong></span>
+                <span>Max 120 chars/pin</span>
+              </div>
+
+              {/* Pins List */}
+              <div className="p-3 max-h-80 overflow-y-auto space-y-2">
+                {pinnedList.length === 0 ? (
+                  <div className="text-center py-6 text-slate-500 text-[11px] font-sans">
+                    No pinned decisions yet.<br />
+                    Click <strong className="text-amber-300 font-mono">📌 PIN</strong> on any message or type <code className="text-argon">pin: &lt;decision&gt;</code> in chat.
+                  </div>
+                ) : (
+                  pinnedList.map((pinText, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-start justify-between gap-2 p-2 rounded bg-slate-900/80 border border-slate-800 hover:border-amber-400/40 transition-colors group"
+                    >
+                      <div className="flex items-start gap-1.5 flex-1 min-w-0">
+                        <span className="text-amber-400 text-[10px] mt-0.5">•</span>
+                        <span className="text-slate-200 text-[11px] leading-snug break-words font-sans">{pinText}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleUnpin(idx)}
+                        className="text-slate-500 hover:text-rose-400 text-xs px-1.5 py-0.5 rounded transition-colors opacity-70 group-hover:opacity-100 cursor-pointer font-bold"
+                        title="Unpin Decision"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Project Creation Modal */}
+          {showNewProjectModal && (
+            <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="glass-bracket p-6 rounded-xl max-w-md w-full bg-[#0A1017] border border-amber-400/50 flex flex-col gap-4 font-mono text-xs shadow-[0_0_30px_rgba(251,191,36,0.2)]">
+                {/* Modal Header */}
+                <div className="flex justify-between items-center border-b border-border pb-3">
+                  <div className="flex items-center gap-2 text-amber-300 font-bold text-sm">
+                    <span>📁</span>
+                    <span>CREATE NEW PROJECT</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowNewProjectModal(false)}
+                    className="text-slate-400 hover:text-white px-2 py-1 text-sm font-bold cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <form onSubmit={handleCreateProjectSubmit} className="flex flex-col gap-3">
+                  <div>
+                    <label className="block text-[11px] text-slate-300 font-bold mb-1">
+                      PROJECT NAME
+                    </label>
+                    <input
+                      type="text"
+                      value={newProjectName}
+                      onChange={(e) => handleProjectNameChange(e.target.value)}
+                      placeholder="e.g., E-Commerce Platform"
+                      className="w-full bg-slate-950 border border-border rounded p-2 text-slate-100 outline-none focus:border-amber-400 font-sans text-xs"
+                      autoFocus
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-300 font-bold mb-1">
+                      PROJECT ID (AUTO-SLUGIFIED)
+                    </label>
+                    <input
+                      type="text"
+                      value={newProjectSlug}
+                      onChange={(e) => setNewProjectSlug(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ''))}
+                      placeholder="e-commerce-platform"
+                      className="w-full bg-slate-950 border border-border rounded p-2 text-amber-300 outline-none focus:border-amber-400 font-mono text-xs"
+                      required
+                    />
+                    <div className="text-[10px] text-slate-500 mt-0.5">Alphanumeric, dashes, and underscores only.</div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-300 font-bold mb-1">
+                      PROJECT INSTRUCTIONS & DIRECTIVES (OPTIONAL)
+                    </label>
+                    <textarea
+                      value={newProjectInstructions}
+                      onChange={(e) => setNewProjectInstructions(e.target.value.slice(0, 2000))}
+                      placeholder="e.g., Always use Tailwind CSS and strict TypeScript. Backend runs on FastAPI..."
+                      rows={4}
+                      className="w-full bg-slate-950 border border-border rounded p-2 text-slate-200 outline-none focus:border-amber-400 font-sans text-xs resize-none"
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-500 mt-0.5">
+                      <span>Injected into LLM project context</span>
+                      <span>{newProjectInstructions.length}/2000</span>
+                    </div>
+                  </div>
+
+                  <div className="flex justify-end gap-2 pt-2 border-t border-border">
+                    <button
+                      type="button"
+                      onClick={() => setShowNewProjectModal(false)}
+                      className="px-3 py-1.5 rounded border border-border text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="px-4 py-1.5 rounded bg-amber-400 text-obsidian font-bold hover:bg-amber-300 cursor-pointer shadow-[0_0_12px_rgba(251,191,36,0.3)]"
+                    >
+                      Create Project
+                    </button>
+                  </div>
+                </form>
               </div>
             </div>
           )}

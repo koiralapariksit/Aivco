@@ -133,7 +133,8 @@ class MemoryAddRequest(BaseModel):
 
 
 class ProjectCreateRequest(BaseModel):
-    name: str
+    name: Optional[str] = None
+    project_id: Optional[str] = None
     instructions: Optional[str] = None
 
 
@@ -1404,21 +1405,60 @@ def add_memory(req: MemoryAddRequest) -> Dict[str, Any]:
     return {"ok": True, "layer": layer, "title": clean_trigger}
 
 
+@app.get("/api/memory/projects")
+@app.get("/api/projects")
+def list_projects() -> Dict[str, Any]:
+    """Returns list of all registered and on-disk projects."""
+    projects_list = []
+    seen = set()
+
+    for pid, proj in tiered_memory.projects.items():
+        seen.add(pid)
+        projects_list.append({
+            "project_id": pid,
+            "title": proj.title or pid,
+            "tasks_count": len(proj.pending_tasks),
+            "milestones_count": len(proj.completed_milestones),
+        })
+
+    projects_dir = session_ledger._projects_dir
+    if projects_dir.exists():
+        for p_path in projects_dir.iterdir():
+            if p_path.is_dir() and p_path.name not in seen:
+                seen.add(p_path.name)
+                projects_list.append({
+                    "project_id": p_path.name,
+                    "title": p_path.name.replace("-", " ").title(),
+                    "tasks_count": 0,
+                    "milestones_count": 0,
+                })
+
+    active_id = tiered_memory.get_active_project() or (projects_list[0]["project_id"] if projects_list else "aivco")
+    return {
+        "ok": True,
+        "active_project": active_id,
+        "projects": projects_list,
+    }
+
+
 @app.post("/api/projects/create")
 def create_project(req: ProjectCreateRequest) -> Dict[str, Any]:
     """Create a new project, ensure project storage on disk, and switch active project to it."""
-    name = req.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Project name cannot be empty.")
+    raw_name = (req.name or req.project_id or "").strip()
+    if not raw_name:
+        raise HTTPException(status_code=400, detail="Project name or ID cannot be empty.")
 
-    pid = re.sub(r"[^a-z0-9\-]", "-", name.lower()).strip("-")
+    pid = (req.project_id or "").strip()
+    if not pid:
+        pid = re.sub(r"[^a-z0-9\-]", "-", raw_name.lower()).strip("-")
     if not pid:
         pid = f"proj-{int(time.time())}"
 
     safe_pid = sanitize_project_id(pid)
-    tiered_memory.register_project(project_id=safe_pid, title=name)
+    title = (req.name or req.project_id or safe_pid).strip()
+    tiered_memory.register_project(project_id=safe_pid, title=title)
     session_ledger.ensure_project_storage(safe_pid, instructions=req.instructions)
-    return {"ok": True, "project_id": safe_pid, "title": name}
+    return {"ok": True, "project_id": safe_pid, "title": title}
 
 
 @app.post("/api/projects/pin")
