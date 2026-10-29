@@ -872,7 +872,7 @@ async def execute_web_failover(
             user_prompt=elite_prompt,
             task_type="general",
             force_provider="groq",
-            history=session_ledger.get_chat_history_messages(mode=mode, project_id=project_id),
+            history=session_ledger.get_chat_history_messages(mode=mode, project_id=project_id, provider="groq"),
         )
         resp_text = gen_res.get("response", "")
         used_prov = gen_res.get("provider_used", "groq")
@@ -999,7 +999,9 @@ async def _run_web_search(plan: Dict[str, Any], raw_prompt: str, t0: float) -> D
             task_type=plan["task_type"],
             force_provider=target_prov,
             history=session_ledger.get_chat_history_messages(
-                mode=plan.get("mode", "casual"), project_id=plan.get("project_id")
+                mode=plan.get("mode", "casual"),
+                project_id=plan.get("project_id"),
+                provider=target_prov,
             ),
         )
         resp_text = gen_res.get("response", "")
@@ -1098,7 +1100,9 @@ async def _run_llm(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str
             task_type=task_type,
             force_provider=force_provider,
             history=session_ledger.get_chat_history_messages(
-                mode=plan.get("mode", "casual"), project_id=plan.get("project_id")
+                mode=plan.get("mode", "casual"),
+                project_id=plan.get("project_id"),
+                provider=force_provider or plan.get("provider"),
             ),
         )
         latency_ms = round((time.time() - t0) * 1000)

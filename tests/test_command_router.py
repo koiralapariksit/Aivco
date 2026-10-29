@@ -1460,32 +1460,32 @@ def test_deterministic_recap_growth_and_cap(tmp_path):
     from kernel.arbiter import SessionExecutionLedger
 
     test_projects_dir = tmp_path / "projects"
-    ledger = SessionExecutionLedger(max_turns=12, projects_dir=test_projects_dir)
+    ledger = SessionExecutionLedger(max_turns=20, projects_dir=test_projects_dir)
     pid = "recap-growth-proj"
     ledger.ensure_project_storage(pid)
 
-    # 1. First 6 turns: in the active window, recap.json is empty
-    for i in range(1, 7):
+    # 1. First 16 turns: in the active window, recap.json is empty
+    for i in range(1, 17):
+        resp = f"Done feature {i}"
+        if i == 10:
+            resp = "```html\n<!DOCTYPE html><html><body>App 10</body></html>\n```"
         ledger.record_turn(
             prompt=f"Task {i}: initialize feature {i}",
             target_tier="kernel",
             actual_provider="groq",
-            response_markdown=f"Done feature {i}",
+            response_markdown=resp,
             mode="project",
             project_id=pid,
         )
     assert ledger.get_recap_entries(pid) == []
 
-    # 2. Simulate 15 turns total (turns 7 through 15)
-    for i in range(7, 16):
-        resp = f"Done feature {i}"
-        if i == 10:
-            resp = "```html\n<!DOCTYPE html><html><body>App 10</body></html>\n```"
+    # 2. Simulate turns 17 through 25
+    for i in range(17, 26):
         ledger.record_turn(
             prompt=f"Task {i}: implement detailed engineering subsystem with extra characters to test length {i}",
             target_tier="kernel",
             actual_provider="groq",
-            response_markdown=resp,
+            response_markdown=f"Done feature {i}",
             mode="project",
             project_id=pid,
         )
@@ -1508,7 +1508,7 @@ def test_deterministic_recap_growth_and_cap(tmp_path):
     assert "groq" in note_content
 
     # 3. Add more turns with long prompts to test aggregate milestone compression
-    for i in range(16, 26):
+    for i in range(26, 36):
         ledger.record_turn(
             prompt=f"Task {i}: very long descriptive engineering prompt detailing architecture design and database migrations for milestone {i}",
             target_tier="kernel",
@@ -1608,4 +1608,169 @@ async def test_server_project_pin_endpoints_and_shortcut(tmp_path, monkeypatch):
     unpin_res = unpin_project_decision(ProjectUnpinRequest(project_id=pid, index=0))
     assert unpin_res["ok"] is True
     assert "Always use Tailwind CSS" not in unpin_res["pins"]
+
+
+def test_history_16_exchanges_and_groq_override():
+    from kernel.arbiter import SessionExecutionLedger
+
+    ledger = SessionExecutionLedger()
+    for i in range(1, 21):
+        ledger.record_turn(
+            prompt=f"user prompt {i}",
+            target_tier="kernel",
+            actual_provider="claude",
+            response_markdown=f"assistant answer {i}",
+            mode="casual",
+        )
+
+    # 1. Default (16 exchanges = 32 messages)
+    msgs = ledger.get_chat_history_messages(mode="casual")
+    assert len(msgs) == 32
+    assert msgs[0]["content"] == "user prompt 5"
+    assert msgs[1]["content"] == "assistant answer 5"
+    assert msgs[-2]["content"] == "user prompt 20"
+    assert msgs[-1]["content"] == "assistant answer 20"
+
+    # 2. Groq override (8 exchanges = 16 messages)
+    msgs_groq = ledger.get_chat_history_messages(mode="casual", provider="groq")
+    assert len(msgs_groq) == 16
+    assert msgs_groq[0]["content"] == "user prompt 13"
+    assert msgs_groq[1]["content"] == "assistant answer 13"
+    assert msgs_groq[-2]["content"] == "user prompt 20"
+    assert msgs_groq[-1]["content"] == "assistant answer 20"
+
+    # 3. Colon prefix format (e.g. "tier2:groq")
+    msgs_tier2 = ledger.get_chat_history_messages(mode="casual", provider="tier2:groq")
+    assert len(msgs_tier2) == 16
+    assert msgs_tier2[0]["content"] == "user prompt 13"
+
+    # 4. Non-overridden provider gets 16 exchanges
+    msgs_gemini = ledger.get_chat_history_messages(mode="casual", provider="gemini")
+    assert len(msgs_gemini) == 32
+
+    # 5. Explicit max_turns overrides default
+    msgs_custom = ledger.get_chat_history_messages(max_turns=4, mode="casual", provider="groq")
+    assert len(msgs_custom) == 8
+    assert msgs_custom[0]["content"] == "user prompt 17"
+
+
+def test_history_char_cap_keeps_newest_drops_oldest():
+    from kernel.arbiter import SessionExecutionLedger
+
+    ledger = SessionExecutionLedger()
+    ledger.record_turn(
+        prompt="Turn 1 old prompt",
+        target_tier="kernel",
+        actual_provider="groq",
+        response_markdown="Turn 1 old response " * 20,
+        mode="casual",
+    )
+    ledger.record_turn(
+        prompt="Turn 2 mid prompt",
+        target_tier="kernel",
+        actual_provider="groq",
+        response_markdown="Turn 2 mid response " * 20,
+        mode="casual",
+    )
+    ledger.record_turn(
+        prompt="Turn 3 newest prompt",
+        target_tier="kernel",
+        actual_provider="groq",
+        response_markdown="Turn 3 newest response " * 15,
+        mode="casual",
+    )
+
+    # Budget big enough for Turn 3 but not Turn 2 + Turn 3
+    t3_turn_len = len("Turn 3 newest prompt") + len("Turn 3 newest response " * 15)
+    max_chars = t3_turn_len + 50
+
+    msgs = ledger.get_chat_history_messages(max_chars=max_chars, mode="casual")
+    contents = [m["content"] for m in msgs]
+
+    # Must preserve newest (Turn 3) and drop older (Turn 1 and Turn 2)
+    assert any("Turn 3 newest prompt" in c for c in contents)
+    assert any("Turn 3 newest response" in c for c in contents)
+    assert not any("Turn 1 old" in c for c in contents)
+    assert not any("Turn 2 mid" in c for c in contents)
+
+
+def test_recap_only_summarizes_turns_older_than_16(tmp_path):
+    from kernel.arbiter import SessionExecutionLedger, HISTORY_EXCHANGES
+
+    test_projects_dir = tmp_path / "projects"
+    ledger = SessionExecutionLedger(max_turns=20, projects_dir=test_projects_dir)
+    pid = "mutual-exclusion-proj"
+    ledger.ensure_project_storage(pid)
+
+    # Record exactly 16 turns
+    for i in range(1, HISTORY_EXCHANGES + 1):
+        ledger.record_turn(
+            prompt=f"Feature step {i}",
+            target_tier="kernel",
+            actual_provider="groq",
+            response_markdown=f"Done step {i}",
+            mode="project",
+            project_id=pid,
+        )
+
+    # 1. Recap must be empty because all 16 turns are active in chat history
+    assert ledger.get_recap_entries(pid) == []
+    msgs = ledger.get_chat_history_messages(mode="project", project_id=pid)
+    # 1 system message + 16 exchanges (32 msgs) = 33
+    assert len(msgs) == 33
+    assert msgs[1]["content"] == "Feature step 1"
+
+    # 2. Record 17th turn: Turn 1 is now evicted from the 16-turn active window
+    ledger.record_turn(
+        prompt="Feature step 17",
+        target_tier="kernel",
+        actual_provider="groq",
+        response_markdown="Done step 17",
+        mode="project",
+        project_id=pid,
+    )
+
+    recap_entries = ledger.get_recap_entries(pid)
+    assert len(recap_entries) == 1
+    assert "Feature step 1 -> groq" in recap_entries[0]
+
+    # Active chat history now holds turns 2..17
+    msgs_17 = ledger.get_chat_history_messages(mode="project", project_id=pid)
+    assert len(msgs_17) == 33
+    assert msgs_17[1]["content"] == "Feature step 2"
+    assert msgs_17[-2]["content"] == "Feature step 17"
+
+
+def test_duplicate_injection_fix_project_mode(tmp_path):
+    from kernel.arbiter import SessionExecutionLedger
+
+    test_projects_dir = tmp_path / "projects"
+    ledger = SessionExecutionLedger(max_turns=20, projects_dir=test_projects_dir)
+    pid = "no-dup-proj"
+    ledger.ensure_project_storage(pid)
+
+    # Record turn in casual mode
+    ledger.record_turn(
+        prompt="Casual prompt 1",
+        target_tier="kernel",
+        actual_provider="groq",
+        response_markdown="Casual response 1",
+        mode="casual",
+    )
+    casual_ctx = ledger.get_recent_history_context(mode="casual")
+    assert "Casual prompt 1" in casual_ctx
+    assert "Casual response 1" in casual_ctx
+
+    # Record turn in project mode
+    ledger.record_turn(
+        prompt="Project prompt 1",
+        target_tier="kernel",
+        actual_provider="groq",
+        response_markdown="Project response 1",
+        mode="project",
+        project_id=pid,
+    )
+    project_ctx = ledger.get_recent_history_context(mode="project", project_id=pid)
+    # Must be empty string to prevent duplicate history injection in Project Mode
+    assert project_ctx == ""
 

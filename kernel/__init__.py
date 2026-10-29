@@ -24,6 +24,10 @@ from kernel.arbiter import (
     META_CONVERSATION_EXCLUDE,
     LIVE_SEARCH_PATTERN,
     FRONTEND_PATTERN,
+    HISTORY_EXCHANGES,
+    HISTORY_MAX_CHARS,
+    REPLY_MAX_CHARS,
+    PROVIDER_EXCHANGE_OVERRIDE,
 )
 from kernel import arbiter
 from kernel import cognitive_kernel
@@ -49,6 +53,10 @@ __all__ = [
     "META_CONVERSATION_EXCLUDE",
     "LIVE_SEARCH_PATTERN",
     "FRONTEND_PATTERN",
+    "HISTORY_EXCHANGES",
+    "HISTORY_MAX_CHARS",
+    "REPLY_MAX_CHARS",
+    "PROVIDER_EXCHANGE_OVERRIDE",
     "arbiter",
     "cognitive_kernel",
 ]

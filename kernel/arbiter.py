@@ -242,6 +242,11 @@ WEB_PROVIDERS = frozenset(
     {"claude", "chatgpt", "gemini_web", "grok", "claude_web", "chatgpt_web", "grok_web"}
 )
 
+HISTORY_EXCHANGES = 16
+HISTORY_MAX_CHARS = 30000
+REPLY_MAX_CHARS = 1500
+PROVIDER_EXCHANGE_OVERRIDE = {"groq": 8}
+
 
 # ── Session Attribution & Artifact Ledger ────────────────────────────────────
 
@@ -392,7 +397,7 @@ class SessionExecutionLedger:
         "kernel": "AIVCO Cognitive Kernel (Stage 0 Deterministic Engine)",
     }
 
-    def __init__(self, max_turns: int = 12, projects_dir: Optional[Path] = None):
+    def __init__(self, max_turns: int = 20, projects_dir: Optional[Path] = None):
         self._lock = threading.Lock()
         self._max_turns: int = max_turns
         self._turns: Deque[SessionTurnRecord] = deque(maxlen=max_turns)
@@ -425,7 +430,7 @@ class SessionExecutionLedger:
         if safe_pid in self._project_ledgers:
             return self._project_ledgers[safe_pid]
 
-        d: Deque[SessionTurnRecord] = deque(maxlen=self._max_turns)
+        d: Deque[SessionTurnRecord] = deque(maxlen=50)
         proj_dir = self.get_project_dir(safe_pid)
         history_file = proj_dir / "chat_history.jsonl"
         if history_file.exists():
@@ -545,12 +550,11 @@ class SessionExecutionLedger:
 
         turns = self._load_all_project_turns(safe_pid)
         t_count = len(turns)
-        if t_count <= 6:
-            if not recap_file.exists():
-                recap_file.write_text("[]\n", encoding="utf-8")
+        if t_count <= HISTORY_EXCHANGES:
+            recap_file.write_text("[]\n", encoding="utf-8")
             return
 
-        evicted = turns[: t_count - 6]
+        evicted = turns[:-HISTORY_EXCHANGES]
         raw_lines: List[str] = []
         for t in evicted:
             p_text = (t.prompt or "").strip()[:80].strip()
@@ -697,12 +701,9 @@ class SessionExecutionLedger:
         """
         with self._lock:
             if self._is_project_mode(mode, project_id):
-                assert project_id is not None
-                turns_source = self._get_or_load_project_turns(project_id)
-            else:
-                turns_source = self._turns
+                return ""
 
-            turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
+            turns = [t for t in self._turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
             if not turns:
                 return ""
             blocks = []
@@ -723,19 +724,32 @@ class SessionExecutionLedger:
 
     def get_chat_history_messages(
         self,
-        max_turns: int = 6,
-        max_chars: int = 3500,
+        max_turns: int = HISTORY_EXCHANGES,
+        max_chars: int = HISTORY_MAX_CHARS,
         mode: str = "casual",
         project_id: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """
         Returns a list of {"role": "user", "content": ...} and {"role": "assistant", "content": ...}
-        dictionaries for the last max_turns turns.
+        dictionaries for up to max_turns turns.
         Replaces massive raw HTML blocks in history with "[Generated Single-File HTML Application]"
         so token budgets stay lean while preserving full conversational text.
         """
         messages: List[Dict[str, str]] = []
         with self._lock:
+            effective_max_turns = max_turns
+            if provider and max_turns == HISTORY_EXCHANGES:
+                clean_p = provider.lower().strip()
+                if clean_p in PROVIDER_EXCHANGE_OVERRIDE:
+                    effective_max_turns = PROVIDER_EXCHANGE_OVERRIDE[clean_p]
+                elif ":" in clean_p:
+                    for part in clean_p.split(":"):
+                        part = part.strip()
+                        if part in PROVIDER_EXCHANGE_OVERRIDE:
+                            effective_max_turns = PROVIDER_EXCHANGE_OVERRIDE[part]
+                            break
+
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
                 safe_pid = self._sanitize_project_id(project_id)
@@ -765,9 +779,11 @@ class SessionExecutionLedger:
             else:
                 turns_source = self._turns
 
-            turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-max_turns:]
-            total_chars = 0
-            for t in turns:
+            candidate_turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-effective_max_turns:]
+            collected_pairs: List[List[Dict[str, str]]] = []
+            accumulated_chars = 0
+
+            for t in reversed(candidate_turns):
                 u_text = t.prompt.strip()
                 resp = (t.response or "").strip()
                 if "<!doctype html" in resp.lower():
@@ -783,16 +799,23 @@ class SessionExecutionLedger:
                         resp,
                         flags=re.IGNORECASE,
                     )
-                if len(resp) > 800:
-                    resp = resp[:800].rsplit(" ", 1)[0] + "..."
+                if len(resp) > REPLY_MAX_CHARS:
+                    resp = resp[:REPLY_MAX_CHARS].rsplit(" ", 1)[0] + "..."
 
-                total_chars += len(u_text) + len(resp)
-                if total_chars > max_chars and len(messages) > (1 if self._is_project_mode(mode, project_id) else 0):
+                turn_chars = len(u_text) + len(resp)
+                if collected_pairs and (accumulated_chars + turn_chars > max_chars):
                     break
 
-                messages.append({"role": "user", "content": u_text})
+                pair = [{"role": "user", "content": u_text}]
                 if resp:
-                    messages.append({"role": "assistant", "content": resp})
+                    pair.append({"role": "assistant", "content": resp})
+
+                collected_pairs.append(pair)
+                accumulated_chars += turn_chars
+
+            collected_pairs.reverse()
+            for pair in collected_pairs:
+                messages.extend(pair)
 
         return messages
 
