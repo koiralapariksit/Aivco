@@ -26,3 +26,4 @@ __all__ = [
     "get_vault_status_summary",
     "set_active_claude_slot",
 ]
+

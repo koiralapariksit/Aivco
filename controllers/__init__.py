@@ -36,3 +36,4 @@ __all__ = [
     "EXIT_SENTINEL",
     "CLEAR_SENTINEL",
 ]
+
