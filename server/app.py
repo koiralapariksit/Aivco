@@ -1000,7 +1000,7 @@ async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> 
         )
 
     latency_ms = max(10, round((time.time() - t0) * 1000))
-    web_res = sanitize_and_validate_code_output(web_res)
+    web_res = sanitize_and_validate_code_output(web_res, normalize_prose=True)
     provider_health.record_success(provider, latency_ms)
     finish_turn(
         raw_prompt=raw_prompt,

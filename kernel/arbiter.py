@@ -745,7 +745,11 @@ class SessionExecutionLedger:
 
         html_code = ""
         has_html = False
-        if response_markdown and "<!doctype html" in response_markdown.lower():
+        if (
+            response_markdown
+            and "[AIVCO-TRUNCATED]" not in response_markdown
+            and ("<!doctype html" in response_markdown.lower() or "<html" in response_markdown.lower())
+        ):
             has_html = True
             m = re.search(r"```html\s*([\s\S]*?)```", response_markdown, re.IGNORECASE)
             html_code = m.group(1).strip() if m else response_markdown.strip()
@@ -2296,146 +2300,317 @@ def _strip_param_types_in_list(raw_params: str) -> str:
     return ", ".join(cleaned_parts)
 
 
+TS_SIGNALS = [
+    re.compile(r"interface\s+[A-Z]"),
+    re.compile(r"type\s+[A-Z]\w*\s*="),
+    re.compile(r":\s*(?:string|number|boolean|any|unknown|void|never)\b"),
+    re.compile(r"\bas\s+(?:const|any|unknown|string|number|HTML\w*Element|Element)\b"),
+    re.compile(r"(?<=[a-zA-Z0-9_$])<(?:[A-Z]\w*|string|number|boolean|any|unknown)>\s*\("),
+]
+
+KNOWN_SMASHES = {
+    "FCBarcelona": "FC Barcelona",
+    "AtléticoMadrid": "Atlético Madrid",
+    "AtleticoMadrid": "Atlético Madrid",
+    "RealMadrid": "Real Madrid",
+}
+
+
+def mask_js_content(code: str) -> Tuple[str, Dict[str, str]]:
+    tokens: Dict[str, str] = {}
+
+    def mask_imports(m):
+        t = f"___AIVCO_MASKED_{len(tokens)}___"
+        tokens[t] = m.group(0)
+        return t
+
+    code = re.sub(r"^[ \t]*import\b[^\r\n;]+;?", mask_imports, code, flags=re.MULTILINE)
+    code = re.sub(r"^[ \t]*export\s+(?:default|\{[^}]+\})[^\r\n;]*;?", mask_imports, code, flags=re.MULTILINE)
+
+    out = []
+    i = 0
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        # Multi-line comment
+        if ch == '/' and i + 1 < n and code[i+1] == '*':
+            end = code.find('*/', i + 2)
+            end = n if end == -1 else end + 2
+            t = f"___AIVCO_MASKED_{len(tokens)}___"
+            tokens[t] = code[i:end]
+            out.append(t)
+            i = end
+            continue
+        # Single-line comment
+        if ch == '/' and i + 1 < n and code[i+1] == '/':
+            end = code.find('\n', i + 2)
+            if end == -1:
+                end = n
+            t = f"___AIVCO_MASKED_{len(tokens)}___"
+            tokens[t] = code[i:end]
+            out.append(t)
+            i = end
+            continue
+        # Double-quoted string
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if code[j] == '\\':
+                    j += 2
+                elif code[j] == '"':
+                    j += 1
+                    break
+                else:
+                    j += 1
+            t = f"___AIVCO_MASKED_{len(tokens)}___"
+            tokens[t] = code[i:j]
+            out.append(t)
+            i = j
+            continue
+        # Single-quoted string
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if code[j] == '\\':
+                    j += 2
+                elif code[j] == "'":
+                    j += 1
+                    break
+                else:
+                    j += 1
+            t = f"___AIVCO_MASKED_{len(tokens)}___"
+            tokens[t] = code[i:j]
+            out.append(t)
+            i = j
+            continue
+        # Template literal
+        if ch == '`':
+            j = i + 1
+            while j < n:
+                if code[j] == '\\':
+                    j += 2
+                elif code[j] == '`':
+                    j += 1
+                    break
+                else:
+                    j += 1
+            t = f"___AIVCO_MASKED_{len(tokens)}___"
+            tokens[t] = code[i:j]
+            out.append(t)
+            i = j
+            continue
+        # Regex literal detection
+        if ch == '/':
+            k = len(out) - 1
+            prev_ch = ''
+            while k >= 0:
+                stripped = out[k].rstrip()
+                if stripped:
+                    prev_ch = stripped[-1]
+                    break
+                k -= 1
+            if prev_ch in ('=', '(', '[', ':', ',', '!', '&', '|', '?', 'return'):
+                j = i + 1
+                in_bracket = False
+                while j < n:
+                    if code[j] == '\\':
+                        j += 2
+                    elif code[j] == '[':
+                        in_bracket = True
+                        j += 1
+                    elif code[j] == ']' and in_bracket:
+                        in_bracket = False
+                        j += 1
+                    elif code[j] == '/' and not in_bracket:
+                        j += 1
+                        while j < n and code[j] in 'gimsuy':
+                            j += 1
+                        break
+                    elif code[j] == '\n':
+                        break
+                    else:
+                        j += 1
+                if j > i + 1 and code[j-1] != '\n':
+                    t = f"___AIVCO_MASKED_{len(tokens)}___"
+                    tokens[t] = code[i:j]
+                    out.append(t)
+                    i = j
+                    continue
+        out.append(ch)
+        i += 1
+    return "".join(out), tokens
+
+
 def sanitize_script_content(js_code: str) -> str:
     """
-    Sanitizes inline JavaScript by stripping accidental TypeScript syntax:
-    - nested interface / type declarations (brace-balanced)
-    - single-line type aliases (`type ID = string | number;`)
-    - type assertions (`as HTMLElement`, `as unknown as Foo`, `as any`)
-    - generic call arguments (`querySelector<HTMLElement>(...)`)
-    - non-null assertions (`el!.addEventListener`)
-    - variable, function parameter, and return type annotations
+    Sanitizes inline JavaScript by safely stripping accidental TypeScript syntax
+    while preserving JavaScript idioms, string literals, and bracket parity:
+    - Gates execution with genuine TypeScript signals (TS_SIGNALS)
+    - Masks literals, comments, template strings, regexes, and imports
+    - Strips nested interface / type declarations (brace-balanced)
+    - Strips single-line type aliases
+    - Strips type assertions (`(el as HTMLElement)` -> `el` and `as Type`)
+    - Strips generic call arguments (`querySelector<HTMLElement>(...)`)
+    - Strips non-null assertions followed by `.`, `[`, or `(`
+    - Strips variable, function parameter, and return type annotations
+    - Restores masked content and reverts if bracket parity is broken
     """
     if not js_code or not isinstance(js_code, str):
         return js_code or ""
 
-    # 1. Strip brace-balanced interface and object type declarations
-    js_code = _strip_balanced_ts_blocks(js_code, "interface")
-    js_code = _strip_balanced_ts_blocks(js_code, "type")
+    # 1. Gate with TS signals
+    if not any(sig.search(js_code) for sig in TS_SIGNALS):
+        return js_code
 
-    # 2. Strip single-line union/primitive type aliases: type Mode = 'dark' | 'light';
-    js_code = re.sub(
-        r"^\s*(?:export\s+)?type\s+[A-Za-z0-9_$]+(?:\s*<[^>]*>)?\s*=\s*[^;\n]+;?[ \t]*$",
+    orig_parity = (
+        js_code.count("{") == js_code.count("}"),
+        js_code.count("(") == js_code.count(")"),
+        js_code.count("[") == js_code.count("]"),
+    )
+
+    # 2. Mask literals, comments, template strings, imports
+    masked_code, tokens = mask_js_content(js_code)
+
+    # 3. Strip balanced interface and type blocks
+    masked_code = _strip_balanced_ts_blocks(masked_code, "interface")
+    masked_code = _strip_balanced_ts_blocks(masked_code, "type")
+
+    # 4. Strip single-line union/primitive type aliases: type Mode = 'dark' | 'light';
+    masked_code = re.sub(
+        r"^[ \t]*(?:export\s+)?type\s+[A-Za-z0-9_$]+(?:\s*<[^>]*>)?\s*=[^;\n]+;?[ \t]*$",
         "",
-        js_code,
+        masked_code,
         flags=re.MULTILINE,
     )
 
-    # 3. Strip generic type arguments on DOM/function calls: document.querySelector<HTMLElement>('...')
-    js_code = re.sub(
-        r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*<\s*[A-Za-z_$][A-Za-z0-9_$<>\[\],\s|&]*>\s*\(",
+    # 5. Strip generic DOM/function calls with NO space before <
+    masked_code = re.sub(
+        r"([a-zA-Z0-9_$]+)<([A-Z]\w*|string|number|boolean|any|unknown)>\s*\(",
         r"\1(",
-        js_code,
+        masked_code,
     )
 
-    # 4. Strip type assertions (handles chained `as unknown as HTMLElement`)
+    # 6. Strip (el as HTMLElement) -> el and standalone as Type
+    masked_code = re.sub(
+        r"\(\s*([a-zA-Z0-9_$]+(?:\.[a-zA-Z0-9_$]+|\([^)]*\)|\[[^\]]*\])*)\s+as\s+(?:const|any|unknown|string|number|HTML\w*Element|Element)\s*\)",
+        r"\1",
+        masked_code,
+    )
     for _ in range(2):
-        js_code = re.sub(
-            r"\s+as\s+(?:const|[A-Za-z_$][A-Za-z0-9_$.]*(?:<[^>]+>)?(?:\[\])*)",
+        masked_code = re.sub(
+            r"\s+as\s+(?:const|any|unknown|string|number|HTML\w*Element|Element)\b",
             "",
-            js_code,
+            masked_code,
         )
 
-    # 5. Strip non-null assertions: `element!.addEventListener`, `container!.innerHTML`, `el!;`
-    js_code = re.sub(r"([a-zA-Z0-9_$\]\)])!([.\[(])", r"\1\2", js_code)
-    js_code = re.sub(r"([a-zA-Z0-9_$\]\)])!\s*(?=[;,)\]\n])", r"\1", js_code)
+    # 7. Non-null assertions followed strictly by ., [, or (
+    masked_code = re.sub(r"([a-zA-Z0-9_$\]\)])!([.\[(])", r"\1\2", masked_code)
 
-    # 6. Strip variable type annotations on a single line: const x: number = ..., let data: Item[] = ...
-    js_code = re.sub(
+    # 8. Variable type annotations: const x: number = ..., let data: Item[] = ...
+    masked_code = re.sub(
         r"\b(const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*[A-Za-z_$][A-Za-z0-9_$<>[\]|&,\s]*?(?=\s*=)",
         r"\1 \2",
-        js_code,
+        masked_code,
     )
 
-    # 7. Strip function parameter types and return types: function foo(a: number, b: string = 'x'): void {
+    # 9. Function parameter and return types: function foo(a: number, b: string = 'x'): void {
     def _clean_fn_decl(m: re.Match) -> str:
         fn_name = m.group(1) or ""
         params = _strip_param_types_in_list(m.group(2) or "")
         space = f" {fn_name}" if fn_name else ""
         return f"function{space}({params}) {{"
 
-    js_code = re.sub(
+    masked_code = re.sub(
         r"\bfunction\s*([A-Za-z_$][A-Za-z0-9_$]*)?\s*\(([^()]*)\)\s*(?::\s*[A-Za-z_$][A-Za-z0-9_$<>[\]|&?\s]*)?\s*\{",
         _clean_fn_decl,
-        js_code,
+        masked_code,
     )
 
-    # 8. Strip arrow function parameter types and return types: (a: number, b: string): number =>
+    # 10. Arrow function parameters and return types: (a: number, b: string): number =>
     def _clean_arrow_decl(m: re.Match) -> str:
         params = _strip_param_types_in_list(m.group(1) or "")
         return f"({params}) =>"
 
-    js_code = re.sub(
+    masked_code = re.sub(
         r"\(([^()\n]*:[^()\n]*)\)\s*(?::\s*[A-Za-z_$][A-Za-z0-9_$<>[\]|&?\s]*)?\s*=>",
         _clean_arrow_decl,
-        js_code,
+        masked_code,
     )
 
-    return js_code.strip()
+    # 11. Restore masked tokens in reverse order
+    for t, orig in reversed(list(tokens.items())):
+        masked_code = masked_code.replace(t, orig)
+
+    # 12. Bracket Parity Revert Rule
+    new_parity = (
+        masked_code.count("{") == masked_code.count("}"),
+        masked_code.count("(") == masked_code.count(")"),
+        masked_code.count("[") == masked_code.count("]"),
+    )
+    if orig_parity == (True, True, True) and new_parity != (True, True, True):
+        return js_code
+
+    return masked_code.strip()
 
 
 def normalize_text_and_whitespace(text: str) -> str:
     """
     Normalizes prose tokens and fixes spacing artifacts:
-    1. Preserves fenced code blocks (```...```) and inline code (`...`) verbatim.
-    2. Fixes unspaced sentence collisions (.Sir, -> . Sir,).
-    3. Fixes merged/smashed dates, numbers, and proper nouns:
+    1. Preserves fenced code blocks (```...```), inline code (`...`), script/style tags,
+       HTML documents, URLs, markdown links, file paths, and emails verbatim.
+    2. Fixes unspaced sentence collisions (.Sir, -> . Sir,) when preceded by word characters.
+    3. Fixes merged/smashed dates and known entities:
        - 'AtléticoMadrid' -> 'Atlético Madrid'
        - 'FCBarcelona' -> 'FC Barcelona'
        - 'RealMadrid' -> 'Real Madrid'
        - '20May2026' -> '20 May 2026'
        - 'June2024' -> 'June 2024'
-    4. Deduplicates consecutive identical lines/paragraphs caused by buffer re-stitching.
+    4. Deduplicates consecutive identical lines/paragraphs and back-to-back duplicate sentences.
+    5. Preserves technical identifiers (JavaScript, GitHub, YouTube, FastAPI, ChatGPT, OpenAI, macOS, System.out.println).
     """
     if not text or not isinstance(text, str):
         return text or ""
 
-    code_blocks = {}
+    # 1. Mask code blocks, scripts, styles, HTML documents, URLs, markdown links, file paths, emails
+    masks: Dict[str, str] = {}
     counter = 0
 
-    def code_repl(m):
+    def mask_repl(m):
         nonlocal counter
-        token = f"___AIVCO_CODE_BLOCK_{counter}___"
-        code_blocks[token] = m.group(0)
+        token = f"___AIVCO_MASK_PROSE_{counter}___"
+        masks[token] = m.group(0)
         counter += 1
         return token
 
-    # Protect code blocks
-    prose = re.sub(r"```[\s\S]*?```", code_repl, text)
-    prose = re.sub(r"`[^`\n]+`", code_repl, prose)
+    # Fenced & inline code
+    prose = re.sub(r"```[\s\S]*?```", mask_repl, text)
+    prose = re.sub(r"`[^`\n]+`", mask_repl, prose)
 
-    # 1. Unspaced period before capitalized word (.Sir, -> . Sir,)
-    prose = re.sub(r"\.([A-Z][a-z]+)", r". \1", prose)
+    # HTML tags: <script>, <style>, <!DOCTYPE ...>
+    prose = re.sub(r"<script(?:\s+[^>]*)?>[\s\S]*?</script>", mask_repl, prose, flags=re.IGNORECASE)
+    prose = re.sub(r"<style(?:\s+[^>]*)?>[\s\S]*?</style>", mask_repl, prose, flags=re.IGNORECASE)
+    prose = re.sub(r"<!DOCTYPE\s+html[\s\S]*?</html>", mask_repl, prose, flags=re.IGNORECASE)
 
-    # 2. Date normalization
-    prose = re.sub(
-        r"\b(\d{1,2})(January|February|March|April|May|June|July|August|September|October|November|December)(\d{4})\b",
-        r"\1 \2 \3",
-        prose,
-        flags=re.IGNORECASE,
-    )
-    prose = re.sub(
-        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)(\d{4})\b",
-        r"\1 \2",
-        prose,
-        flags=re.IGNORECASE,
-    )
-    prose = re.sub(
-        r"\b(\d{1,2})(January|February|March|April|May|June|July|August|September|October|November|December)\b",
-        r"\1 \2",
-        prose,
-        flags=re.IGNORECASE,
-    )
-    prose = re.sub(r"\b(\d{1,4})([A-Z][a-z]+)\b", r"\1 \2", prose)
+    # URLs, markdown links, emails, paths
+    prose = re.sub(r"https?://[^\s)\]]+", mask_repl, prose)
+    prose = re.sub(r"www\.[^\s)\]]+", mask_repl, prose)
+    prose = re.sub(r"\]\([^\)]+\)", mask_repl, prose)
+    prose = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", mask_repl, prose)
+    prose = re.sub(r"(?:/[a-zA-Z0-9_.-]+){2,}", mask_repl, prose)
+    prose = re.sub(r"[a-zA-Z]:\\[a-zA-Z0-9_.\-\\]+", mask_repl, prose)
 
-    # 3. Known entity smashes
-    prose = re.sub(r"\bFCBarcelona\b", "FC Barcelona", prose)
-    prose = re.sub(r"\bAtl[eé]ticoMadrid\b", "Atlético Madrid", prose, flags=re.IGNORECASE)
-    prose = re.sub(r"\bRealMadrid\b", "Real Madrid", prose)
-    prose = re.sub(r"\b([A-Z]{2,})([A-Z][a-z]{2,})\b", r"\1 \2", prose)
+    # 2. Unspaced period before capitalized word (.Sir, -> . Sir,) preceded by word character
+    prose = re.sub(r"(?<=[a-zA-Z0-9])\.([A-Z][a-z]+)(?=[\s,;!?]|$)", r". \1", prose)
 
-    # 4. Smashed unicode / CamelCase words in prose (lowercase followed by uppercase)
-    prose = re.sub(r"([a-z\u00DF-\u00FF])([A-Z\u00C0-\u00DE])", r"\1 \2", prose)
+    # 3. Date normalization
+    MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
+    prose = re.sub(rf"\b(\d{{1,2}})({MONTHS})(\d{{4}})\b", r"\1 \2 \3", prose, flags=re.IGNORECASE)
+    prose = re.sub(rf"\b({MONTHS})(\d{{4}})\b", r"\1 \2", prose, flags=re.IGNORECASE)
+    prose = re.sub(rf"\b(\d{{1,2}})({MONTHS})\b", r"\1 \2", prose, flags=re.IGNORECASE)
+
+    # 4. Strict Known entity smashes
+    for smashed, fixed in KNOWN_SMASHES.items():
+        prose = re.sub(rf"\b{re.escape(smashed)}\b", fixed, prose)
 
     # 5. Deduplicate identical consecutive paragraphs
     paragraphs = prose.split("\n\n")
@@ -2452,28 +2627,63 @@ def normalize_text_and_whitespace(text: str) -> str:
     # 6. Deduplicate repeated back-to-back sentences within lines
     prose = re.sub(r"([^.!?\n]{10,}[.!?])\s*\1", r"\1", prose)
 
-    # Restore code blocks
-    for token, block in code_blocks.items():
-        prose = prose.replace(token, block)
+    # Restore masks in reverse order
+    for token, val in reversed(list(masks.items())):
+        prose = prose.replace(token, val)
 
     return prose.strip()
 
 
-def sanitize_and_validate_code_output(markdown_text: str) -> str:
+def sanitize_and_validate_code_output(markdown_text: str, normalize_prose: bool = False) -> str:
     """
-    Pre-delivery quality gate that strips accidental TypeScript syntax out of plain <script> blocks
-    (while leaving JSON/importmap/babel scripts untouched), balances HTML & markdown fences,
-    and normalizes prose whitespace and deduplicates fallback duplicates.
+    Pre-delivery quality gate that:
+    1. Wraps unfenced <!DOCTYPE html> or <html in ```html fences (7.4)
+    2. Strips accidental TypeScript syntax out of plain <script> blocks (7.1, 7.2)
+       (while leaving JSON/importmap/babel scripts untouched)
+    3. Detects truncation (<html without </html>, unbalanced script braces, unclosed fences) (7.5),
+       cleanly closes them and appends [AIVCO-TRUNCATED] notification
+    4. Gated prose normalization (7.3): applies normalize_text_and_whitespace when normalize_prose=True
+       or on non-code fallback strings.
     """
     if not markdown_text or not isinstance(markdown_text, str):
         return markdown_text or ""
 
+    lower_md = markdown_text.lower()
+
+    # 7.4 HTML Fence Wrap for Unfenced Code
+    if ("<!doctype html" in lower_md or "<html" in lower_md) and "```html" not in lower_md:
+        if "```" in markdown_text:
+            markdown_text = re.sub(
+                r"^```\s*(<!DOCTYPE html|<html)",
+                r"```html\n\1",
+                markdown_text,
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+        else:
+            idx_doc = lower_md.find("<!doctype html")
+            idx_html = lower_md.find("<html")
+            start_idx = idx_doc if idx_doc != -1 else idx_html
+            if idx_doc != -1 and idx_html != -1:
+                start_idx = min(idx_doc, idx_html)
+
+            prefix = markdown_text[:start_idx]
+            html_and_rest = markdown_text[start_idx:]
+            end_tag = "</html>"
+            idx_end = html_and_rest.lower().rfind(end_tag)
+            if idx_end != -1:
+                end_pos = idx_end + len(end_tag)
+                html_body = html_and_rest[:end_pos]
+                suffix = html_and_rest[end_pos:]
+                markdown_text = f"{prefix}```html\n{html_body}\n```{suffix}".strip()
+            else:
+                markdown_text = f"{prefix}```html\n{html_and_rest}\n```".strip()
+
+    # Clean <script> blocks
     def _clean_script_tag(match: re.Match) -> str:
         open_tag = match.group(1)
         body = match.group(2)
         close_tag = match.group(3)
         open_lower = open_tag.lower()
-        # Do not touch non-JS script blocks (e.g., application/json, importmap, ld+json, text/babel)
         if "type=" in open_lower and not any(
             js_t in open_lower
             for js_t in ("text/javascript", "application/javascript", "module")
@@ -2488,19 +2698,40 @@ def sanitize_and_validate_code_output(markdown_text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    if "```html" in sanitized.lower():
-        lower_san = sanitized.lower()
-        if "<html" in lower_san and "</html>" not in lower_san:
-            last_fence = sanitized.rfind("```")
-            if last_fence > lower_san.find("```html"):
-                sanitized = (
-                    sanitized[:last_fence] + "\n</html>\n" + sanitized[last_fence:]
-                )
-            else:
-                sanitized += "\n</html>\n```"
-        else:
-            if sanitized.count("```") % 2 != 0:
-                sanitized += "\n```"
+    # 7.5 Truncation Detection & Clean Closure
+    is_truncated = False
+    lower_san = sanitized.lower()
 
-    sanitized = normalize_text_and_whitespace(sanitized)
+    if ("<!doctype html" in lower_san or "<html" in lower_san) and "</html>" not in lower_san:
+        is_truncated = True
+
+    if sanitized.count("```") % 2 != 0:
+        is_truncated = True
+
+    scripts = re.findall(r"<script(?:\s+[^>]*)?>([\s\S]*?)(?:</script>|$)", sanitized, re.IGNORECASE)
+    for s in scripts:
+        if s.count("{") > s.count("}"):
+            is_truncated = True
+            break
+
+    if is_truncated:
+        if ("<!doctype html" in lower_san or "<html" in lower_san) and "</html>" not in sanitized.lower():
+            if sanitized.count("```") % 2 != 0:
+                sanitized = sanitized.rstrip() + "\n</html>\n```"
+            else:
+                sanitized = sanitized.rstrip() + "\n</html>"
+        elif sanitized.count("```") % 2 != 0:
+            sanitized = sanitized.rstrip() + "\n```"
+
+        if "[AIVCO-TRUNCATED]" not in sanitized:
+            sanitized = sanitized.rstrip() + "\n[AIVCO-TRUNCATED] Output looks cut off. Say 'continue' to finish it."
+    else:
+        if sanitized.count("```") % 2 != 0:
+            sanitized += "\n```"
+
+    # Prose normalization gate (7.3)
+    should_normalize = normalize_prose or ("```" not in markdown_text and "<script" not in markdown_text.lower())
+    if should_normalize:
+        sanitized = normalize_text_and_whitespace(sanitized)
+
     return sanitized
