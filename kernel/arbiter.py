@@ -5,7 +5,8 @@ Brain 4 Web AI (Claude/ChatGPT via Extension Bridge), or Tier 2/3 Fast API (Groq
 Runs in <5ms with 0-LLM token consumption.
 """
 
-from collections import deque
+from collections import deque, OrderedDict
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import difflib
 import json
@@ -246,6 +247,22 @@ HISTORY_EXCHANGES = 16
 HISTORY_MAX_CHARS = 30000
 REPLY_MAX_CHARS = 1500
 PROVIDER_EXCHANGE_OVERRIDE = {"groq": 8}
+INSTRUCTIONS_MAX = 2000
+PINS_MAX_ITEMS = 10
+RECAP_MAX = 800
+RAM_LOADED_CHATS = 20
+
+_current_chat_ctx: ContextVar[Optional[Tuple[Optional[str], bool, Optional[str]]]] = ContextVar("current_chat_ctx", default=None)
+
+
+def set_current_chat(chat_id: Optional[str], temporary: bool = False, project_id: Optional[str] = None) -> None:
+    """Binds the current execution context to a specific chat_id, temporary flag, and project_id."""
+    _current_chat_ctx.set((chat_id, temporary, project_id))
+
+
+def get_current_chat() -> Optional[Tuple[Optional[str], bool, Optional[str]]]:
+    """Returns the current bound chat context tuple (chat_id, temporary, project_id)."""
+    return _current_chat_ctx.get()
 
 
 # ── Session Attribution & Artifact Ledger ────────────────────────────────────
@@ -405,7 +422,89 @@ class SessionExecutionLedger:
         self._casual_recap: List[str] = []
         self._turn_counter: int = 0
         self._project_ledgers: Dict[str, Deque[SessionTurnRecord]] = {}
+        self._chat_lru: OrderedDict[str, Deque[SessionTurnRecord]] = OrderedDict()
+        self._temporary_turns: Deque[SessionTurnRecord] = deque(maxlen=50)
         self._projects_dir: Path = projects_dir or PROJECTS_DIR
+
+    def set_current_chat(self, chat_id: Optional[str], temporary: bool = False, project_id: Optional[str] = None) -> None:
+        set_current_chat(chat_id, temporary=temporary, project_id=project_id)
+
+    def get_current_chat(self) -> Optional[Tuple[Optional[str], bool, Optional[str]]]:
+        return get_current_chat()
+
+    def _resolve_active_ctx(
+        self,
+        mode: str = "casual",
+        project_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        temporary: Optional[bool] = None,
+    ) -> Tuple[Optional[str], bool, Optional[str]]:
+        ctx = _current_chat_ctx.get()
+        active_chat_id = chat_id or (ctx[0] if ctx else None)
+        active_temp = temporary if temporary is not None else (ctx[1] if ctx else False)
+        active_pid = project_id or (ctx[2] if ctx else None)
+        return active_chat_id, active_temp, active_pid
+
+    def _get_or_load_chat_turns(self, chat_id: str) -> Deque[SessionTurnRecord]:
+        safe_cid = chat_id.strip().lower()
+        if safe_cid in self._chat_lru:
+            self._chat_lru.move_to_end(safe_cid)
+            return self._chat_lru[safe_cid]
+
+        d: Deque[SessionTurnRecord] = deque(maxlen=50)
+        try:
+            from chat_store import chat_store
+            messages = chat_store.load_messages(safe_cid, limit=50)
+            for m in messages:
+                if m.get("type") == "context_reset":
+                    d.append(SessionTurnRecord(turn_id=0, prompt="", target_tier="", actual_provider="", response="[Context Reset]"))
+                elif "prompt" in m:
+                    d.append(SessionTurnRecord(
+                        turn_id=m.get("turn_id", 0),
+                        prompt=m.get("prompt", ""),
+                        target_tier=m.get("target_tier", "kernel"),
+                        actual_provider=m.get("actual_provider") or m.get("provider", "groq"),
+                        cascaded_from=m.get("cascaded_from"),
+                        has_html_artifact=bool(m.get("has_html", False)),
+                        html_code=m.get("html_code", ""),
+                        response=m.get("response", ""),
+                    ))
+        except Exception:
+            pass
+
+        if len(self._chat_lru) >= RAM_LOADED_CHATS:
+            self._chat_lru.popitem(last=False)
+        self._chat_lru[safe_cid] = d
+        return d
+
+    def _sync_chat_recap(self, chat_id: str) -> None:
+        try:
+            from chat_store import chat_store
+            safe_cid = chat_id.strip().lower()
+            all_msgs = chat_store.load_messages(safe_cid, limit=200)
+            reset_idx = -1
+            for idx, m in enumerate(all_msgs):
+                if m.get("type") == "context_reset":
+                    reset_idx = idx
+            active_msgs = all_msgs[reset_idx + 1:] if reset_idx >= 0 else all_msgs
+            turn_msgs = [m for m in active_msgs if "prompt" in m]
+            if len(turn_msgs) <= HISTORY_EXCHANGES:
+                chat_store.write_recap(safe_cid, [], covered_through_turn=0)
+                return
+
+            evicted = turn_msgs[:-HISTORY_EXCHANGES]
+            raw_lines: List[str] = []
+            for t in evicted:
+                p_text = (t.get("prompt") or "").strip()[:80].strip()
+                prov = t.get("provider") or t.get("actual_provider") or "groq"
+                app_flag = " [app built]" if t.get("has_html") else ""
+                raw_lines.append(f"{p_text} -> {prov}{app_flag}")
+
+            compressed = self._compress_recap_lines(raw_lines, max_chars=RECAP_MAX)
+            covered_turn = evicted[-1].get("turn_id", 0)
+            chat_store.write_recap(safe_cid, compressed, covered_through_turn=covered_turn)
+        except Exception:
+            pass
 
     def _sanitize_project_id(self, project_id: str) -> str:
         return sanitize_project_id(project_id)
@@ -631,6 +730,8 @@ class SessionExecutionLedger:
         response_markdown: str = "",
         mode: str = "casual",
         project_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        temporary: Optional[bool] = None,
     ) -> SessionTurnRecord:
         provider = (actual_provider or target_tier or "groq").strip().lower()
         if ":" in provider:
@@ -650,6 +751,87 @@ class SessionExecutionLedger:
             html_code = m.group(1).strip() if m else response_markdown.strip()
 
         with self._lock:
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(
+                mode=mode, project_id=project_id, chat_id=chat_id, temporary=temporary
+            )
+
+            # 1. Temporary Mode: purely in-memory
+            if active_temp:
+                self._turn_counter += 1
+                rec = SessionTurnRecord(
+                    turn_id=self._turn_counter,
+                    prompt=prompt,
+                    target_tier=target_tier,
+                    actual_provider=provider,
+                    cascaded_from=cascaded if cascaded != provider else None,
+                    has_html_artifact=has_html,
+                    html_code=html_code,
+                    response=response_markdown,
+                )
+                self._temporary_turns.append(rec)
+                return rec
+
+            # 2. Active Chat Mode: persisted via chat_store
+            if active_chat_id:
+                from chat_store import chat_store
+                safe_cid = active_chat_id.strip().lower()
+                d = self._get_or_load_chat_turns(safe_cid)
+                highest_turn = max([t.turn_id for t in d if t.turn_id > 0], default=0)
+                turn_id = highest_turn + 1
+                rec = SessionTurnRecord(
+                    turn_id=turn_id,
+                    prompt=prompt,
+                    target_tier=target_tier,
+                    actual_provider=provider,
+                    cascaded_from=cascaded if cascaded != provider else None,
+                    has_html_artifact=has_html,
+                    html_code=html_code,
+                    response=response_markdown,
+                )
+                d.append(rec)
+                self._chat_lru.move_to_end(safe_cid)
+
+                turn_payload = {
+                    "turn_id": turn_id,
+                    "ts": time.time(),
+                    "prompt": prompt,
+                    "response": response_markdown,
+                    "provider": provider,
+                    "target_tier": target_tier,
+                    "cascaded_from": cascaded if cascaded != provider else None,
+                    "has_html": has_html,
+                    "html_code": html_code,
+                }
+                chat_store.append_turn(safe_cid, turn_payload)
+
+                if has_html and html_code:
+                    chat_store.save_artifact(safe_cid, html_code, f"App updated on turn {turn_id} by {provider}")
+
+                if active_pid:
+                    try:
+                        safe_pid = sanitize_project_id(active_pid)
+                        m_pin = PIN_SHORTCUT_PATTERN.match(prompt.strip())
+                        if m_pin:
+                            chat_store.add_pin(safe_pid, m_pin.group(1).strip())
+                            try:
+                                self.pin(safe_pid, m_pin.group(1).strip())
+                            except Exception:
+                                pass
+                        proj_dir = self.get_project_dir(safe_pid)
+                        proj_dir.mkdir(parents=True, exist_ok=True)
+                        history_file = proj_dir / "chat_history.jsonl"
+                        with open(history_file, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(rec.to_dict()) + "\n")
+                        if has_html and html_code:
+                            (proj_dir / "last_app.html").write_text(html_code, encoding="utf-8")
+                            (proj_dir / "last_app_note.txt").write_text(f"App updated on turn {turn_id} by {provider}\n", encoding="utf-8")
+                    except Exception:
+                        pass
+
+                self._sync_chat_recap(safe_cid)
+                return rec
+
+            # 3. Fallback Legacy Mode (when no chat context is set)
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
                 safe_pid = self._sanitize_project_id(project_id)
@@ -714,16 +896,28 @@ class SessionExecutionLedger:
                 self._sync_casual_recap()
                 return rec
 
-    def get_last_turn(self, mode: str = "casual", project_id: Optional[str] = None) -> Optional[SessionTurnRecord]:
+    def get_last_turn(self, mode: str = "casual", project_id: Optional[str] = None, chat_id: Optional[str] = None) -> Optional[SessionTurnRecord]:
         with self._lock:
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(mode=mode, project_id=project_id, chat_id=chat_id)
+            if active_temp:
+                return self._temporary_turns[-1] if self._temporary_turns else None
+            if active_chat_id:
+                d = self._get_or_load_chat_turns(active_chat_id)
+                return d[-1] if d else None
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
                 turns = self._get_or_load_project_turns(project_id)
                 return turns[-1] if turns else None
             return self._casual_turns[-1] if self._casual_turns else (self._turns[-1] if self._turns else None)
 
-    def get_recent_turns(self, n: int = 3, mode: str = "casual", project_id: Optional[str] = None) -> List[SessionTurnRecord]:
+    def get_recent_turns(self, n: int = 3, mode: str = "casual", project_id: Optional[str] = None, chat_id: Optional[str] = None) -> List[SessionTurnRecord]:
         with self._lock:
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(mode=mode, project_id=project_id, chat_id=chat_id)
+            if active_temp:
+                return list(self._temporary_turns)[-n:]
+            if active_chat_id:
+                d = self._get_or_load_chat_turns(active_chat_id)
+                return list(d)[-n:]
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
                 turns = self._get_or_load_project_turns(project_id)
@@ -737,16 +931,23 @@ class SessionExecutionLedger:
         max_chars_per_turn: int = 500,
         mode: str = "casual",
         project_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ) -> str:
         """
         Returns a compact conversation history buffer of the last n turns
         to give Tier 2/3 stateless APIs short-term conversational continuity.
         """
         with self._lock:
-            if self._is_project_mode(mode, project_id):
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(mode=mode, project_id=project_id, chat_id=chat_id)
+            # Return empty string for saved/active chat_id or project mode sessions to prevent duplicate history injection
+            if active_chat_id or self._is_project_mode(mode, project_id) or active_pid:
                 return ""
 
-            turns_source = self._casual_turns if self._casual_turns else list(self._turns)
+            if active_temp:
+                turns_source = list(self._temporary_turns)
+            else:
+                turns_source = self._casual_turns if self._casual_turns else list(self._turns)
+
             turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
             if not turns:
                 return ""
@@ -773,6 +974,8 @@ class SessionExecutionLedger:
         mode: str = "casual",
         project_id: Optional[str] = None,
         provider: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        temporary: Optional[bool] = None,
     ) -> List[Dict[str, str]]:
         """
         Returns a list of {"role": "user", "content": ...} and {"role": "assistant", "content": ...}
@@ -793,6 +996,103 @@ class SessionExecutionLedger:
                         if part in PROVIDER_EXCHANGE_OVERRIDE:
                             effective_max_turns = PROVIDER_EXCHANGE_OVERRIDE[part]
                             break
+
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(
+                mode=mode, project_id=project_id, chat_id=chat_id, temporary=temporary
+            )
+
+            if active_temp:
+                candidate_turns = [t for t in self._temporary_turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-effective_max_turns:]
+                collected_pairs: List[List[Dict[str, str]]] = []
+                accumulated_chars = 0
+                for t in reversed(candidate_turns):
+                    u_text = t.prompt.strip()
+                    resp = (t.response or "").strip()
+                    if "<!doctype html" in resp.lower():
+                        resp = re.sub(r"```html[\s\S]*?```", "[Generated Single-File HTML Application]", resp, flags=re.IGNORECASE)
+                        resp = re.sub(r"<!DOCTYPE html[\s\S]*?</html>", "[Generated Single-File HTML Application]", resp, flags=re.IGNORECASE)
+                    if len(resp) > REPLY_MAX_CHARS:
+                        resp = resp[:REPLY_MAX_CHARS].rsplit(" ", 1)[0] + "..."
+
+                    turn_chars = len(u_text) + len(resp)
+                    if collected_pairs and (accumulated_chars + turn_chars > max_chars):
+                        break
+
+                    pair = [{"role": "user", "content": u_text}]
+                    if resp:
+                        pair.append({"role": "assistant", "content": resp})
+                    collected_pairs.append(pair)
+                    accumulated_chars += turn_chars
+
+                collected_pairs.reverse()
+                for pair in collected_pairs:
+                    messages.extend(pair)
+                return messages
+
+            if active_chat_id:
+                from chat_store import chat_store
+                safe_cid = active_chat_id.strip().lower()
+
+                # Prepend context pair if inside a project
+                if active_pid:
+                    safe_pid = sanitize_project_id(active_pid)
+                    instr = chat_store.read_instructions(safe_pid)
+                    pins_list = chat_store.list_pins(safe_pid)
+                    pins_text = "\n".join(f"- {p}" for p in pins_list)[:600] if pins_list else "(None)"
+                    recap_data = chat_store.read_recap(safe_cid)
+                    recap_lines = recap_data.get("lines", [])
+                    recap_text = "\n".join(f"- {r}" for r in recap_lines)[:RECAP_MAX] if recap_lines else "(None)"
+
+                    proj_context = (
+                        f"[PROJECT CONTEXT]\n"
+                        f"INSTRUCTIONS:\n{instr or '(None)'}\n\n"
+                        f"PINNED DECISIONS:\n{pins_text}\n\n"
+                        f"PROJECT RECAP:\n{recap_text}"
+                    )
+                    messages.append({"role": "user", "content": proj_context})
+                    messages.append({"role": "assistant", "content": "Understood."})
+                else:
+                    recap_data = chat_store.read_recap(safe_cid)
+                    recap_lines = recap_data.get("lines", [])
+                    if recap_lines:
+                        recap_text = "\n".join(f"- {r}" for r in recap_lines)[:RECAP_MAX]
+                        messages.append({"role": "user", "content": f"[RECAP]\n{recap_text}"})
+                        messages.append({"role": "assistant", "content": "Understood."})
+
+                chat_turns = self._get_or_load_chat_turns(safe_cid)
+                valid_turns: List[SessionTurnRecord] = []
+                for t in chat_turns:
+                    if t.response == "[Context Reset]" or t.turn_id == 0:
+                        valid_turns = []
+                    else:
+                        valid_turns.append(t)
+
+                candidate_turns = [t for t in valid_turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-effective_max_turns:]
+                collected_pairs = []
+                accumulated_chars = 0
+                for t in reversed(candidate_turns):
+                    u_text = t.prompt.strip()
+                    resp = (t.response or "").strip()
+                    if "<!doctype html" in resp.lower():
+                        resp = re.sub(r"```html[\s\S]*?```", "[Generated Single-File HTML Application]", resp, flags=re.IGNORECASE)
+                        resp = re.sub(r"<!DOCTYPE html[\s\S]*?</html>", "[Generated Single-File HTML Application]", resp, flags=re.IGNORECASE)
+                    if len(resp) > REPLY_MAX_CHARS:
+                        resp = resp[:REPLY_MAX_CHARS].rsplit(" ", 1)[0] + "..."
+
+                    turn_chars = len(u_text) + len(resp)
+                    if collected_pairs and (accumulated_chars + turn_chars > max_chars):
+                        break
+
+                    pair = [{"role": "user", "content": u_text}]
+                    if resp:
+                        pair.append({"role": "assistant", "content": resp})
+                    collected_pairs.append(pair)
+                    accumulated_chars += turn_chars
+
+                collected_pairs.reverse()
+                for pair in collected_pairs:
+                    messages.extend(pair)
+                return messages
 
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
@@ -828,7 +1128,7 @@ class SessionExecutionLedger:
                 turns_source = self._casual_turns if self._casual_turns else self._turns
 
             candidate_turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-effective_max_turns:]
-            collected_pairs: List[List[Dict[str, str]]] = []
+            collected_pairs = []
             accumulated_chars = 0
 
             for t in reversed(candidate_turns):
@@ -871,8 +1171,37 @@ class SessionExecutionLedger:
         self,
         mode: str = "casual",
         project_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ) -> Optional[SessionTurnRecord]:
         with self._lock:
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(mode=mode, project_id=project_id, chat_id=chat_id)
+            if active_temp:
+                for rec in reversed(self._temporary_turns):
+                    if rec.has_html_artifact and rec.html_code:
+                        return rec
+                return None
+
+            if active_chat_id:
+                from chat_store import chat_store
+                safe_cid = active_chat_id.strip().lower()
+                if safe_cid in self._chat_lru:
+                    for rec in reversed(self._chat_lru[safe_cid]):
+                        if rec.has_html_artifact and rec.html_code:
+                            return rec
+                art = chat_store.load_artifact(safe_cid)
+                if art:
+                    html, note = art
+                    return SessionTurnRecord(
+                        turn_id=0,
+                        prompt="[Chat Saved Artifact]",
+                        target_tier="chat",
+                        actual_provider="chat",
+                        has_html_artifact=True,
+                        html_code=html,
+                        response=html,
+                    )
+                return None
+
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
                 safe_pid = self._sanitize_project_id(project_id)
@@ -911,12 +1240,18 @@ class SessionExecutionLedger:
         query: str = "",
         mode: str = "casual",
         project_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ) -> str:
         last: Optional[SessionTurnRecord] = None
         with self._lock:
-            if self._is_project_mode(mode, project_id):
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(mode=mode, project_id=project_id, chat_id=chat_id)
+            if active_temp:
+                turns_source = list(self._temporary_turns)
+            elif active_chat_id:
+                turns_source = list(self._get_or_load_chat_turns(active_chat_id))
+            elif self._is_project_mode(mode, project_id):
                 assert project_id is not None
-                turns_source = self._get_or_load_project_turns(project_id)
+                turns_source = list(self._get_or_load_project_turns(project_id))
             else:
                 turns_source = self._casual_turns if self._casual_turns else self._turns
 
@@ -953,8 +1288,20 @@ class SessionExecutionLedger:
             f"For your previous request (`\"{last.prompt[:80]}\"`), AIVCO used **{friendly}**."
         )
 
-    def clear(self, mode: str = "casual", project_id: Optional[str] = None) -> None:
+    def clear(self, mode: str = "casual", project_id: Optional[str] = None, chat_id: Optional[str] = None) -> None:
         with self._lock:
+            active_chat_id, active_temp, active_pid = self._resolve_active_ctx(mode=mode, project_id=project_id, chat_id=chat_id)
+            if active_temp:
+                self._temporary_turns.clear()
+                return
+            if active_chat_id:
+                from chat_store import chat_store
+                safe_cid = active_chat_id.strip().lower()
+                chat_store.append_turn(safe_cid, {"type": "context_reset", "ts": time.time()})
+                if safe_cid in self._chat_lru:
+                    self._chat_lru[safe_cid].clear()
+                return
+
             if self._is_project_mode(mode, project_id):
                 assert project_id is not None
                 safe_pid = self._sanitize_project_id(project_id)

@@ -88,7 +88,11 @@ app = FastAPI(title="AIVCO GUI Bridge — Argon Edition", version="2.0")
 # Enable CORS for localhost and frontend origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ],
+    allow_origin_regex=r"^(chrome-extension://.*|http://localhost:\d+|http://127\.0\.0\.1:\d+)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,6 +109,24 @@ class ChatRequest(BaseModel):
     attachments: Optional[List[Dict[str, Any]]] = None
     mode: str = "casual"
     project_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    temporary: bool = False
+
+
+class ChatCreateRequest(BaseModel):
+    project_id: Optional[str] = None
+
+
+class ChatRenameRequest(BaseModel):
+    title: str
+
+
+class ChatStarRequest(BaseModel):
+    starred: bool
+
+
+class ProjectInstructionsRequest(BaseModel):
+    instructions: str
 
 
 class DatasetApproveRequest(BaseModel):
@@ -460,7 +482,7 @@ def _cascaded_from(initial_tier: Optional[str], actual: str, excluded: Tuple = (
 def _reply(plan: Dict[str, Any], t0: float, response: str, provider: str, src: str,
            tier: int, *, web_searched: bool = False, min_lat: int = 1) -> Dict[str, Any]:
     """Builds the standard /api/chat JSON response shape."""
-    return {
+    res = {
         "response": response,
         "src": src,
         "provider": provider,
@@ -469,6 +491,16 @@ def _reply(plan: Dict[str, Any], t0: float, response: str, provider: str, src: s
         "web_searched": web_searched,
         "handshake": plan["handshake"],
     }
+    if "chat_id" in plan and plan["chat_id"]:
+        res["chat_id"] = plan["chat_id"]
+    if "title" in plan and plan["title"]:
+        res["title"] = plan["title"]
+    elif plan.get("chat_id"):
+        from chat_store import chat_store
+        meta = chat_store.get_chat(plan["chat_id"])
+        if meta:
+            res["title"] = meta.get("title", "New Chat")
+    return res
 
 
 def finish_turn(
@@ -486,11 +518,23 @@ def finish_turn(
     health_provider: Optional[str] = None,
     mode: str = "casual",
     project_id: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    temporary: bool = False,
 ) -> None:
     """Single place for end-of-turn bookkeeping: health, learning, ledger, dataset."""
+    ctx = session_ledger.get_current_chat()
+    if ctx:
+        if chat_id is None:
+            chat_id = ctx[0]
+        if not temporary:
+            temporary = ctx[1]
+        if not project_id:
+            project_id = ctx[2]
+
     if health_ms is not None:
         provider_health.record_success(health_provider or actual_provider, health_ms)
-    learn_from_turn(raw_prompt, response, tiered_memory)
+    if not temporary:
+        learn_from_turn(raw_prompt, response, tiered_memory)
     session_ledger.record_turn(
         prompt=ledger_prompt,
         target_tier=target_tier,
@@ -499,14 +543,17 @@ def finish_turn(
         response_markdown=response,
         mode=mode,
         project_id=project_id,
+        chat_id=chat_id,
+        temporary=temporary,
     )
-    dataset_logger.log(
-        source=source,
-        task_type=task_type,
-        system_content=system_content,
-        user_content=raw_prompt,
-        assistant_content=response,
-    )
+    if not temporary:
+        dataset_logger.log(
+            source=source,
+            task_type=task_type,
+            system_content=system_content,
+            user_content=raw_prompt,
+            assistant_content=response,
+        )
 
 
 def _label_llm_provider(provider: str) -> Tuple[int, str]:
@@ -538,10 +585,12 @@ def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
     """
     is_auto_mode = req.target_model in ("auto", "AUTO (Arbiter)", None)
     ext_connected = universal_web_agent.is_connected()
+    is_temp = bool(getattr(req, "temporary", False))
     target_tier, handshake_msg = KernelCognitiveArbiter.arbitrate(
         raw_prompt,
         target_override=None if is_auto_mode else (req.target_model or active_model_override),
         extension_connected=ext_connected,
+        log_telemetry=False if is_temp else True,
     )
     if handshake_msg:
         print(f"[KernelCognitiveArbiter] Arbitrated '{raw_prompt[:40]}' -> Tier: {target_tier} | Handshake: {handshake_msg}")
@@ -565,6 +614,8 @@ def build_plan(req: ChatRequest, raw_prompt: str) -> Dict[str, Any]:
         "initial_tier": target_tier,
         "mode": mode,
         "project_id": project_id,
+        "chat_id": getattr(req, "chat_id", None),
+        "temporary": is_temp,
     }
 
     def plan(action: str, **kw) -> Dict[str, Any]:
@@ -1159,6 +1210,25 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
     if not raw_prompt:
         raise HTTPException(status_code=400, detail="Empty prompt provided.")
 
+    chat_id = req.chat_id.strip() if req.chat_id else None
+    project_id = req.project_id.strip() if req.project_id else None
+    is_temporary = bool(req.temporary)
+
+    from chat_store import chat_store
+    chat_title = "Temporary Chat" if is_temporary else "New Chat"
+    if not is_temporary and not chat_id:
+        new_chat = chat_store.create_chat(project_id=project_id)
+        chat_id = new_chat["id"]
+        chat_title = new_chat.get("title", "New Chat")
+    elif chat_id and not is_temporary:
+        meta = chat_store.get_chat(chat_id)
+        if meta:
+            chat_title = meta.get("title", "New Chat")
+            if not project_id and meta.get("project_id"):
+                project_id = meta.get("project_id")
+
+    session_ledger.set_current_chat(chat_id, temporary=is_temporary, project_id=project_id)
+
     # Unpack attachments if present
     if req.attachments:
         attachment_text = ""
@@ -1171,7 +1241,23 @@ async def post_chat(req: ChatRequest) -> Dict[str, Any]:
 
     t0 = time.time()
     plan = build_plan(req, raw_prompt)
-    return await execute_plan(plan, raw_prompt, t0)
+    plan["chat_id"] = chat_id
+    plan["project_id"] = project_id
+    plan["temporary"] = is_temporary
+    plan["title"] = chat_title
+
+    res = await execute_plan(plan, raw_prompt, t0)
+    # Refresh title after auto-titling if applicable
+    if chat_id and not is_temporary:
+        updated_meta = chat_store.get_chat(chat_id)
+        if updated_meta:
+            res["title"] = updated_meta.get("title", chat_title)
+    if "chat_id" not in res:
+        res["chat_id"] = chat_id
+    if "title" not in res:
+        res["title"] = chat_title
+
+    return res
 
 
 # --- Native Chrome Extension Bridge (WebSocket & REST) ---
@@ -1545,3 +1631,91 @@ def approve_dataset(req: DatasetApproveRequest) -> Dict[str, Any]:
         assistant_content=req.response,
     )
     return {"ok": True, "total": dataset_logger.stats()["total_entries"]}
+
+
+# ── Multi-Chat Persistence Engine REST Endpoints ─────────────────────────────
+
+@app.get("/api/chats")
+def list_chats_endpoint(project_id: Optional[str] = None, q: Optional[str] = None) -> Dict[str, Any]:
+    """Lists chats metadata for graph visualization and session switching."""
+    from chat_store import chat_store
+    chats = chat_store.list_chats(project_id=project_id, q=q)
+    return {"ok": True, "chats": chats}
+
+
+@app.get("/api/chats/search")
+def search_chats_endpoint(q: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+    """Search messages and titles with ~100-character snippets. Declared before {chat_id}."""
+    from chat_store import chat_store
+    results = chat_store.search(q=q, project_id=project_id)
+    return {"ok": True, "results": results}
+
+
+@app.post("/api/chats/new")
+def new_chat_endpoint(req: Optional[ChatCreateRequest] = None) -> Dict[str, Any]:
+    """Creates a new persistent chat with a server-generated UUID."""
+    from chat_store import chat_store
+    pid = req.project_id if req else None
+    meta = chat_store.create_chat(project_id=pid)
+    return {"ok": True, **meta}
+
+
+@app.get("/api/chats/{chat_id}")
+def get_chat_endpoint(chat_id: str) -> Dict[str, Any]:
+    """Retrieves chat metadata and recent messages for restoring conversations."""
+    from chat_store import chat_store
+    try:
+        meta = chat_store.get_chat(chat_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        messages = chat_store.load_messages(chat_id)
+        return {"ok": True, "meta": meta, "messages": messages}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/chats/{chat_id}/rename")
+def rename_chat_endpoint(chat_id: str, req: ChatRenameRequest) -> Dict[str, Any]:
+    """Renames chat and locks manual title flag."""
+    from chat_store import chat_store
+    try:
+        meta = chat_store.rename_chat(chat_id, req.title)
+        return {"ok": True, "meta": meta}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/chats/{chat_id}/star")
+def star_chat_endpoint(chat_id: str, req: ChatStarRequest) -> Dict[str, Any]:
+    """Stars or unstars a chat."""
+    from chat_store import chat_store
+    try:
+        meta = chat_store.set_star(chat_id, req.starred)
+        return {"ok": True, "meta": meta}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/chats/{chat_id}")
+def delete_chat_endpoint(chat_id: str) -> Dict[str, Any]:
+    """Deletes a chat folder from disk."""
+    from chat_store import chat_store
+    try:
+        ok = chat_store.delete_chat(chat_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        return {"ok": True, "deleted": chat_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/instructions")
+def set_project_instructions_endpoint(project_id: str, req: ProjectInstructionsRequest) -> Dict[str, Any]:
+    """Sets project instructions and system context."""
+    from chat_store import chat_store
+    try:
+        safe_pid = sanitize_project_id(project_id)
+        text = chat_store.write_instructions(safe_pid, req.instructions)
+        return {"ok": True, "project_id": safe_pid, "instructions": text}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

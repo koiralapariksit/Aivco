@@ -621,6 +621,17 @@
         }
       });
 
+      // Multi-Chat Persistence & Temporary Mode State
+      const [activeChatId, setActiveChatId] = useState(() => {
+        try {
+          return localStorage.getItem('aivco_active_chat_id') || null;
+        } catch (_) {
+          return null;
+        }
+      });
+      const [isTemporary, setIsTemporary] = useState(false);
+      const [activeChatTitle, setActiveChatTitle] = useState('New Chat');
+
       const [activeProjectId, setActiveProjectId] = useState(() => {
         try {
           return localStorage.getItem('aivco_active_project_id') || 'aivco';
@@ -696,6 +707,16 @@
 
       useEffect(() => {
         window.showToast = showToast;
+      }, [showToast]);
+
+      const handleNewChat = useCallback(() => {
+        setMessages([]);
+        setActiveChatId(null);
+        setActiveChatTitle('New Chat');
+        try {
+          localStorage.removeItem('aivco_active_chat_id');
+        } catch (_) {}
+        showToast('Started new conversation session', 'info', 2000);
       }, [showToast]);
 
       const fetchVaultStatus = async () => {
@@ -1003,7 +1024,9 @@
               auto_route: modelTarget === 'auto',
               attachments: attachments.map(a => ({ name: a.name, content: a.content })),
               mode: chatMode,
-              project_id: chatMode === 'project' ? (activeProjectId || null) : null
+              project_id: chatMode === 'project' ? (activeProjectId || null) : null,
+              chat_id: isTemporary ? null : activeChatId,
+              temporary: isTemporary
             })
           });
 
@@ -1011,6 +1034,16 @@
 
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
+
+          if (data.chat_id && !isTemporary) {
+            setActiveChatId(data.chat_id);
+            try {
+              localStorage.setItem('aivco_active_chat_id', data.chat_id);
+            } catch (_) {}
+          }
+          if (data.title) {
+            setActiveChatTitle(data.title);
+          }
 
           const botMsg = {
             id: Date.now() + 1,
@@ -1376,6 +1409,16 @@
 
               {/* Glassmorphic Mode Switcher */}
               <div className="flex items-center gap-1.5 bg-slate-900/90 border border-border/80 rounded-lg p-0.5 shadow-inner backdrop-blur-md">
+                <button
+                  type="button"
+                  onClick={handleNewChat}
+                  className="px-2 py-1 rounded bg-slate-950/80 border border-slate-800 text-slate-300 hover:text-argon hover:border-argon/50 transition-all text-[11px] font-bold cursor-pointer flex items-center gap-1"
+                  title="Start a New Conversation Session"
+                >
+                  <span className="text-argon font-bold">+</span>
+                  <span className="hidden sm:inline">New Chat</span>
+                </button>
+
                 <div className="flex items-center rounded bg-slate-950/80 p-0.5 border border-slate-800">
                   <button
                     type="button"
@@ -1402,6 +1445,25 @@
                   >
                     <span>📁</span>
                     <span>Project</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsTemporary(t => {
+                        const next = !t;
+                        showToast(next ? "Temporary Mode Active: Zero Disk Footprint" : "Temporary Mode Disabled", "info", 2500);
+                        return next;
+                      });
+                    }}
+                    className={`px-2 py-1 rounded text-[11px] font-bold transition-all flex items-center gap-1 cursor-pointer border ${
+                      isTemporary
+                        ? 'bg-rose-500/20 text-rose-300 border-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.3)] animate-pulse'
+                        : 'border-transparent text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Temporary Mode: Pure in-memory session, writes nothing to disk"
+                  >
+                    <span>🕶️</span>
+                    <span className="hidden sm:inline">Temporary</span>
                   </button>
                 </div>
 

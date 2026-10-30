@@ -28,6 +28,12 @@ from kernel.arbiter import (
     HISTORY_MAX_CHARS,
     REPLY_MAX_CHARS,
     PROVIDER_EXCHANGE_OVERRIDE,
+    INSTRUCTIONS_MAX,
+    PINS_MAX_ITEMS,
+    RECAP_MAX,
+    RAM_LOADED_CHATS,
+    set_current_chat,
+    get_current_chat,
 )
 from kernel import arbiter
 from kernel import cognitive_kernel
@@ -57,6 +63,12 @@ __all__ = [
     "HISTORY_MAX_CHARS",
     "REPLY_MAX_CHARS",
     "PROVIDER_EXCHANGE_OVERRIDE",
+    "INSTRUCTIONS_MAX",
+    "PINS_MAX_ITEMS",
+    "RECAP_MAX",
+    "RAM_LOADED_CHATS",
+    "set_current_chat",
+    "get_current_chat",
     "arbiter",
     "cognitive_kernel",
 ]

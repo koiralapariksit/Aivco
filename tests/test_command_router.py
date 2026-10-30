@@ -1856,3 +1856,378 @@ def test_casual_mode_in_memory_recap(tmp_path):
     assert ledger.get_casual_recap_entries() == []
     assert len(ledger.get_chat_history_messages(mode="casual")) == 0
 
+
+def test_chat_store_crud_and_auto_title(tmp_path):
+    from chat_store import ChatStore
+
+    store = ChatStore(chats_dir=tmp_path / "chats", projects_dir=tmp_path / "projects")
+
+    # 1. Create chat
+    meta = store.create_chat()
+    chat_id = meta["id"]
+    assert len(chat_id) == 32
+    assert meta["title"] == "New Chat"
+    assert meta["starred"] is False
+    assert meta["title_is_manual"] is False
+
+    # 2. Append first turn with file attachment header -> triggers deterministic auto-title
+    prompt = "[Attached File: test.py]\n```\nprint('hello')\n```\nBuild a comprehensive real-time dashboard for metrics monitoring"
+    turn = store.append_turn(chat_id, {
+        "turn_id": 1,
+        "prompt": prompt,
+        "response": "Here is the dashboard.",
+        "provider": "groq",
+        "has_html": True,
+        "html_code": "<html>Dashboard</html>",
+    })
+    assert turn["turn_id"] == 1
+
+    updated_meta = store.get_chat(chat_id)
+    assert updated_meta is not None
+    # Auto-title should strip attachment block, collapse whitespace, cut to 40 chars at word boundary, append '…'
+    assert updated_meta["title_is_manual"] is False
+    assert updated_meta["title"] == "Build a comprehensive real-time…"
+    assert len(updated_meta["title"]) <= 42
+
+    # 3. Rename chat (sets title_is_manual = True)
+    renamed = store.rename_chat(chat_id, "Custom Architecture Plan")
+    assert renamed["title"] == "Custom Architecture Plan"
+    assert renamed["title_is_manual"] is True
+
+    # 4. Set star
+    starred = store.set_star(chat_id, True)
+    assert starred["starred"] is True
+
+    # 5. List chats
+    chats = store.list_chats()
+    assert len(chats) == 1
+    assert chats[0]["id"] == chat_id
+    assert chats[0]["title"] == "Custom Architecture Plan"
+    assert chats[0]["starred"] is True
+
+    # 6. Delete chat
+    assert store.delete_chat(chat_id) is True
+    assert store.get_chat(chat_id) is None
+    assert len(store.list_chats()) == 0
+
+
+def test_chat_store_search_and_corrupt_recovery(tmp_path):
+    from chat_store import ChatStore
+
+    store = ChatStore(chats_dir=tmp_path / "chats", projects_dir=tmp_path / "projects")
+
+    chat1 = store.create_chat(project_id="alpha")
+    cid1 = chat1["id"]
+    store.rename_chat(cid1, "Quantum Algorithm Implementation")
+    store.append_turn(cid1, {
+        "turn_id": 1,
+        "prompt": "Explain Shor's algorithm for prime factorization",
+        "response": "Shor's algorithm uses quantum Fourier transform.",
+        "provider": "claude",
+    })
+
+    chat2 = store.create_chat()
+    cid2 = chat2["id"]
+    store.rename_chat(cid2, "Rust Microservice Architecture")
+    store.append_turn(cid2, {
+        "turn_id": 1,
+        "prompt": "How to handle zero-copy deserialization in Serde?",
+        "response": "Use borrow lifetimes with serde::Deserialize.",
+        "provider": "groq",
+    })
+
+    # 1. Search title match
+    res_title = store.search("Quantum")
+    assert len(res_title) == 1
+    assert res_title[0]["chat_id"] == cid1
+    assert res_title[0]["match_type"] == "title"
+    assert "Quantum" in res_title[0]["snippet"]
+
+    # 2. Search message body match
+    res_msg = store.search("deserialization")
+    assert len(res_msg) == 1
+    assert res_msg[0]["chat_id"] == cid2
+    assert res_msg[0]["match_type"] == "message"
+    assert "deserialization" in res_msg[0]["snippet"]
+
+    # 3. Project filter search
+    assert len(store.search("Quantum", project_id="beta")) == 0
+    assert len(store.search("Quantum", project_id="alpha")) == 1
+
+    # 4. Corrupt line recovery: inject bad JSON into messages.jsonl
+    msg_path = store.get_chat_dir(cid1) / "messages.jsonl"
+    with open(msg_path, "a", encoding="utf-8") as f:
+        f.write("CORRUPT_JSON_DATA_###\n")
+        f.write(json.dumps({"turn_id": 2, "prompt": "Follow up question", "response": "Valid answer"}) + "\n")
+
+    loaded = store.load_messages(cid1)
+    assert len(loaded) == 2
+    assert loaded[0]["turn_id"] == 1
+    assert loaded[1]["turn_id"] == 2
+
+
+def test_chat_store_path_traversal_guards(tmp_path):
+    import pytest
+    from chat_store import ChatStore, sanitize_project_id, validate_chat_id
+
+    store = ChatStore(chats_dir=tmp_path / "chats", projects_dir=tmp_path / "projects")
+
+    # 1. Project ID traversal
+    with pytest.raises(ValueError):
+        sanitize_project_id("../../etc/passwd")
+    with pytest.raises(ValueError):
+        sanitize_project_id("invalid/name")
+    with pytest.raises(ValueError):
+        sanitize_project_id("..\\windows\\system32")
+
+    # 2. Chat ID invalid formats
+    with pytest.raises(ValueError):
+        validate_chat_id("../../../secret")
+    with pytest.raises(ValueError):
+        validate_chat_id("short-id")
+    with pytest.raises(ValueError):
+        validate_chat_id("g" * 32)  # Non-hex character
+
+    # Valid chat id
+    valid_id = "a" * 32
+    assert validate_chat_id(valid_id) == valid_id
+
+
+def test_chat_store_project_and_pins(tmp_path):
+    from chat_store import ChatStore
+
+    store = ChatStore(chats_dir=tmp_path / "chats", projects_dir=tmp_path / "projects")
+    pid = "infra-core"
+
+    # Create project
+    proj = store.create_project(pid, instructions="Always enforce strict idempotency and SSL verification.")
+    assert proj["project_id"] == pid
+
+    # Read instructions
+    assert "strict idempotency" in store.read_instructions(pid)
+
+    # Write instructions
+    store.write_instructions(pid, "Updated directives: use Python 3.12+ and Pydantic V2.")
+    assert "Pydantic V2" in store.read_instructions(pid)
+
+    # Add pins (max 10)
+    for i in range(1, 15):
+        store.add_pin(pid, f"Decision {i}: architecture rule {i}")
+
+    pins = store.list_pins(pid)
+    assert len(pins) == 10
+    assert pins[0] == "Decision 1: architecture rule 1"
+
+    # Remove pin
+    store.remove_pin(pid, 0)
+    pins_after = store.list_pins(pid)
+    assert len(pins_after) == 9
+    assert pins_after[0] == "Decision 2: architecture rule 2"
+
+
+def test_session_ledger_multi_chat_contextvar_isolation(tmp_path):
+    from kernel.arbiter import SessionExecutionLedger, set_current_chat
+    from chat_store import ChatStore
+    import chat_store as cs_module
+
+    test_chats = tmp_path / "chats"
+    test_projects = tmp_path / "projects"
+    store = ChatStore(chats_dir=test_chats, projects_dir=test_projects)
+    old_store = cs_module.chat_store
+    cs_module.chat_store = store
+
+    try:
+        chat_a = store.create_chat()
+        chat_b = store.create_chat()
+        cid_a = chat_a["id"]
+        cid_b = chat_b["id"]
+
+        ledger = SessionExecutionLedger(projects_dir=test_projects)
+
+        # Turn in Chat A
+        set_current_chat(cid_a, temporary=False)
+        ledger.record_turn(
+            prompt="Design microservice A",
+            target_tier="kernel",
+            actual_provider="groq",
+            response_markdown="Service A design ready",
+        )
+
+        # Turn in Chat B
+        set_current_chat(cid_b, temporary=False)
+        ledger.record_turn(
+            prompt="Design microservice B",
+            target_tier="kernel",
+            actual_provider="claude",
+            response_markdown="Service B design ready",
+        )
+
+        # Verify Chat A history does not contain Chat B turns
+        set_current_chat(cid_a, temporary=False)
+        msgs_a = ledger.get_chat_history_messages()
+        assert len(msgs_a) == 2
+        assert msgs_a[0]["content"] == "Design microservice A"
+        assert msgs_a[1]["content"] == "Service A design ready"
+        assert not any("microservice B" in m["content"] for m in msgs_a)
+
+        # Verify Chat B history does not contain Chat A turns
+        set_current_chat(cid_b, temporary=False)
+        msgs_b = ledger.get_chat_history_messages()
+        assert len(msgs_b) == 2
+        assert msgs_b[0]["content"] == "Design microservice B"
+        assert msgs_b[1]["content"] == "Service B design ready"
+        assert not any("microservice A" in m["content"] for m in msgs_b)
+
+        # Clean up ContextVar
+        set_current_chat(None)
+    finally:
+        cs_module.chat_store = old_store
+
+
+def test_session_ledger_context_reset_and_newest_first_truncation(tmp_path):
+    from kernel.arbiter import SessionExecutionLedger, set_current_chat
+    from chat_store import ChatStore
+    import chat_store as cs_module
+
+    test_chats = tmp_path / "chats"
+    test_projects = tmp_path / "projects"
+    store = ChatStore(chats_dir=test_chats, projects_dir=test_projects)
+    old_store = cs_module.chat_store
+    cs_module.chat_store = store
+
+    try:
+        chat = store.create_chat()
+        cid = chat["id"]
+
+        ledger = SessionExecutionLedger(projects_dir=test_projects)
+        set_current_chat(cid, temporary=False)
+
+        # 1. Record 2 turns
+        ledger.record_turn(prompt="Prompt 1", target_tier="kernel", actual_provider="groq", response_markdown="Response 1")
+        ledger.record_turn(prompt="Prompt 2", target_tier="kernel", actual_provider="groq", response_markdown="Response 2")
+        assert len(ledger.get_chat_history_messages()) == 4
+
+        # 2. Context reset (clear)
+        ledger.clear()
+
+        # History after reset must be empty
+        assert len(ledger.get_chat_history_messages()) == 0
+
+        # 3. Turns after reset are returned, while turns before reset remain on disk
+        ledger.record_turn(prompt="Prompt 3", target_tier="kernel", actual_provider="groq", response_markdown="Response 3")
+        msgs = ledger.get_chat_history_messages()
+        assert len(msgs) == 2
+        assert msgs[0]["content"] == "Prompt 3"
+
+        # Verify disk holds all messages including the context_reset marker
+        all_msgs = store.load_messages(cid)
+        assert len(all_msgs) == 4
+        assert any(m.get("type") == "context_reset" for m in all_msgs)
+
+        # Clean up ContextVar
+        set_current_chat(None)
+    finally:
+        cs_module.chat_store = old_store
+
+
+def test_temporary_mode_zero_disk_footprint(tmp_path, monkeypatch):
+    from kernel.arbiter import SessionExecutionLedger, set_current_chat
+    import chat_store
+
+    test_chats = tmp_path / "chats"
+    test_projects = tmp_path / "projects"
+    monkeypatch.setattr(chat_store, "CHATS_DIR", test_chats)
+    monkeypatch.setattr(chat_store, "PROJECTS_DIR", test_projects)
+
+    ledger = SessionExecutionLedger(projects_dir=test_projects)
+    set_current_chat(chat_id=None, temporary=True)
+
+    # Record 5 turns in temporary mode
+    for i in range(1, 6):
+        ledger.record_turn(
+            prompt=f"Secret prompt {i}",
+            target_tier="kernel",
+            actual_provider="groq",
+            response_markdown=f"Secret answer {i}",
+        )
+
+    # Chat history returned from in-memory RAM
+    msgs = ledger.get_chat_history_messages()
+    assert len(msgs) == 10
+    assert msgs[0]["content"] == "Secret prompt 1"
+    assert msgs[-2]["content"] == "Secret prompt 5"
+
+    # STRICT REQUIREMENT: Verify ZERO disk files created under test_chats or test_projects
+    assert not test_chats.exists() or len(list(test_chats.iterdir())) == 0
+    assert not test_projects.exists() or len(list(test_projects.iterdir())) == 0
+
+    # Clear resets ephemeral temporary buffer
+    ledger.clear()
+    assert len(ledger.get_chat_history_messages()) == 0
+
+    set_current_chat(None)
+
+
+@pytest.mark.anyio
+async def test_fastapi_chat_and_project_endpoints(tmp_path, monkeypatch):
+    import chat_store
+    from server.app import (
+        new_chat_endpoint,
+        list_chats_endpoint,
+        rename_chat_endpoint,
+        star_chat_endpoint,
+        search_chats_endpoint,
+        get_chat_endpoint,
+        delete_chat_endpoint,
+        set_project_instructions_endpoint,
+        ChatCreateRequest,
+        ChatRenameRequest,
+        ChatStarRequest,
+        ProjectInstructionsRequest,
+    )
+    from fastapi import HTTPException
+
+    test_chats = tmp_path / "server_chats"
+    test_projects = tmp_path / "server_projects"
+    custom_store = chat_store.ChatStore(chats_dir=test_chats, projects_dir=test_projects)
+    monkeypatch.setattr(chat_store, "chat_store", custom_store)
+
+    # 1. POST /api/chats/new
+    res_new = new_chat_endpoint(ChatCreateRequest())
+    assert res_new["ok"] is True
+    chat_id = res_new["id"]
+    assert len(chat_id) == 32
+
+    # 2. GET /api/chats
+    res_list = list_chats_endpoint()
+    assert any(c["id"] == chat_id for c in res_list["chats"])
+
+    # 3. POST /api/chats/{chat_id}/rename
+    res_rename = rename_chat_endpoint(chat_id, ChatRenameRequest(title="FastAPI Master Test"))
+    assert res_rename["meta"]["title"] == "FastAPI Master Test"
+
+    # 4. POST /api/chats/{chat_id}/star
+    res_star = star_chat_endpoint(chat_id, ChatStarRequest(starred=True))
+    assert res_star["meta"]["starred"] is True
+
+    # 5. GET /api/chats/search
+    res_search = search_chats_endpoint(q="Master")
+    assert len(res_search["results"]) >= 1
+
+    # 6. GET /api/chats/{chat_id}
+    res_get = get_chat_endpoint(chat_id)
+    assert res_get["meta"]["title"] == "FastAPI Master Test"
+
+    # 7. POST /api/projects/{project_id}/instructions
+    res_instr = set_project_instructions_endpoint("my-proj", ProjectInstructionsRequest(instructions="Zero latency mandate"))
+    assert res_instr["instructions"] == "Zero latency mandate"
+
+    # 8. DELETE /api/chats/{chat_id}
+    res_del = delete_chat_endpoint(chat_id)
+    assert res_del["ok"] is True
+    with pytest.raises(HTTPException) as exc_info:
+        get_chat_endpoint(chat_id)
+    assert exc_info.value.status_code == 404
+
+
+
