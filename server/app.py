@@ -1807,24 +1807,55 @@ async def get_memory_graph():
 
     # 3. Read Real Projects from chat_store / data/projects/ / MultiLayerMemory
     all_chats = chat_store.list_chats()
-    project_ids = set()
+    
+    def resolve_project_key(p: Optional[str]) -> Optional[str]:
+        if not p:
+            return None
+        clean = re.sub(r"^proj[-_]", "", str(p).strip().lower())
+        alias_map = {
+            "cipher": "cipher-charades",
+            "nepsent": "nepsent-engine",
+            "ingredients_insights": "ingredient-insight",
+            "ingredients-insights": "ingredient-insight",
+            "ingredient_insights": "ingredient-insight",
+            "ingredient-insights": "ingredient-insight",
+            "omega_project": "omega-project",
+            "pin_project": "pin-project",
+        }
+        return alias_map.get(clean, clean)
+
+    raw_project_ids = set()
     for c in all_chats:
-        if c.get("project_id"):
-            project_ids.add(c["project_id"])
+        p = c.get("project_id")
+        if p:
+            resolved = resolve_project_key(p)
+            if resolved:
+                raw_project_ids.add(resolved)
 
     projects_dir = chat_store.get_projects_dir()
     if projects_dir.exists():
         for p in projects_dir.iterdir():
             if p.is_dir() and not p.name.startswith("."):
-                project_ids.add(p.name)
+                resolved = resolve_project_key(p.name)
+                if resolved:
+                    raw_project_ids.add(resolved)
 
     mem_projects = getattr(mem, "projects", {}) if mem else {}
     if isinstance(mem_projects, dict):
         for pid in mem_projects.keys():
-            project_ids.add(pid)
+            resolved = resolve_project_key(pid)
+            if resolved:
+                raw_project_ids.add(resolved)
 
-    for pid in sorted(project_ids):
+    # Always ensure baseline core hubs exist if mentioned in memory or specs
+    for expected in ["aivco", "cipher-charades", "nepsent-engine", "ingredient-insight", "omega-project", "pin-project"]:
+        if isinstance(mem_projects, dict) and expected in mem_projects:
+            raw_project_ids.add(expected)
+
+    project_node_ids = set()
+    for pid in sorted(raw_project_ids):
         proj_node_id = f"proj_{pid}"
+        project_node_ids.add(proj_node_id)
         instr = chat_store.read_instructions(pid)
         pins = chat_store.list_pins(pid)
 
@@ -1859,8 +1890,30 @@ async def get_memory_graph():
         })
         links.append({"source": "trunk_projects", "target": proj_node_id})
 
-    # 4. Read Live Chats and attach to Projects or Casual Trunk
+    # 4. Filter empty/phantom test chats and attach strictly to resolved project or casual trunk
+    filtered_chats = []
+    seen_chat_sigs = set()
     for c in all_chats:
+        cid = c.get("id")
+        if not cid:
+            continue
+        starred = bool(c.get("starred", False))
+        turns = c.get("turn_count", 0)
+        title = (c.get("title") or "Untitled Session").strip()
+        raw_pid = c.get("project_id")
+
+        # Filter empty phantom non-starred chats with default titles
+        if turns == 0 and not starred and title in ("New Chat", "Untitled Session", "Untitled Chat", ""):
+            continue
+
+        # Deduplicate repeated identical unstarred titles under the same project
+        sig = (raw_pid, title.lower())
+        if not starred and sig in seen_chat_sigs:
+            continue
+        seen_chat_sigs.add(sig)
+        filtered_chats.append(c)
+
+    for c in filtered_chats:
         cid = c["id"]
         pid = c.get("project_id")
         starred = bool(c.get("starred", False))
@@ -1873,16 +1926,12 @@ async def get_memory_graph():
                 has_recap = False
         title = c.get("title") or "Untitled Session"
 
-        matched_pid = None
-        if pid:
-            for known_pid in project_ids:
-                if pid == known_pid or pid == f"proj_{known_pid}":
-                    matched_pid = known_pid
-                    break
+        matched_pid = resolve_project_key(pid) if pid else None
+        target_proj_node = f"proj_{matched_pid}" if matched_pid else None
 
-        if matched_pid:
+        if target_proj_node and target_proj_node in project_node_ids:
             node_type = "chat"
-            parent_id = f"proj_{matched_pid}"
+            parent_id = target_proj_node
             color = "#fbbf24" if starred else "#38bdf8"
         else:
             node_type = "casual_chat"
@@ -1893,7 +1942,7 @@ async def get_memory_graph():
             "id": cid,
             "label": title,
             "type": node_type,
-            "project_id": f"proj_{matched_pid}" if matched_pid else None,
+            "project_id": parent_id if node_type == "chat" else None,
             "starred": starred,
             "turns": turns,
             "has_recap": has_recap,

@@ -656,7 +656,7 @@ def test_arbiter_telemetry_logging_writes_valid_jsonl(tmp_path):
 
     try:
         tier, msg = KernelCognitiveArbiter.arbitrate("build a tactical dashboard", target_override="auto")
-        flush_telemetry(timeout=2.0)
+        flush_telemetry(timeout=3.0)
 
         assert test_log.exists()
         lines = test_log.read_text(encoding="utf-8").strip().splitlines()

@@ -477,9 +477,17 @@
       );
     }
 
-    // ── Dynamic Neural Memory Tree Graph (Ingests Real AIVCO Data) ──
-    const COLS = [60, 200, 380, 580];     // x per column: root · engrams+trunks · projects · chat leaves
-    const GAP = 38, ENGRAM_GAP = 58;      // min row gap for leaves (>=26px label buffer) · extra room for engram dots
+    // ── Dynamic Neural Memory Tree Graph (Collapsible Hubs, Real Data, Zero Overlaps) ──
+    const X_ROOT = 75;
+    const X_ENGRAMS_TRUNKS = 185;
+    const X_PROJECTS = 330;
+    const X_CHATS = 490;
+
+    const GAP_ENGRAM = 34;
+    const GAP_PROJECT = 32;
+    const GAP_CHAT = 28;
+    const GAP_SECTION = 38;
+
     const isChat = n => n && (n.type === "chat" || n.type === "casual_chat");
 
     function MemoryGraph({
@@ -522,6 +530,15 @@
       const [focus, setFocus] = useState(null);
       const [hoverId, setHoverId] = useState(null);
       const [isLoading, setIsLoading] = useState(false);
+      
+      // Collapsible project clusters: Set of expanded project node IDs
+      const [expandedProjects, setExpandedProjects] = useState(() => {
+        const s = new Set();
+        if (activeProjectId) {
+          s.add(`proj_${activeProjectId}`);
+        }
+        return s;
+      });
 
       const wake = () => { S.current.asleep = false; };
 
@@ -545,20 +562,73 @@
         fetchGraph();
       }, [fetchGraph, refreshKey]);
 
+      // Synchronize expanded project when activeProjectId changes
       useEffect(() => {
         if (activeProjectId) {
+          setExpandedProjects(prev => {
+            const next = new Set(prev);
+            next.add(`proj_${activeProjectId}`);
+            return next;
+          });
           setFocus(`proj_${activeProjectId}`);
+          wake();
         }
       }, [activeProjectId]);
 
-      /* 1. Build nodes/links, derive parent->child tree from links, lay out columns + rows */
+      /* 1. Build hierarchy, compute strict bounding-box tree layout with monotonic Y cursor */
       useEffect(() => {
         if (!data || !data.nodes || !data.nodes.length) return;
         const s = S.current, old = s.by, by = new Map();
-        const nodes = data.nodes.map(d => {
+
+        // Map all raw nodes
+        const rawNodeMap = new Map();
+        data.nodes.forEach(d => rawNodeMap.set(d.id, d));
+
+        // Group child chats by parent project/trunk
+        const childrenMap = new Map();
+        data.nodes.forEach(d => childrenMap.set(d.id, []));
+        (data.links || []).forEach(l => {
+          if (childrenMap.has(l.source) && rawNodeMap.has(l.target)) {
+            childrenMap.get(l.source).push(rawNodeMap.get(l.target));
+          }
+        });
+
+        // Determine node visibility based on collapsible states
+        const isNodeVisible = d => {
+          if (!d) return false;
+          if (d.type === "root" || d.type === "engram" || d.type === "trunk" || d.type === "project") {
+            return true;
+          }
+          if (d.type === "chat") {
+            return expandedProjects.has(d.project_id);
+          }
+          if (d.type === "casual_chat") {
+            return expandedProjects.has("trunk_casual");
+          }
+          return false;
+        };
+
+        const visibleRawNodes = data.nodes.filter(isNodeVisible);
+        const visibleIdSet = new Set(visibleRawNodes.map(n => n.id));
+
+        // Instantiate stateful animation nodes
+        const nodes = visibleRawNodes.map(d => {
           const o = old.get(d.id);
+          const totalKids = (childrenMap.get(d.id) || []).length;
+          const isExp = expandedProjects.has(d.id);
+          
+          let displayLabel = d.label || "";
+          if (d.type === "project") {
+            displayLabel = !isExp && totalKids > 0 ? `${d.label} [${totalKids}]` : d.label;
+          } else if (d.id === "trunk_casual") {
+            displayLabel = !isExp && totalKids > 0 ? `${d.label} [${totalKids}]` : d.label;
+          }
+
           const n = {
             ...d,
+            displayLabel,
+            childCount: totalKids,
+            isExpanded: isExp,
             x: o?.x ?? 0,
             y: o?.y ?? 0,
             vx: o?.vx ?? 0,
@@ -569,65 +639,123 @@
           by.set(n.id, n);
           return n;
         });
-        const links = (data.links || []).map(l => ({
-          a: by.get(l.source),
-          b: by.get(l.target)
-        })).filter(l => l.a && l.b);
 
-        const root = nodes.find(n => n.type === "root") || nodes[0];
-        if (!root) return;
+        // Visible links
+        const links = (data.links || [])
+          .filter(l => visibleIdSet.has(l.source) && visibleIdSet.has(l.target))
+          .map(l => ({ a: by.get(l.source), b: by.get(l.target) }))
+          .filter(l => l.a && l.b);
 
-        const kids = new Map(nodes.map(n => [n.id, []])), parent = new Map(), order = [root], seen = new Set([root.id]);
-        for (let i = 0; i < order.length; i++) {
-          links.forEach(l => {
-            if (l.a === order[i] && !seen.has(l.b.id)) {
-              seen.add(l.b.id);
-              parent.set(l.b.id, l.a.id);
-              kids.get(l.a.id).push(l.b);
-              order.push(l.b);
-            }
-          });
-        }
-        nodes.forEach(n => {
-          if (!seen.has(n.id)) {
-            parent.set(n.id, root.id);
-            kids.get(root.id).push(n);
-            order.push(n);
-          }
+        // Derive parent mapping
+        const parent = new Map();
+        links.forEach(l => {
+          parent.set(l.b.id, l.a.id);
         });
 
-        let cur = 0;
-        const lay = (n, d) => {
-          n.depth = d;
-          const ks = kids.get(n.id);
-          n.leaf = !ks.length;
-          if (n.leaf) {
-            const h = n.type === "engram" ? ENGRAM_GAP : GAP;
-            n.ty = cur + h / 2;
-            cur += h;
+        // Strict Monotonic Vertical Cursor Layout
+        let currentY = 32;
+
+        // Group 1: Cognitive Engrams (SEMANTIC, PROCEDURAL, EPISODIC, CREATIVE)
+        const engrams = nodes.filter(n => n.type === "engram");
+        const engramStartY = currentY;
+        engrams.forEach(n => {
+          n.tx = X_ENGRAMS_TRUNKS;
+          n.ty = currentY;
+          n.isLeaf = true;
+          currentY += GAP_ENGRAM;
+        });
+        currentY += GAP_SECTION;
+
+        // Group 2: Project Workspaces Trunk & Project Hubs
+        const projectTrunk = by.get("trunk_projects");
+        const projectHubs = nodes.filter(n => n.type === "project");
+
+        projectHubs.forEach(pNode => {
+          pNode.tx = X_PROJECTS;
+          const isExp = expandedProjects.has(pNode.id);
+          const childChats = isExp ? (childrenMap.get(pNode.id) || []).map(c => by.get(c.id)).filter(Boolean) : [];
+
+          if (childChats.length > 0) {
+            pNode.isLeaf = false;
+            const chatStartY = currentY;
+            childChats.forEach(cNode => {
+              cNode.tx = X_CHATS;
+              cNode.ty = currentY;
+              cNode.isLeaf = true;
+              currentY += GAP_CHAT;
+            });
+            pNode.ty = (chatStartY + (currentY - GAP_CHAT)) / 2;
+            currentY += 10; // buffer after expanded cluster
           } else {
-            ks.forEach(k => lay(k, d + 1));
-            n.ty = (ks[0].ty + ks[ks.length - 1].ty) / 2;
+            pNode.isLeaf = true;
+            pNode.ty = currentY;
+            currentY += GAP_PROJECT;
           }
-        };
-        lay(root, 0);
-
-        nodes.forEach(n => {
-          n.ty -= cur / 2;
-          n.tx = COLS[isChat(n) ? 3 : Math.min(n.depth, 2)];
         });
-        order.forEach(n => {
+
+        if (projectTrunk) {
+          projectTrunk.tx = X_ENGRAMS_TRUNKS;
+          projectTrunk.isLeaf = false;
+          if (projectHubs.length > 0) {
+            projectTrunk.ty = (projectHubs[0].ty + projectHubs[projectHubs.length - 1].ty) / 2;
+          } else {
+            projectTrunk.ty = currentY;
+            currentY += GAP_PROJECT;
+          }
+        }
+        currentY += GAP_SECTION;
+
+        // Group 3: Casual / Standalone Trunk & Casual Chats
+        const casualTrunk = by.get("trunk_casual");
+        const isCasualExp = expandedProjects.has("trunk_casual");
+        const casualChats = isCasualExp ? (childrenMap.get("trunk_casual") || []).map(c => by.get(c.id)).filter(Boolean) : [];
+
+        if (casualChats.length > 0) {
+          const cStartY = currentY;
+          casualChats.forEach(cNode => {
+            cNode.tx = X_CHATS;
+            cNode.ty = currentY;
+            cNode.isLeaf = true;
+            currentY += GAP_CHAT;
+          });
+          if (casualTrunk) {
+            casualTrunk.tx = X_ENGRAMS_TRUNKS;
+            casualTrunk.isLeaf = false;
+            casualTrunk.ty = (cStartY + (currentY - GAP_CHAT)) / 2;
+          }
+          currentY += 10;
+        } else {
+          if (casualTrunk) {
+            casualTrunk.tx = X_ENGRAMS_TRUNKS;
+            casualTrunk.isLeaf = true;
+            casualTrunk.ty = currentY;
+          }
+          currentY += GAP_PROJECT;
+        }
+
+        // Root Node (AIVCO IDENTITY CORE)
+        const rootNode = by.get("core_root") || nodes.find(n => n.type === "root");
+        if (rootNode) {
+          rootNode.tx = X_ROOT;
+          rootNode.isLeaf = false;
+          const topBound = engramStartY;
+          const bottomBound = casualTrunk ? casualTrunk.ty : currentY;
+          rootNode.ty = (topBound + bottomBound) / 2;
+        }
+
+        // Initialize coordinates of newly spawned nodes out of parent
+        nodes.forEach(n => {
           if (!n.seeded) {
             const p = by.get(parent.get(n.id));
-            n.x = (p ? p.x : 0) + (Math.random() - .5) * 12;
-            n.y = (p ? p.y : 0) + (Math.random() - .5) * 12;
+            n.x = (p ? p.x : n.tx) + (Math.random() - 0.5) * 10;
+            n.y = (p ? p.y : n.ty) + (Math.random() - 0.5) * 10;
           }
         });
 
         Object.assign(s, { nodes, links, by, parent });
         wake();
         s.fit();
-      }, [data]);
+      }, [data, expandedProjects]);
 
       /* 2. Active path: root -> active chat */
       useEffect(() => {
@@ -647,28 +775,57 @@
           if (focus) ok = n.id === focus || n.project_id === focus;
           else if (filter === "projects") ok = n.type === "project" || n.id === "trunk_projects" || (isChat(n) && !!n.project_id);
           else if (filter === "starred") ok = (isChat(n) && n.starred) || (n.type === "project" && (data.nodes || []).some(c => c.project_id === n.id && c.starred));
-          return ok && (!term || (n.label || "").toLowerCase().includes(term) || (n.category || "").includes(term));
+          return ok && (!term || (n.displayLabel || n.label || "").toLowerCase().includes(term) || (n.category || "").includes(term));
         };
       }, [filter, q, focus, data]);
 
-      /* 4. Retina canvas + fit-to-view */
+      /* 4. Responsive Auto-Fit with 24px Margin Bounds */
       useEffect(() => {
         const s = S.current, el = stageRef.current, cv = cvRef.current;
         if (!el || !cv) return;
+
         s.fit = () => {
           if (!s.w || !s.nodes.length) return;
-          let a = 1e9, b = -1e9, c = 1e9, d = -1e9;
+          let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+
           s.nodes.forEach(n => {
-            a = Math.min(a, n.tx);
-            b = Math.max(b, n.tx);
-            c = Math.min(c, n.ty);
-            d = Math.max(d, n.ty);
+            const lbl = n.displayLabel || n.label || "";
+            const lblW = lbl.length * 7.2;
+            let left = n.tx - (n.radius + 15);
+            let right = n.tx + (n.radius + 15);
+            let top = n.ty - (n.radius + 15);
+            let bottom = n.ty + (n.radius + 15);
+
+            if (n.type === "root") {
+              left = Math.min(left, n.tx - lblW / 2 - 8);
+              right = Math.max(right, n.tx + lblW / 2 + 8);
+              top = Math.min(top, n.ty - 24);
+            } else if (n.type === "trunk" || (n.type === "project" && !n.isLeaf)) {
+              left = Math.min(left, n.tx - lblW / 2 - 8);
+              right = Math.max(right, n.tx + lblW / 2 + 8);
+              top = Math.min(top, n.ty - 24);
+            } else {
+              // Node labels rendered to the right
+              right = Math.max(right, n.tx + n.radius + lblW + 20);
+            }
+
+            minX = Math.min(minX, left);
+            maxX = Math.max(maxX, right);
+            minY = Math.min(minY, top);
+            maxY = Math.max(maxY, bottom);
           });
-          const v = s.view;
-          v.k = Math.min((s.w - 260) / Math.max(b - a, 1), (s.h - 60) / Math.max(d - c, 1), 1.5);
-          v.x = 44 - a * v.k;
-          v.y = s.h / 2 - (c + d) / 2 * v.k;
+
+          const contentW = Math.max(maxX - minX, 1);
+          const contentH = Math.max(maxY - minY, 1);
+          const availW = s.w - 48; // 24px margin on each side
+          const availH = s.h - 48; // 24px margin on top/bottom
+
+          const k = Math.min(availW / contentW, availH / contentH, 1.25);
+          s.view.k = Math.max(0.35, k);
+          s.view.x = (s.w - contentW * s.view.k) / 2 - minX * s.view.k;
+          s.view.y = (s.h - contentH * s.view.k) / 2 - minY * s.view.k;
         };
+
         const size = () => {
           if (!el || !cv) return;
           const r = el.getBoundingClientRect(), d = window.devicePixelRatio || 1;
@@ -682,6 +839,7 @@
             s.fit();
           }
         };
+
         size();
         const ro = new ResizeObserver(size);
         ro.observe(el);
@@ -692,7 +850,7 @@
         };
       }, []);
 
-      /* 5. Spring physics (nodes ease to their tree slots) + render loop */
+      /* 5. Spring physics + Render loop */
       useEffect(() => {
         const s = S.current, cv = cvRef.current;
         if (!cv) return;
@@ -708,7 +866,7 @@
               let dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy;
               if (d2 > 78400) continue;
               d2 = Math.max(d2, 100);
-              const d = Math.sqrt(d2), f = 600 / d2;
+              const d = Math.sqrt(d2), f = 500 / d2;
               dx /= d;
               dy /= d;
               a.vx -= dx * f;
@@ -717,11 +875,11 @@
               b.vy += dy * f;
             }
           }
-          const damp = Math.pow(.8, dt);
+          const damp = Math.pow(0.8, dt);
           let mv = 0;
           for (const n of nodes) {
-            n.vx += (n.tx - n.x) * .07;
-            n.vy += (n.ty - n.y) * .07;
+            n.vx += (n.tx - n.x) * 0.08;
+            n.vy += (n.ty - n.y) * 0.08;
             if (s.drag === n) {
               n.vx = n.vy = 0;
               continue;
@@ -732,18 +890,19 @@
             n.y += n.vy * dt;
             mv = Math.max(mv, Math.abs(n.vx) + Math.abs(n.vy));
           }
-          if (!s.drag && mv < .02) s.asleep = true;
+          if (!s.drag && mv < 0.02) s.asleep = true;
         };
 
         const draw = t => {
           const { w, h, dpr, view: v, nodes, links } = s;
-          const pulse = .5 + .5 * Math.sin(t / 600);
+          const pulse = 0.5 + 0.5 * Math.sin(t / 600);
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.clearRect(0, 0, w, h);
           ctx.save();
           ctx.translate(v.x, v.y);
           ctx.scale(v.k, v.k);
 
+          // Draw connecting links
           for (const l of links) {
             const { a, b } = l;
             const m = s.match(a) && s.match(b);
@@ -752,14 +911,15 @@
             const amb = b.type === "project" || b.type === "chat" || b.id === "trunk_projects";
             const dx = b.x - a.x;
 
-            ctx.globalAlpha = m ? 1 : .12;
+            ctx.globalAlpha = m ? 1 : 0.12;
             ctx.lineWidth = (hi ? 1.8 : 1) / v.k;
-            ctx.strokeStyle = hi ? "rgba(245,158,11,.8)" : cas ? "rgba(148,163,184,.25)" : amb ? "rgba(245,158,11,.35)" : "rgba(56,189,248,.22)";
+            ctx.strokeStyle = hi ? "rgba(245,158,11,.85)" : cas ? "rgba(148,163,184,.25)" : amb ? "rgba(245,158,11,.35)" : "rgba(56,189,248,.22)";
             ctx.beginPath();
             ctx.moveTo(a.x, a.y);
-            ctx.bezierCurveTo(a.x + dx * .5, a.y, b.x - dx * .5, b.y, b.x, b.y);
+            ctx.bezierCurveTo(a.x + dx * 0.5, a.y, b.x - dx * 0.5, b.y, b.x, b.y);
             ctx.stroke();
 
+            // Energy packet flowing toward active session
             if (hi) {
               const u = (t / 1600 + a.ph) % 1, mx = (a.x + b.x) / 2, i = 1 - u;
               const x = i * i * i * a.x + 3 * i * i * u * mx + 3 * i * u * u * mx + u * u * u * b.x;
@@ -775,24 +935,27 @@
             }
           }
 
+          // Draw nodes
           for (const n of nodes) {
             const m = s.match(n), hov = s.hover === n, act = n.id === s.active, hit = s.term && m;
-            const r = n.radius * (hov ? 1.3 : 1) * (hit ? 1 + .25 * pulse : 1);
-            const dim = m ? 1 : .13;
+            const r = n.radius * (hov ? 1.3 : 1) * (hit ? 1 + 0.25 * pulse : 1);
+            const dim = m ? 1 : 0.13;
 
+            // Breathing halo for project hubs, trunks, and starred sessions
             if (n.type === "project" || n.type === "trunk" || (isChat(n) && n.starred)) {
               ctx.strokeStyle = n.color;
-              ctx.globalAlpha = dim * (.15 + .25 * (1 - pulse));
+              ctx.globalAlpha = dim * (0.15 + 0.25 * (1 - pulse));
               ctx.lineWidth = 1.5;
               ctx.beginPath();
-              ctx.arc(n.x, n.y, r + 4 + pulse * 5, 0, 6.283);
+              ctx.arc(n.x, n.y, r + 4 + pulse * 4, 0, 6.283);
               ctx.stroke();
             }
 
+            // Orbital dots for cognitive engrams
             if (n.type === "engram") {
               const N = Math.min(n.count || 0, 24);
               ctx.fillStyle = n.color;
-              ctx.globalAlpha = dim * .85;
+              ctx.globalAlpha = dim * 0.85;
               for (let i = 0; i < N; i++) {
                 const a = i * 6.283 / N - 1.5708, rr = r + 11 + (i % 3) * 3;
                 ctx.beginPath();
@@ -801,6 +964,7 @@
               }
             }
 
+            // Radial gauge for project instructions
             if (n.type === "project" && n.instructions_len != null) {
               ctx.globalAlpha = dim;
               ctx.lineWidth = 2;
@@ -810,6 +974,7 @@
               ctx.stroke();
             }
 
+            // Node Core Fill
             ctx.globalAlpha = dim;
             ctx.fillStyle = n.color;
             ctx.shadowColor = n.glow || n.color;
@@ -819,6 +984,7 @@
             ctx.fill();
             ctx.shadowBlur = 0;
 
+            // Recap indicator ring
             if (n.has_recap) {
               ctx.strokeStyle = n.color;
               ctx.lineWidth = 1;
@@ -827,18 +993,20 @@
               ctx.stroke();
             }
 
+            // Core Root and Trunk Outer Rings
             if (n.type === "root" || n.type === "trunk") {
-              ctx.strokeStyle = n.glow;
+              ctx.strokeStyle = n.glow || n.color;
               ctx.lineWidth = 1.4;
               ctx.beginPath();
               ctx.arc(n.x, n.y, r + 4 + pulse * 2, 0, 6.283);
               ctx.stroke();
             }
 
+            // Radar rings for active chat session
             if (act) {
               for (let k = 0; k < 2; k++) {
-                const ph = ((t / 1700) + k * .5) % 1;
-                ctx.globalAlpha = (1 - ph) * .9;
+                const ph = ((t / 1700) + k * 0.5) % 1;
+                ctx.globalAlpha = (1 - ph) * 0.9;
                 ctx.strokeStyle = "#f59e0b";
                 ctx.lineWidth = 1.5;
                 ctx.beginPath();
@@ -847,18 +1015,25 @@
               }
             }
 
+            // Text Label Rendering (No Collisions)
             if (m) {
-              ctx.globalAlpha = .92;
+              ctx.globalAlpha = 0.92;
               ctx.fillStyle = "#cfe8ef";
               ctx.font = `${(isChat(n) ? 9.5 : 10.5) / v.k}px "IBM Plex Mono", monospace`;
-              const lim = n.leaf ? 38 : 24;
-              const txt = (n.label || "").length > lim ? (n.label || "").slice(0, lim - 1) + "..." : (n.label || "");
-              if (n.leaf) {
-                ctx.textAlign = "left";
-                ctx.fillText(txt, n.x + r + 9 / v.k, n.y + 3.5 / v.k);
-              } else {
+              const fullLabel = n.displayLabel || n.label || "";
+              const lim = n.isLeaf ? 38 : 26;
+              const txt = fullLabel.length > lim ? fullLabel.slice(0, lim - 1) + "..." : fullLabel;
+
+              if (n.type === "root") {
                 ctx.textAlign = "center";
-                ctx.fillText(txt, n.x, n.y - r - (n.type === "engram" || n.type === "project" ? 20 : 10) / v.k);
+                ctx.fillText(txt, n.x, n.y - r - 10 / v.k);
+              } else if (n.type === "trunk" || (n.type === "project" && !n.isLeaf)) {
+                ctx.textAlign = "center";
+                ctx.fillText(txt, n.x, n.y - r - 12 / v.k);
+              } else {
+                ctx.textAlign = "left";
+                const xOffset = n.type === "engram" ? 14 : 9;
+                ctx.fillText(txt, n.x + r + xOffset / v.k, n.y + 3.5 / v.k);
               }
             }
           }
@@ -877,7 +1052,7 @@
         return () => cancelAnimationFrame(raf);
       }, []);
 
-      /* 6. Pointer: drag node · pan · wheel zoom · hover · click */
+      /* 6. Pointer interactions: Click to toggle expand/collapse, drag, pan, zoom */
       useEffect(() => {
         const s = S.current, cv = cvRef.current;
         if (!cv) return;
@@ -947,12 +1122,32 @@
           wake();
           cv.style.cursor = s.hover ? "pointer" : "grab";
           if (n && !mv) {
-            if (isChat(n)) {
-              onSelectChat?.(n.id);
-            } else if (n.type === "project") {
-              setFocus(f => f === n.id ? null : n.id);
+            if (n.type === "project") {
+              setExpandedProjects(prev => {
+                const next = new Set(prev);
+                if (next.has(n.id)) {
+                  next.delete(n.id);
+                } else {
+                  next.add(n.id);
+                }
+                return next;
+              });
               const rawPid = n.id.replace(/^proj_/, "");
               onSelectProject?.(rawPid);
+              wake();
+            } else if (n.id === "trunk_casual") {
+              setExpandedProjects(prev => {
+                const next = new Set(prev);
+                if (next.has(n.id)) {
+                  next.delete(n.id);
+                } else {
+                  next.add(n.id);
+                }
+                return next;
+              });
+              wake();
+            } else if (isChat(n)) {
+              onSelectChat?.(n.id);
             }
           }
         };
@@ -960,7 +1155,7 @@
         const wheel = e => {
           e.preventDefault();
           const [x, y] = pos(e), [wx, wy] = world(x, y);
-          const k = Math.min(4, Math.max(.3, s.view.k * Math.exp(-e.deltaY * .0015)));
+          const k = Math.min(4, Math.max(0.3, s.view.k * Math.exp(-e.deltaY * 0.0015)));
           s.view.k = k;
           s.view.x = x - wx * k;
           s.view.y = y - wy * k;
@@ -991,8 +1186,7 @@
       const hn = hoverId && S.current.by.get(hoverId);
       const proj = hn?.project_id && S.current.by.get(hn.project_id);
       const fp = focus && S.current.by.get(focus);
-      const childCount = hn ? (data.nodes || []).filter(c => S.current.parent.get(c.id) === hn.id).length : 0;
-      const totalNodes = (data.nodes || []).length;
+      const totalNodes = S.current.nodes.length;
 
       return (
         <div className="glass-bracket p-2.5 rounded flex-1 flex flex-col gap-1.5 min-h-[300px] relative overflow-hidden bg-slate-950/70 border border-border/80">
@@ -1055,7 +1249,7 @@
                 aria-label="Memory tree: identity core, cognitive engrams, project workspaces and chats"
               />
               <div className="mg-legend">
-                drag node • pan canvas • wheel zoom • click chat to load • click project to focus
+                click project to expand/collapse • click chat to load • pan • wheel zoom
               </div>
 
               {hn && (
@@ -1076,8 +1270,12 @@
                       )}
                     </div>
                   )}
-                  {hn.type === "project" && <div>{childCount} chats · click to focus</div>}
-                  {hn.type === "trunk" && <div>{childCount} branches</div>}
+                  {hn.type === "project" && (
+                    <div>
+                      {hn.childCount} chats · {hn.isExpanded ? "click to collapse" : "click to expand"}
+                    </div>
+                  )}
+                  {hn.type === "trunk" && <div>{hn.childCount} branches</div>}
                   {hn.type === "engram" && <div>{hn.count} stored items</div>}
                   {hn.type === "root" && <div>cognitive baseline</div>}
                 </div>
