@@ -458,11 +458,12 @@
       );
     }
 
-    // ── Interactive Neural Memory Graph (Constellation Visualizer) ─────────
-    function MemoryNeuralGraph({
+    // ── Dynamic Neural Memory Graph (Tree & Orbit Constellation Visualizer) ──
+    function MemoryGraph({
       activeChatId,
       activeProjectId,
       onSelectChat,
+      onSelectProject,
       onNewChat,
       onOpenNewEngram,
       theme = 'argon',
@@ -471,19 +472,19 @@
       const canvasRef = useRef(null);
       const containerRef = useRef(null);
 
-      // Data state
-      const [rawChats, setRawChats] = useState([]);
-      const [rawProjects, setRawProjects] = useState([]);
-      const [filter, setFilter] = useState('all'); // 'all' | 'starred' | 'projects'
+      // Graph Data State
+      const [graphData, setGraphData] = useState({ nodes: [], links: [] });
+      const [filter, setFilter] = useState('all'); // 'all' | 'projects' | 'starred'
       const [searchQuery, setSearchQuery] = useState('');
+      const [physicsMode, setPhysicsMode] = useState('orbit'); // 'orbit' | 'tree'
       const [hoveredNode, setHoveredNode] = useState(null);
-      const [tooltip, setTooltip] = useState(null); // { x, y, node }
+      const [tooltip, setTooltip] = useState(null);
       const [isLoading, setIsLoading] = useState(false);
 
-      // Animation & Graph Node Persistence Ref
+      // Animation & Coordinates Ref
       const nodesRef = useRef([]);
-      const edgesRef = useRef([]);
-      const nodePosCacheRef = useRef(new Map()); // id -> { x, y, vx, vy }
+      const linksRef = useRef([]);
+      const nodePosCacheRef = useRef(new Map());
       const cameraRef = useRef({ x: 0, y: 0, zoom: 1.0 });
       const dragRef = useRef({
         isDraggingNode: false,
@@ -496,173 +497,172 @@
 
       const themeColor = THEME_COLORS[theme] || '#56E2F5';
 
-      // 1. Fetch Chats and Projects
-      const fetchData = useCallback(async () => {
+      // 1. Fetch Dynamic Graph Schema from GET /api/memory/graph
+      const fetchGraph = useCallback(async () => {
         setIsLoading(true);
         try {
-          const [chatsRes, projRes] = await Promise.all([
-            fetch(`${API_BASE}/api/chats`),
-            fetch(`${API_BASE}/api/memory/projects`).catch(() => null)
-          ]);
-
-          if (chatsRes.ok) {
-            const data = await chatsRes.json();
-            setRawChats(data.chats || []);
-          }
-          if (projRes && projRes.ok) {
-            const pData = await projRes.json();
-            setRawProjects(pData.projects || []);
+          const res = await fetch(`${API_BASE}/api/memory/graph`);
+          if (res.ok) {
+            const data = await res.json();
+            setGraphData(data);
           }
         } catch (err) {
-          console.error("Failed to fetch graph data:", err);
+          console.error("Failed to fetch memory graph:", err);
         } finally {
           setIsLoading(false);
         }
       }, []);
 
       useEffect(() => {
-        fetchData();
-      }, [fetchData, refreshKey]);
+        fetchGraph();
+      }, [fetchGraph, refreshKey]);
 
-      // 2. Build Nodes & Edges from Raw Data
+      // 2. Build / Update Nodes and Links with Target Positions
       useEffect(() => {
         const container = containerRef.current;
         const width = container ? container.clientWidth : 280;
-        const height = container ? container.clientHeight : 220;
+        const height = container ? container.clientHeight : 240;
         const cx = width / 2;
         const cy = height / 2;
 
         const posCache = nodePosCacheRef.current;
+        const rawNodes = graphData.nodes || [];
+        const rawLinks = graphData.links || [];
 
-        // Collect project IDs
-        const projectMap = new Map();
-        rawProjects.forEach(p => {
-          projectMap.set(p.project_id, p.title || p.project_id);
-        });
-        rawChats.forEach(c => {
-          if (c.project_id && !projectMap.has(c.project_id)) {
-            projectMap.set(c.project_id, c.project_id.replace(/[-_]/g, ' ').toUpperCase());
-          }
-        });
+        const projects = rawNodes.filter(n => n.type === 'project');
+        const casualChats = rawNodes.filter(n => n.type === 'casual_chat');
+        const projectChats = rawNodes.filter(n => n.type === 'chat');
+        const engrams = rawNodes.filter(n => n.type === 'engram');
 
-        const newNodes = [];
-        const newEdges = [];
+        const projIndexMap = new Map();
+        projects.forEach((p, idx) => projIndexMap.set(p.id, idx));
 
-        // Project Hubs
-        const projectList = Array.from(projectMap.entries());
-        const hubCount = projectList.length;
-        const hubRadius = Math.min(width, height) * 0.32;
+        const newNodes = rawNodes.map((n, i) => {
+          let targetX = cx;
+          let targetY = cy;
 
-        projectList.forEach(([pid, ptitle], index) => {
-          const nodeId = `proj_${pid}`;
-          let cached = posCache.get(nodeId);
-          if (!cached) {
-            const angle = hubCount > 0 ? (index / hubCount) * Math.PI * 2 : 0;
-            cached = {
-              x: cx + Math.cos(angle) * hubRadius,
-              y: cy + Math.sin(angle) * hubRadius,
-              vx: 0,
-              vy: 0
-            };
-            posCache.set(nodeId, cached);
-          }
-
-          newNodes.push({
-            id: nodeId,
-            rawId: pid,
-            type: 'project',
-            title: ptitle,
-            project_id: pid,
-            radius: 12,
-            x: cached.x,
-            y: cached.y,
-            vx: cached.vx || 0,
-            vy: cached.vy || 0,
-            seed: index * 1.5,
-            isHub: true
-          });
-        });
-
-        // Chat Nodes
-        const standaloneChats = [];
-        rawChats.forEach((chat, cIdx) => {
-          const nodeId = chat.id;
-          let cached = posCache.get(nodeId);
-          if (!cached) {
-            if (chat.project_id) {
-              const pCached = posCache.get(`proj_${chat.project_id}`);
-              const baseAngle = cIdx * 1.2;
-              const dist = 32 + (cIdx % 4) * 12;
-              cached = {
-                x: (pCached ? pCached.x : cx) + Math.cos(baseAngle) * dist,
-                y: (pCached ? pCached.y : cy) + Math.sin(baseAngle) * dist,
-                vx: 0,
-                vy: 0
-              };
-            } else {
-              const sAngle = (cIdx * 0.9) % (Math.PI * 2);
-              const sDist = 40 + (cIdx % 5) * 14;
-              cached = {
-                x: cx + Math.cos(sAngle) * sDist,
-                y: cy + Math.sin(sAngle) * sDist,
-                vx: 0,
-                vy: 0
-              };
+          if (physicsMode === 'tree') {
+            // ── TREE LAYOUT ──
+            if (n.type === 'root') {
+              targetX = cx;
+              targetY = 28;
+            } else if (n.type === 'engram') {
+              const eIdx = engrams.findIndex(e => e.id === n.id);
+              targetX = cx - 95 + eIdx * 34;
+              targetY = 70;
+            } else if (n.type === 'trunk') {
+              if (n.id === 'trunk_projects') {
+                targetX = cx - 50;
+                targetY = 115;
+              } else {
+                targetX = cx + 60;
+                targetY = 115;
+              }
+            } else if (n.type === 'project') {
+              const pIdx = projIndexMap.get(n.id) || 0;
+              const span = Math.max(1, projects.length - 1) * 44;
+              targetX = cx - 50 - span / 2 + pIdx * 44;
+              targetY = 160;
+            } else if (n.type === 'chat') {
+              const pIdx = projIndexMap.get(n.project_id) || 0;
+              const siblingChats = projectChats.filter(c => c.project_id === n.project_id);
+              const cIdx = siblingChats.findIndex(c => c.id === n.id);
+              const parentX = cx - 50 - (Math.max(1, projects.length - 1) * 44) / 2 + pIdx * 44;
+              targetX = parentX + (cIdx % 2 === 0 ? -1 : 1) * (10 + Math.floor(cIdx / 2) * 16);
+              targetY = 205 + Math.floor(cIdx / 2) * 22;
+            } else if (n.type === 'casual_chat') {
+              const cIdx = casualChats.findIndex(c => c.id === n.id);
+              targetX = cx + 60 + ((cIdx % 3) - 1) * 26;
+              targetY = 160 + Math.floor(cIdx / 3) * 24;
             }
-            posCache.set(nodeId, cached);
+          } else {
+            // ── ORBIT LAYOUT ──
+            if (n.type === 'root') {
+              targetX = cx;
+              targetY = cy;
+            } else if (n.type === 'engram') {
+              const eIdx = engrams.findIndex(e => e.id === n.id);
+              const angle = (eIdx / Math.max(1, engrams.length)) * Math.PI * 2 + Math.PI / 4;
+              targetX = cx + Math.cos(angle) * 44;
+              targetY = cy + Math.sin(angle) * 44;
+            } else if (n.type === 'trunk') {
+              if (n.id === 'trunk_projects') {
+                targetX = cx - 75;
+                targetY = cy - 20;
+              } else {
+                targetX = cx + 75;
+                targetY = cy + 20;
+              }
+            } else if (n.type === 'project') {
+              const pIdx = projIndexMap.get(n.id) || 0;
+              const angle = Math.PI + (pIdx - (projects.length - 1) / 2) * 0.7;
+              targetX = cx - 75 + Math.cos(angle) * 38;
+              targetY = cy - 20 + Math.sin(angle) * 38;
+            } else if (n.type === 'chat') {
+              const pIdx = projIndexMap.get(n.project_id) || 0;
+              const siblingChats = projectChats.filter(c => c.project_id === n.project_id);
+              const cIdx = siblingChats.findIndex(c => c.id === n.id);
+              const pAngle = Math.PI + (pIdx - (projects.length - 1) / 2) * 0.7;
+              const projBaseX = cx - 75 + Math.cos(pAngle) * 38;
+              const projBaseY = cy - 20 + Math.sin(pAngle) * 38;
+              const cAngle = pAngle + (cIdx + 1) * 0.8;
+              targetX = projBaseX + Math.cos(cAngle) * 26;
+              targetY = projBaseY + Math.sin(cAngle) * 26;
+            } else if (n.type === 'casual_chat') {
+              const cIdx = casualChats.findIndex(c => c.id === n.id);
+              const angle = (cIdx * 0.9) % (Math.PI * 2);
+              targetX = cx + 75 + Math.cos(angle) * (26 + (cIdx % 3) * 10);
+              targetY = cy + 20 + Math.sin(angle) * (26 + (cIdx % 3) * 10);
+            }
           }
 
-          const turns = chat.turn_count || 1;
-          const r = Math.max(4, Math.min(10, 4 + turns * 0.8));
+          let cached = posCache.get(n.id);
+          if (!cached) {
+            cached = { x: targetX, y: targetY, vx: 0, vy: 0 };
+            posCache.set(n.id, cached);
+          }
 
-          const nodeObj = {
-            id: nodeId,
-            rawId: chat.id,
-            type: 'chat',
-            title: chat.title || 'Untitled Session',
-            project_id: chat.project_id,
-            starred: Boolean(chat.starred),
-            turn_count: turns,
-            created: chat.created,
-            updated: chat.updated,
+          const turns = n.turns || 1;
+          let r = n.radius || 6;
+          if (n.type === 'chat' || n.type === 'casual_chat') {
+            r = Math.max(4, Math.min(9, 4 + turns * 0.7));
+          }
+
+          return {
+            ...n,
             radius: r,
             x: cached.x,
             y: cached.y,
             vx: cached.vx || 0,
             vy: cached.vy || 0,
-            seed: cIdx * 2.3 + 0.7,
-            isHub: false
+            targetX,
+            targetY,
+            seed: i * 1.7 + 0.3
           };
+        });
 
-          newNodes.push(nodeObj);
+        // Resolve link references to node objects
+        const nodeMap = new Map();
+        newNodes.forEach(node => nodeMap.set(node.id, node));
 
-          if (chat.project_id) {
-            const hubNode = newNodes.find(n => n.id === `proj_${chat.project_id}`);
-            if (hubNode) {
-              newEdges.push({
-                source: hubNode,
-                target: nodeObj,
-                type: 'project'
-              });
-            }
-          } else {
-            standaloneChats.push(nodeObj);
+        const resolvedLinks = [];
+        rawLinks.forEach(link => {
+          const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+          const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+          const sourceNode = nodeMap.get(srcId);
+          const targetNode = nodeMap.get(tgtId);
+          if (sourceNode && targetNode) {
+            resolvedLinks.push({
+              source: sourceNode,
+              target: targetNode,
+              type: targetNode.type
+            });
           }
         });
 
-        // Connect standalone chats chronologically to form constellation chains
-        standaloneChats.sort((a, b) => (a.created || 0) - (b.created || 0));
-        for (let i = 0; i < standaloneChats.length - 1; i++) {
-          newEdges.push({
-            source: standaloneChats[i],
-            target: standaloneChats[i + 1],
-            type: 'constellation'
-          });
-        }
-
         nodesRef.current = newNodes;
-        edgesRef.current = newEdges;
-      }, [rawChats, rawProjects]);
+        linksRef.current = resolvedLinks;
+      }, [graphData, physicsMode]);
 
       // 3. Canvas Simulation & Rendering Loop
       useEffect(() => {
@@ -678,88 +678,92 @@
           const cy = height / 2;
 
           const nodes = nodesRef.current;
-          const edges = edgesRef.current;
+          const links = linksRef.current;
           const cam = cameraRef.current;
           const q = searchQuery.trim().toLowerCase();
 
-          // Physics Simulation Step
+          // Physics Step
           if (nodes.length > 0) {
-            // Gentle breathing idle drift
             nodes.forEach(n => {
               if (!n.isDragging) {
-                const driftX = Math.cos(time * 0.0012 + n.seed) * 0.14;
-                const driftY = Math.sin(time * 0.0015 + n.seed) * 0.14;
-                n.x += driftX;
-                n.y += driftY;
-              }
-            });
-
-            // Spring forces along edges
-            edges.forEach(e => {
-              const dx = e.target.x - e.source.x;
-              const dy = e.target.y - e.source.y;
-              const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-              const idealDist = e.type === 'project' ? 42 : 32;
-              const force = (dist - idealDist) * 0.012;
-              const fx = (dx / dist) * force;
-              const fy = (dy / dist) * force;
-              if (!e.source.isDragging) {
-                e.source.vx += fx;
-                e.source.vy += fy;
-              }
-              if (!e.target.isDragging) {
-                e.target.vx -= fx;
-                e.target.vy -= fy;
-              }
-            });
-
-            // Node-Node Repulsion
-            for (let i = 0; i < nodes.length; i++) {
-              for (let j = i + 1; j < nodes.length; j++) {
-                const a = nodes[i];
-                const b = nodes[j];
-                const dx = b.x - a.x;
-                const dy = b.y - a.y;
-                const distSq = dx * dx + dy * dy + 1;
-                const minDist = a.radius + b.radius + 16;
-                if (distSq < minDist * minDist * 4) {
-                  const dist = Math.sqrt(distSq);
-                  const repulse = (minDist * minDist) / (distSq * 7);
-                  const rx = (dx / dist) * repulse;
-                  const ry = (dy / dist) * repulse;
-                  if (!a.isDragging) { a.vx -= rx; a.vy -= ry; }
-                  if (!b.isDragging) { b.vx += rx; b.vy += ry; }
+                if (physicsMode === 'tree') {
+                  n.vx += (n.targetX - n.x) * 0.045;
+                  n.vy += (n.targetY - n.y) * 0.045;
+                  n.x += Math.cos(time * 0.001 + n.seed) * 0.06;
+                  n.y += Math.sin(time * 0.0012 + n.seed) * 0.06;
+                } else {
+                  n.x += Math.cos(time * 0.0012 + n.seed) * 0.12;
+                  n.y += Math.sin(time * 0.0015 + n.seed) * 0.12;
                 }
               }
+            });
+
+            if (physicsMode === 'orbit') {
+              links.forEach(link => {
+                const dx = link.target.x - link.source.x;
+                const dy = link.target.y - link.source.y;
+                const dist = Math.hypot(dx, dy) || 1;
+                const ideal = link.source.type === 'root' ? 48 : (link.source.type === 'trunk' ? 38 : 28);
+                const force = (dist - ideal) * 0.014;
+                const fx = (dx / dist) * force;
+                const fy = (dy / dist) * force;
+                if (!link.source.isDragging) {
+                  link.source.vx += fx;
+                  link.source.vy += fy;
+                }
+                if (!link.target.isDragging) {
+                  link.target.vx -= fx;
+                  link.target.vy -= fy;
+                }
+              });
+
+              for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                  const a = nodes[i];
+                  const b = nodes[j];
+                  const dx = b.x - a.x;
+                  const dy = b.y - a.y;
+                  const distSq = dx * dx + dy * dy + 1;
+                  const minDist = a.radius + b.radius + 14;
+                  if (distSq < minDist * minDist * 4) {
+                    const dist = Math.sqrt(distSq);
+                    const repulse = (minDist * minDist) / (distSq * 6);
+                    const rx = (dx / dist) * repulse;
+                    const ry = (dy / dist) * repulse;
+                    if (!a.isDragging) { a.vx -= rx; a.vy -= ry; }
+                    if (!b.isDragging) { b.vx += rx; b.vy += ry; }
+                  }
+                }
+              }
+
+              nodes.forEach(n => {
+                if (!n.isDragging) {
+                  n.vx += (cx - n.x) * 0.0007;
+                  n.vy += (cy - n.y) * 0.0007;
+                }
+              });
             }
 
-            // Gravity towards center & velocity damping
             nodes.forEach(n => {
               if (!n.isDragging) {
-                n.vx += (cx - n.x) * 0.0006;
-                n.vy += (cy - n.y) * 0.0006;
-                n.vx *= 0.86;
-                n.vy *= 0.86;
+                n.vx *= 0.84;
+                n.vy *= 0.84;
                 n.x += n.vx;
                 n.y += n.vy;
-
-                // Cache position
                 nodePosCacheRef.current.set(n.id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy });
               }
             });
           }
 
-          // Clear Canvas
+          // Clear
           ctx.clearRect(0, 0, width, height);
-
           ctx.save();
-          // Apply Camera Pan and Zoom
           ctx.translate(cam.x, cam.y);
           ctx.scale(cam.zoom, cam.zoom);
 
-          // Subtle Background HUD Grid Points
-          ctx.fillStyle = 'rgba(86, 226, 245, 0.04)';
-          const gridSize = 36;
+          // Subtle Sci-Fi Grid Points
+          ctx.fillStyle = 'rgba(86, 226, 245, 0.035)';
+          const gridSize = 32;
           const startX = Math.floor((-cam.x / cam.zoom) / gridSize) * gridSize - gridSize;
           const startY = Math.floor((-cam.y / cam.zoom) / gridSize) * gridSize - gridSize;
           const endX = startX + (width / cam.zoom) + gridSize * 2;
@@ -767,61 +771,73 @@
           for (let gx = startX; gx < endX; gx += gridSize) {
             for (let gy = startY; gy < endY; gy += gridSize) {
               ctx.beginPath();
-              ctx.arc(gx, gy, 0.8, 0, Math.PI * 2);
+              ctx.arc(gx, gy, 0.75, 0, Math.PI * 2);
               ctx.fill();
             }
           }
 
-          // Helper to check filter match
+          // Filter & Search Matchers
           const matchesFilter = (n) => {
-            if (n.type === 'project') {
-              if (filter === 'starred') return false;
+            if (n.type === 'root') return true;
+            if (filter === 'starred') {
+              if (n.starred) return true;
+              if (n.type === 'project') return links.some(l => l.source.id === n.id && l.target.starred);
+              if (n.id === 'trunk_projects') return links.some(l => l.source.id === n.id && matchesFilter(l.target));
+              if (n.id === 'trunk_casual') return links.some(l => l.source.id === n.id && l.target.starred);
+              return false;
+            }
+            if (filter === 'projects') {
+              if (n.type === 'engram' || n.type === 'casual_chat' || n.id === 'trunk_casual') return false;
               return true;
             }
-            if (filter === 'starred' && !n.starred) return false;
-            if (filter === 'projects' && !n.project_id) return false;
             return true;
           };
 
           const matchesQuery = (n) => {
             if (!q) return true;
-            return (n.title || '').toLowerCase().includes(q) || (n.project_id || '').toLowerCase().includes(q);
+            return (n.label || '').toLowerCase().includes(q) || (n.id || '').toLowerCase().includes(q);
           };
 
-          // Draw Edges
-          edges.forEach(e => {
-            const sMatch = matchesFilter(e.source) && matchesQuery(e.source);
-            const tMatch = matchesFilter(e.target) && matchesQuery(e.target);
+          // Draw Links
+          links.forEach(link => {
+            const sMatch = matchesFilter(link.source) && matchesQuery(link.source);
+            const tMatch = matchesFilter(link.target) && matchesQuery(link.target);
             const isDimmed = !sMatch || !tMatch;
-            const isConnectedToHover = hoveredNode && (hoveredNode.id === e.source.id || hoveredNode.id === e.target.id);
+            const isHovered = hoveredNode && (hoveredNode.id === link.source.id || hoveredNode.id === link.target.id);
 
             ctx.beginPath();
-            ctx.moveTo(e.source.x, e.source.y);
-            ctx.lineTo(e.target.x, e.target.y);
+            ctx.moveTo(link.source.x, link.source.y);
+            ctx.lineTo(link.target.x, link.target.y);
 
-            if (e.type === 'project') {
-              ctx.strokeStyle = isConnectedToHover 
-                ? 'rgba(6, 182, 212, 0.9)' 
-                : (isDimmed ? 'rgba(6, 182, 212, 0.08)' : 'rgba(6, 182, 212, 0.32)');
-              ctx.lineWidth = isConnectedToHover ? 1.8 : 1.0;
-              if (isConnectedToHover) {
-                ctx.shadowColor = '#06B6D4';
-                ctx.shadowBlur = 6;
-              } else {
-                ctx.shadowBlur = 0;
-              }
-              ctx.stroke();
+            let strokeColor = 'rgba(148, 163, 184, 0.22)';
+            let strokeWidth = 0.85;
+
+            if (link.source.type === 'root') {
+              strokeColor = isHovered ? 'rgba(56, 189, 248, 0.95)' : 'rgba(56, 189, 248, 0.35)';
+              strokeWidth = isHovered ? 1.8 : 1.1;
+            } else if (link.source.type === 'trunk' && link.source.id === 'trunk_projects') {
+              strokeColor = isHovered ? 'rgba(245, 158, 11, 0.95)' : 'rgba(245, 158, 11, 0.32)';
+              strokeWidth = isHovered ? 1.8 : 1.0;
+            } else if (link.source.type === 'project') {
+              strokeColor = isHovered ? 'rgba(56, 189, 248, 0.95)' : 'rgba(56, 189, 248, 0.28)';
+              strokeWidth = isHovered ? 1.6 : 0.9;
             } else {
-              // Constellation chain
-              ctx.strokeStyle = isConnectedToHover 
-                ? 'rgba(168, 85, 247, 0.9)' 
-                : (isDimmed ? 'rgba(168, 85, 247, 0.08)' : 'rgba(168, 85, 247, 0.28)');
-              ctx.lineWidth = isConnectedToHover ? 1.5 : 0.85;
-              ctx.setLineDash([3, 3]);
-              ctx.stroke();
-              ctx.setLineDash([]);
+              strokeColor = isHovered ? 'rgba(168, 85, 247, 0.95)' : 'rgba(148, 163, 184, 0.24)';
+              strokeWidth = isHovered ? 1.4 : 0.8;
             }
+
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = strokeWidth;
+            ctx.globalAlpha = isDimmed ? 0.08 : 1.0;
+            if (isHovered) {
+              ctx.shadowColor = link.source.color || '#38bdf8';
+              ctx.shadowBlur = 6;
+            } else {
+              ctx.shadowBlur = 0;
+            }
+            ctx.stroke();
             ctx.shadowBlur = 0;
+            ctx.globalAlpha = 1.0;
           });
 
           // Draw Nodes
@@ -830,109 +846,189 @@
             const isSearched = matchesQuery(n);
             const isDimmed = isFiltered || (!isSearched && q);
             const isHovered = hoveredNode && hoveredNode.id === n.id;
-            const isActive = n.type === 'chat' && n.id === activeChatId;
+            const isActive = (n.type === 'chat' || n.type === 'casual_chat') && n.id === activeChatId;
 
             ctx.save();
             ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
 
-            if (n.type === 'project') {
-              // Project Hub Node
-              const pulse = Math.sin(time * 0.004 + n.seed) * 3;
-              const haloR = n.radius + 6 + pulse;
-
-              // Pulsing Halo Ring
+            if (n.type === 'root') {
+              // ── AIVCO IDENTITY ROOT ──
+              const pulse = Math.sin(time * 0.005) * 3;
               ctx.beginPath();
-              ctx.arc(n.x, n.y, haloR, 0, Math.PI * 2);
-              ctx.strokeStyle = isHovered ? '#00e5ff' : 'rgba(86, 226, 245, 0.4)';
+              ctx.arc(n.x, n.y, n.radius + 6 + pulse, 0, Math.PI * 2);
+              ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
               ctx.lineWidth = 1;
               ctx.stroke();
 
-              // Hub Outer Body
               ctx.beginPath();
               ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.fillStyle = '#0B1320';
+              ctx.fillStyle = '#061325';
               ctx.fill();
-              ctx.strokeStyle = isHovered ? '#FFFFFF' : '#00e5ff';
-              ctx.lineWidth = isHovered ? 2 : 1.5;
+              ctx.strokeStyle = '#38bdf8';
+              ctx.lineWidth = 2;
               ctx.stroke();
 
-              // Hub Inner Tech Cross
               ctx.beginPath();
-              ctx.arc(n.x, n.y, 3, 0, Math.PI * 2);
-              ctx.fillStyle = '#00e5ff';
-              ctx.shadowColor = '#00e5ff';
-              ctx.shadowBlur = 8;
+              ctx.arc(n.x, n.y, 3.5, 0, Math.PI * 2);
+              ctx.fillStyle = '#ffffff';
+              ctx.shadowColor = '#38bdf8';
+              ctx.shadowBlur = 10;
               ctx.fill();
               ctx.shadowBlur = 0;
 
-              // Hub Label Text
-              ctx.font = 'bold 9px "IBM Plex Mono", monospace';
-              ctx.fillStyle = isHovered ? '#FFFFFF' : '#94A3B8';
+              ctx.font = 'bold 8px "IBM Plex Mono", monospace';
+              ctx.fillStyle = '#e2e8f0';
               ctx.textAlign = 'center';
               ctx.textBaseline = 'top';
-              const label = (n.title || n.project_id || '').toUpperCase();
-              ctx.fillText(label.length > 14 ? label.slice(0, 13) + '…' : label, n.x, n.y + n.radius + 4);
+              ctx.fillText('AIVCO CORE', n.x, n.y + n.radius + 3);
+
+            } else if (n.type === 'engram') {
+              // ── COGNITIVE ENGRAM LAYER ──
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius + 3, 0, Math.PI * 2);
+              ctx.strokeStyle = isHovered ? '#ffffff' : (n.color || '#38bdf8');
+              ctx.lineWidth = 1;
+              ctx.globalAlpha = isDimmed ? 0.15 : 0.4;
+              ctx.stroke();
+              ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
+
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+              ctx.fillStyle = n.color || '#38bdf8';
+              if (isHovered) {
+                ctx.shadowColor = n.color || '#38bdf8';
+                ctx.shadowBlur = 8;
+              }
+              ctx.fill();
+              ctx.shadowBlur = 0;
+
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+              ctx.strokeStyle = '#000000';
+              ctx.lineWidth = 1;
+              ctx.stroke();
+
+              ctx.font = 'bold 8px "IBM Plex Mono", monospace';
+              ctx.fillStyle = '#ffffff';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.fillText((n.category || 'e')[0].toUpperCase(), n.x, n.y);
+
+            } else if (n.type === 'trunk') {
+              // ── SESSION TRUNK ──
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius + 4, 0, Math.PI * 2);
+              ctx.strokeStyle = isHovered ? '#ffffff' : (n.color || '#f59e0b');
+              ctx.lineWidth = 1;
+              ctx.globalAlpha = isDimmed ? 0.15 : 0.35;
+              ctx.stroke();
+              ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
+
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+              ctx.fillStyle = '#0f172a';
+              ctx.fill();
+              ctx.strokeStyle = n.color || '#f59e0b';
+              ctx.lineWidth = 1.8;
+              if (isHovered) {
+                ctx.shadowColor = n.color || '#f59e0b';
+                ctx.shadowBlur = 8;
+              }
+              ctx.stroke();
+              ctx.shadowBlur = 0;
+
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, 2.5, 0, Math.PI * 2);
+              ctx.fillStyle = n.color || '#f59e0b';
+              ctx.fill();
+
+              ctx.font = 'bold 7px "IBM Plex Mono", monospace';
+              ctx.fillStyle = isHovered ? '#ffffff' : '#94a3b8';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'top';
+              const label = n.id === 'trunk_projects' ? 'PROJECTS' : 'CASUAL';
+              ctx.fillText(label, n.x, n.y + n.radius + 2);
+
+            } else if (n.type === 'project') {
+              // ── PROJECT HUB ──
+              const pulse = Math.sin(time * 0.004 + n.seed) * 2;
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius + 4 + pulse, 0, Math.PI * 2);
+              ctx.strokeStyle = isHovered ? '#ffffff' : 'rgba(245, 158, 11, 0.45)';
+              ctx.lineWidth = 1;
+              ctx.stroke();
+
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+              ctx.fillStyle = '#171206';
+              ctx.fill();
+              ctx.strokeStyle = '#f59e0b';
+              ctx.lineWidth = isHovered ? 2 : 1.4;
+              ctx.stroke();
+
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, 3, 0, Math.PI * 2);
+              ctx.fillStyle = '#f59e0b';
+              ctx.shadowColor = '#f59e0b';
+              ctx.shadowBlur = 6;
+              ctx.fill();
+              ctx.shadowBlur = 0;
+
+              ctx.font = 'bold 8px "IBM Plex Mono", monospace';
+              ctx.fillStyle = isHovered ? '#ffffff' : '#cbd5e1';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'top';
+              const plabel = (n.label || '').toUpperCase();
+              ctx.fillText(plabel.length > 12 ? plabel.slice(0, 11) + '…' : plabel, n.x, n.y + n.radius + 2);
 
             } else {
-              // Chat Thread Node
-              let nodeColor = '#8B5CF6'; // Standalone Violet
-              let glowColor = '#A78BFA';
-              if (n.starred) {
-                nodeColor = '#F59E0B'; // Starred Gold
-                glowColor = '#FBBF24';
-              } else if (n.project_id) {
-                nodeColor = '#06B6D4'; // Project Cyan
-                glowColor = '#22D3EE';
-              }
+              // ── CHAT & CASUAL CHAT LEAVES ──
+              let nodeColor = n.color || '#94a3b8';
+              let glowColor = n.starred ? '#fbbf24' : '#38bdf8';
 
-              // Active Chat Expanding Pulse Ring
               if (isActive) {
-                const ringR = n.radius + ((time * 0.035) % 14);
-                const ringAlpha = 1.0 - ((ringR - n.radius) / 14);
+                const ringR = n.radius + ((time * 0.035) % 12);
+                const ringAlpha = 1.0 - (ringR - n.radius) / 12;
                 ctx.beginPath();
                 ctx.arc(n.x, n.y, ringR, 0, Math.PI * 2);
                 ctx.strokeStyle = themeColor;
-                ctx.lineWidth = 1.5;
+                ctx.lineWidth = 1.4;
                 ctx.globalAlpha = isDimmed ? 0.15 : ringAlpha;
                 ctx.stroke();
                 ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
               }
 
-              // Search Match Pulse Ring
               if (q && isSearched) {
-                const sRing = n.radius + ((time * 0.05) % 10);
+                const sRing = n.radius + ((time * 0.05) % 8);
                 ctx.beginPath();
                 ctx.arc(n.x, n.y, sRing, 0, Math.PI * 2);
-                ctx.strokeStyle = '#FBBF24';
+                ctx.strokeStyle = '#fbbf24';
                 ctx.lineWidth = 1.2;
                 ctx.stroke();
               }
 
-              // Node Body
               ctx.beginPath();
               ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
               ctx.fillStyle = nodeColor;
               if (isHovered || isActive) {
                 ctx.shadowColor = glowColor;
-                ctx.shadowBlur = 10;
+                ctx.shadowBlur = 8;
               }
               ctx.fill();
               ctx.shadowBlur = 0;
 
-              // Outer boundary ring
               ctx.beginPath();
               ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.strokeStyle = isHovered ? '#FFFFFF' : 'rgba(255, 255, 255, 0.4)';
-              ctx.lineWidth = isHovered ? 1.8 : 0.8;
+              ctx.strokeStyle = isHovered ? '#ffffff' : 'rgba(255, 255, 255, 0.4)';
+              ctx.lineWidth = isHovered ? 1.5 : 0.75;
               ctx.stroke();
 
-              // Star Icon indicator on canvas if starred
-              if (n.starred && n.radius >= 6) {
-                ctx.fillStyle = '#FFFFFF';
-                ctx.font = '8px sans-serif';
+              if (n.starred && n.radius >= 5.5) {
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '7px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText('★', n.x, n.y - 0.5);
+                ctx.fillText('★', n.x, n.y);
               }
             }
 
@@ -940,15 +1036,14 @@
           });
 
           ctx.restore();
-
           animId = requestAnimationFrame(render);
         };
 
         animId = requestAnimationFrame(render);
         return () => cancelAnimationFrame(animId);
-      }, [searchQuery, filter, activeChatId, themeColor]);
+      }, [searchQuery, filter, physicsMode, activeChatId, themeColor]);
 
-      // 4. ResizeObserver for Crisp Retina Display
+      // 4. ResizeObserver for Crisp DPI
       useEffect(() => {
         const container = containerRef.current;
         const canvas = canvasRef.current;
@@ -974,7 +1069,7 @@
         return () => ro.disconnect();
       }, []);
 
-      // 5. Mouse / Interaction Handlers (Hover, Tooltip, Drag, Pan, Click)
+      // 5. Mouse / Interaction Handlers
       const findNodeAtPos = (clientX, clientY) => {
         const canvas = canvasRef.current;
         if (!canvas) return null;
@@ -1043,7 +1138,6 @@
           return;
         }
 
-        // Hover Tooltip Check
         const node = findNodeAtPos(e.clientX, e.clientY);
         setHoveredNode(node);
         if (node) {
@@ -1067,12 +1161,16 @@
           drag.draggedNode.isDragging = false;
         }
 
-        // If it was a simple click (not dragged)
         if (!drag.hasMoved) {
           const node = findNodeAtPos(e.clientX, e.clientY);
           if (node) {
-            if (node.type === 'chat') {
+            if (node.type === 'chat' || node.type === 'casual_chat') {
               onSelectChat(node.id);
+            } else if (node.type === 'project') {
+              const pid = node.id.replace('proj_', '');
+              if (onSelectProject) onSelectProject(pid);
+            } else if (node.type === 'engram' && onOpenNewEngram) {
+              onOpenNewEngram();
             }
           }
         }
@@ -1087,16 +1185,17 @@
         e.preventDefault();
         const cam = cameraRef.current;
         const zoomDelta = e.deltaY < 0 ? 1.1 : 0.9;
-        const newZoom = Math.max(0.5, Math.min(2.5, cam.zoom * zoomDelta));
-        cam.zoom = newZoom;
+        cam.zoom = Math.max(0.5, Math.min(2.5, cam.zoom * zoomDelta));
       };
 
-      const handleResetView = () => {
+      const handleFitToView = () => {
         cameraRef.current = { x: 0, y: 0, zoom: 1.0 };
       };
 
+      const totalNodes = (graphData.nodes || []).length;
+
       return (
-        <div className="glass-bracket p-2.5 rounded flex-1 flex flex-col gap-2 min-h-[250px] relative overflow-hidden bg-slate-950/70 border border-border/80">
+        <div className="glass-bracket p-2.5 rounded flex-1 flex flex-col gap-2 min-h-[260px] relative overflow-hidden bg-slate-950/70 border border-border/80">
           
           {/* Card Header: Title & Minimal Icon Controls */}
           <div className="flex flex-col gap-1.5 font-mono">
@@ -1104,16 +1203,26 @@
               <div className="flex items-center gap-1.5 text-slate-300">
                 <span className="w-1.5 h-1.5 rounded-full bg-argon animate-pulse"></span>
                 <span className="font-bold tracking-wider text-[11px] text-argon">MEMORY ENGRAMS</span>
-                <span className="text-[9px] text-slate-500 font-normal">[{rawChats.length}]</span>
+                <span className="text-[9px] text-slate-500 font-normal">[{totalNodes}]</span>
               </div>
               <div className="flex items-center gap-1">
+                {/* Physics Layout Mode Toggle [ TREE | ORBIT ] */}
                 <button
                   type="button"
-                  onClick={handleResetView}
-                  className="text-[9px] text-slate-400 hover:text-white px-1.5 py-0.5 rounded border border-border/60 hover:border-slate-600"
-                  title="Recenter Constellation"
+                  onClick={() => setPhysicsMode(m => m === 'orbit' ? 'tree' : 'orbit')}
+                  className="text-[9px] font-bold px-1.5 py-0.5 rounded border border-border/70 hover:border-argon/60 text-slate-300 hover:text-argon transition-colors uppercase"
+                  title="Toggle Tree / Orbit Constellation Layout"
                 >
-                  ⊙
+                  {physicsMode === 'orbit' ? '⊚ ORBIT' : '⑂ TREE'}
+                </button>
+                {/* Fit to View Button [ ⌖ ] */}
+                <button
+                  type="button"
+                  onClick={handleFitToView}
+                  className="text-[10px] text-slate-400 hover:text-white px-1.5 py-0.5 rounded border border-border/60 hover:border-slate-500 font-bold"
+                  title="Fit to View / Recenter Graph"
+                >
+                  ⌖
                 </button>
                 {onOpenNewEngram && (
                   <button
@@ -1141,9 +1250,9 @@
             <div className="flex items-center gap-1 text-[10px]">
               <div className="flex items-center bg-slate-900/90 rounded border border-border/60 p-0.5">
                 {[
-                  { id: 'all', label: 'All' },
-                  { id: 'starred', label: '★ Starred' },
-                  { id: 'projects', label: 'Projects' }
+                  { id: 'all', label: 'ALL' },
+                  { id: 'projects', label: 'PROJECTS' },
+                  { id: 'starred', label: '★ STARRED' }
                 ].map(tab => (
                   <button
                     key={tab.id}
@@ -1183,7 +1292,7 @@
           {/* Canvas Viewport */}
           <div
             ref={containerRef}
-            className="relative flex-1 w-full min-h-[160px] h-full overflow-hidden rounded bg-slate-950/90 border border-border/50 select-none cursor-crosshair"
+            className="relative flex-1 w-full min-h-[170px] h-full overflow-hidden rounded bg-slate-950/90 border border-border/50 select-none cursor-crosshair"
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
@@ -1193,37 +1302,46 @@
             <canvas id="memoryGraphCanvas" ref={canvasRef} className="w-full h-full block" />
 
             {/* HUD Tooltip Overlay */}
-            {tooltip && (
+            {tooltip && tooltip.node && (
               <div
                 style={{
                   left: `${tooltip.x}px`,
                   top: `${tooltip.y}px`,
                   transform: 'translate(-50%, -100%)'
                 }}
-                className="absolute pointer-events-none mb-1.5 z-30 px-2 py-1 rounded bg-slate-900/95 border border-argon/60 shadow-xl backdrop-blur-md font-mono text-[10px] text-slate-200 min-w-[130px] max-w-[200px]"
+                className="absolute pointer-events-none mb-1.5 z-30 px-2.5 py-1.5 rounded bg-slate-900/95 border border-argon/60 shadow-xl backdrop-blur-md font-mono text-[10px] text-slate-200 min-w-[140px] max-w-[220px]"
               >
                 <div className="flex items-center justify-between text-argon font-bold mb-0.5">
-                  <span className="truncate max-w-[150px]">{tooltip.node.title}</span>
+                  <span className="truncate max-w-[160px]">{tooltip.node.label || tooltip.node.id}</span>
                   {tooltip.node.starred && <span className="text-amber-400 ml-1">★</span>}
                 </div>
                 <div className="text-[9px] text-slate-400 flex items-center justify-between gap-1">
-                  <span className="truncate">
-                    {tooltip.node.type === 'project'
-                      ? 'PROJECT HUB'
-                      : (tooltip.node.project_id ? `Proj: ${tooltip.node.project_id}` : 'Standalone')}
+                  <span className="uppercase text-slate-500 text-[8px] font-bold">
+                    {tooltip.node.type === 'root' && 'Identity Core'}
+                    {tooltip.node.type === 'engram' && `${tooltip.node.category} layer`}
+                    {tooltip.node.type === 'trunk' && 'Workspace Trunk'}
+                    {tooltip.node.type === 'project' && 'Project Hub'}
+                    {tooltip.node.type === 'chat' && 'Project Thread'}
+                    {tooltip.node.type === 'casual_chat' && 'Casual Session'}
                   </span>
-                  {tooltip.node.turn_count && (
-                    <span className="text-slate-500 shrink-0">{tooltip.node.turn_count} turns</span>
+                  {tooltip.node.turns !== undefined && (
+                    <span className="text-slate-400 shrink-0">{tooltip.node.turns} turns</span>
+                  )}
+                  {tooltip.node.count !== undefined && (
+                    <span className="text-slate-400 shrink-0">{tooltip.node.count} records</span>
+                  )}
+                  {tooltip.node.pins_count !== undefined && (
+                    <span className="text-amber-400 shrink-0">{tooltip.node.pins_count} pins</span>
                   )}
                 </div>
-                {tooltip.node.created && (
-                  <div className="text-[8px] text-slate-500 mt-0.5">
-                    {new Date(tooltip.node.created * 1000).toLocaleDateString(undefined, {
-                      month: 'short',
-                      day: 'numeric',
-                      hour: '2-digit',
-                      minute: '2-digit'
-                    })}
+                {(tooltip.node.type === 'chat' || tooltip.node.type === 'casual_chat') && (
+                  <div className="text-[8px] text-slate-500 mt-0.5 flex justify-between items-center">
+                    <span>{tooltip.node.has_recap ? '✓ Recap Synced' : 'Click to load session'}</span>
+                  </div>
+                )}
+                {tooltip.node.type === 'project' && (
+                  <div className="text-[8px] text-amber-500/80 mt-0.5">
+                    Click to switch active project
                   </div>
                 )}
               </div>
@@ -1232,20 +1350,23 @@
             {/* Empty State Overlay */}
             {nodesRef.current.length === 0 && !isLoading && (
               <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-slate-600 font-mono text-[10px]">
-                <span>NO ENGRAM NODES FOUND</span>
-                <span className="text-[9px] text-slate-700 mt-0.5">Start a conversation to map neural paths</span>
+                <span>NO GRAPH NODES LOADED</span>
+                <span className="text-[9px] text-slate-700 mt-0.5">Initializing neural memory graph...</span>
               </div>
             )}
 
             {/* Bottom Status Ticker */}
             <div className="absolute bottom-1 left-2 right-2 flex items-center justify-between pointer-events-none text-[8px] font-mono text-slate-500">
-              <span>DRAG TO PAN • SCROLL ZOOM • CLICK NODE</span>
-              <span className="text-argon/70">{rawChats.length} SESSIONS</span>
+              <span>{physicsMode.toUpperCase()} MODE • ⌖ FIT • CLICK TO LOAD</span>
+              <span className="text-argon/70">{totalNodes} ACTIVE NODES</span>
             </div>
           </div>
         </div>
       );
     }
+
+    const MemoryNeuralGraph = MemoryGraph;
+
 
     // ── 3D HTML5 Canvas Memory Constellation Sphere ─────────────────────────
     function ConstellationSphere({ themeColor = '#56E2F5' }) {

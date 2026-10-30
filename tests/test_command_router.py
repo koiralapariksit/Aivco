@@ -2230,4 +2230,50 @@ async def test_fastapi_chat_and_project_endpoints(tmp_path, monkeypatch):
     assert exc_info.value.status_code == 404
 
 
+def test_memory_graph_endpoint(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server.app import app
+    import chat_store
+
+    test_chats = tmp_path / "graph_chats"
+    test_projects = tmp_path / "graph_projects"
+    custom_store = chat_store.ChatStore(chats_dir=test_chats, projects_dir=test_projects)
+    monkeypatch.setattr(chat_store, "chat_store", custom_store)
+
+    # Seed project and chat
+    c1 = custom_store.create_chat(project_id="test_proj")
+    custom_store.append_turn(c1["id"], {"turn_id": 1, "prompt": "p1", "response": "r1"})
+    custom_store.set_star(c1["id"], True)
+    custom_store.write_instructions("test_proj", "Strict test rules")
+    custom_store.add_pin("test_proj", "Pin 1")
+
+    client = TestClient(app)
+    res = client.get("/api/memory/graph")
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data["nodes"]) >= 7
+    assert len(data["links"]) >= 6
+
+    node_map = {n["id"]: n for n in data["nodes"]}
+    assert "core_root" in node_map
+    assert "trunk_projects" in node_map
+    assert "trunk_casual" in node_map
+    assert "proj_test_proj" in node_map
+    assert c1["id"] in node_map
+
+    # Check links
+    links = [(l["source"], l["target"]) for l in data["links"]]
+    assert ("core_root", "trunk_projects") in links
+    assert ("core_root", "trunk_casual") in links
+    assert ("trunk_projects", "proj_test_proj") in links
+    assert ("proj_test_proj", c1["id"]) in links
+
+    # Check chat node attributes
+    chat_node = node_map[c1["id"]]
+    assert chat_node["starred"] is True
+    assert chat_node["turns"] >= 1
+    assert chat_node["project_id"] == "proj_test_proj"
+
+
+
 

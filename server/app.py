@@ -1742,3 +1742,130 @@ def set_project_instructions_endpoint(project_id: str, req: ProjectInstructionsR
         return {"ok": True, "project_id": safe_pid, "instructions": text}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/memory/graph")
+async def get_memory_graph():
+    """
+    Dynamically constructs graph nodes and links for the UI Memory Constellation:
+    - 1 Core Root node
+    - 4 Cognitive Engram nodes (Semantic, Procedural, Episodic, Creative) with live item counts
+    - 2 Session Trunks (Projects and Casual/Standalone)
+    - Live Project Hubs (with instruction length and pin count)
+    - Live Chat Leaves (color-coded, turn count, recap status, starred)
+    """
+    from kernel import arbiter
+    from chat_store import chat_store
+
+    nodes = [
+        {"id": "core_root", "label": "AIVCO IDENTITY CORE", "type": "root", "radius": 12, "color": "#ffffff", "glow": "#38bdf8"}
+    ]
+    links = []
+
+    # 1. Ingest Identity Engrams from MultiLayerMemory
+    engram_counts = {
+        "semantic": 0,
+        "procedural": 0,
+        "episodic": 0,
+        "creative": 0
+    }
+    try:
+        mem = getattr(arbiter, "memory", None) or tiered_memory
+        if mem:
+            for k, fact in getattr(mem, "core_profile", {}).items():
+                if any(w in k.lower() for w in ("tone", "rule", "protocol", "workflow", "constraint")):
+                    engram_counts["procedural"] += 1
+                elif any(w in k.lower() for w in ("interest", "creative", "songwriting", "game")):
+                    engram_counts["creative"] += 1
+                else:
+                    engram_counts["semantic"] += 1
+            for lf in getattr(mem, "learned_facts", []):
+                ftype = lf.get("fact_type", "taught_rule")
+                if ftype == "taught_rule" or "rule" in ftype:
+                    engram_counts["procedural"] += 1
+                else:
+                    engram_counts["semantic"] += 1
+            engram_counts["episodic"] = len(getattr(mem, "episodes", []))
+    except Exception as e:
+        logger.warning(f"Could not read exact engram counts: {e}")
+
+    engram_configs = [
+        ("engram_semantic", f"SEMANTIC [{engram_counts['semantic']}]", "semantic", "#38bdf8", engram_counts['semantic']),
+        ("engram_procedural", f"PROCEDURAL [{engram_counts['procedural']}]", "procedural", "#818cf8", engram_counts['procedural']),
+        ("engram_episodic", f"EPISODIC [{engram_counts['episodic']}]", "episodic", "#34d399", engram_counts['episodic']),
+        ("engram_creative", f"CREATIVE [{engram_counts['creative']}]", "creative", "#f472b6", engram_counts['creative']),
+    ]
+    for eid, elabel, ecat, ecolor, ecount in engram_configs:
+        nodes.append({"id": eid, "label": elabel, "type": "engram", "category": ecat, "radius": 8, "color": ecolor, "count": ecount})
+        links.append({"source": "core_root", "target": eid})
+
+    # 2. Add Session Execution Trunks
+    nodes.append({"id": "trunk_projects", "label": "PROJECT WORKSPACES", "type": "trunk", "radius": 10, "color": "#f59e0b", "glow": "#f59e0b"})
+    nodes.append({"id": "trunk_casual", "label": "CASUAL / STANDALONE", "type": "trunk", "radius": 9, "color": "#94a3b8", "glow": "#cbd5e1"})
+    links.append({"source": "core_root", "target": "trunk_projects"})
+    links.append({"source": "core_root", "target": "trunk_casual"})
+
+    # 3. Read Real Projects from chat_store / data/projects/
+    all_chats = chat_store.list_chats()
+    project_ids = set()
+    for c in all_chats:
+        if c.get("project_id"):
+            project_ids.add(c["project_id"])
+
+    projects_dir = chat_store.get_projects_dir()
+    if projects_dir.exists():
+        for p in projects_dir.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                project_ids.add(p.name)
+
+    for pid in sorted(project_ids):
+        proj_node_id = f"proj_{pid}"
+        instr = chat_store.read_instructions(pid)
+        pins = chat_store.list_pins(pid)
+        nodes.append({
+            "id": proj_node_id,
+            "label": pid.upper().replace("_", " "),
+            "type": "project",
+            "radius": 9,
+            "color": "#f59e0b",
+            "instructions_len": len(instr),
+            "pins_count": len(pins)
+        })
+        links.append({"source": "trunk_projects", "target": proj_node_id})
+
+    # 4. Read Live Chats and attach to Projects or Casual Trunk
+    for c in all_chats:
+        cid = c["id"]
+        pid = c.get("project_id")
+        starred = bool(c.get("starred", False))
+        turns = c.get("turn_count", 0)
+        has_recap = bool(c.get("has_recap", False))
+        if not has_recap:
+            try:
+                has_recap = bool(chat_store.read_recap(cid).get("lines"))
+            except Exception:
+                has_recap = False
+        title = c.get("title") or "Untitled Session"
+
+        if pid:
+            node_type = "chat"
+            parent_id = f"proj_{pid}"
+            color = "#fbbf24" if starred else "#38bdf8"
+        else:
+            node_type = "casual_chat"
+            parent_id = "trunk_casual"
+            color = "#fbbf24" if starred else "#94a3b8"
+
+        nodes.append({
+            "id": cid,
+            "label": title,
+            "type": node_type,
+            "project_id": f"proj_{pid}" if pid else None,
+            "starred": starred,
+            "turns": turns,
+            "has_recap": has_recap,
+            "color": color
+        })
+        links.append({"source": parent_id, "target": cid})
+
+    return {"nodes": nodes, "links": links}
