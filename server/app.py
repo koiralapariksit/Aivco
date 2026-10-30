@@ -1805,7 +1805,7 @@ async def get_memory_graph():
     links.append({"source": "core_root", "target": "trunk_projects"})
     links.append({"source": "core_root", "target": "trunk_casual"})
 
-    # 3. Read Real Projects from chat_store / data/projects/
+    # 3. Read Real Projects from chat_store / data/projects/ / MultiLayerMemory
     all_chats = chat_store.list_chats()
     project_ids = set()
     for c in all_chats:
@@ -1818,13 +1818,39 @@ async def get_memory_graph():
             if p.is_dir() and not p.name.startswith("."):
                 project_ids.add(p.name)
 
+    mem_projects = getattr(mem, "projects", {}) if mem else {}
+    if isinstance(mem_projects, dict):
+        for pid in mem_projects.keys():
+            project_ids.add(pid)
+
     for pid in sorted(project_ids):
         proj_node_id = f"proj_{pid}"
         instr = chat_store.read_instructions(pid)
         pins = chat_store.list_pins(pid)
+
+        p_mem = mem_projects.get(pid) if isinstance(mem_projects, dict) else None
+        title = None
+        if p_mem is not None:
+            if hasattr(p_mem, "title"):
+                title = getattr(p_mem, "title")
+            elif isinstance(p_mem, dict):
+                title = p_mem.get("title")
+
+        if title:
+            if "cipher" in pid.lower():
+                display_label = "CIPHER! CHARADES"
+            elif "nepsent" in pid.lower():
+                display_label = "NEPSENT ENGINE"
+            elif " - " in title:
+                display_label = title.split(" - ")[0].upper()
+            else:
+                display_label = title.upper()
+        else:
+            display_label = pid.upper().replace("_", " ").replace("-", " ")
+
         nodes.append({
             "id": proj_node_id,
-            "label": pid.upper().replace("_", " "),
+            "label": display_label,
             "type": "project",
             "radius": 9,
             "color": "#f59e0b",
@@ -1847,9 +1873,16 @@ async def get_memory_graph():
                 has_recap = False
         title = c.get("title") or "Untitled Session"
 
+        matched_pid = None
         if pid:
+            for known_pid in project_ids:
+                if pid == known_pid or pid == f"proj_{known_pid}":
+                    matched_pid = known_pid
+                    break
+
+        if matched_pid:
             node_type = "chat"
-            parent_id = f"proj_{pid}"
+            parent_id = f"proj_{matched_pid}"
             color = "#fbbf24" if starred else "#38bdf8"
         else:
             node_type = "casual_chat"
@@ -1860,7 +1893,7 @@ async def get_memory_graph():
             "id": cid,
             "label": title,
             "type": node_type,
-            "project_id": f"proj_{pid}" if pid else None,
+            "project_id": f"proj_{matched_pid}" if matched_pid else None,
             "starred": starred,
             "turns": turns,
             "has_recap": has_recap,

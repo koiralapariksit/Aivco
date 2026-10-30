@@ -118,6 +118,25 @@
       pointer-events: none;
     }
 
+    /* ===== MemoryGraph Tree Styles ===== */
+    .mg{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
+    .mg-bar{display:flex;flex-wrap:wrap;gap:5px;padding:6px;border-bottom:1px solid #16303a;align-items:center}
+    .pill{background:none;border:1px solid #16303a;color:#6b8794;padding:2px 9px;border-radius:999px;font:inherit;cursor:pointer;transition:all 0.15s ease}
+    .pill:hover{color:#cfe8ef;border-color:#38bdf8}
+    .pill[aria-pressed=true]{color:#05080c;background:#38bdf8;border-color:#38bdf8;font-weight:600}
+    .pill.focus{color:#f59e0b;border-color:#f59e0b;background:rgba(245,158,11,0.12)}
+    .mg-bar input{flex:1;min-width:85px;background:#060b10;border:1px solid #16303a;color:#cfe8ef;padding:3px 8px;border-radius:999px;font:inherit;outline:none}
+    .mg-bar input:focus{border-color:#38bdf8}
+    .pill:focus-visible,.mg-bar input:focus-visible{outline:2px solid #f59e0b;outline-offset:1px}
+    .mg-stage{position:relative;flex:1;min-height:220px;overflow:hidden}
+    .mg-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:grab;touch-action:none}
+    .mg-tip{position:absolute;left:0;top:0;z-index:50;pointer-events:none;min-width:190px;max-width:250px;background:#07121aee;border:1px solid #38bdf8;border-radius:3px;padding:7px 9px;box-shadow:0 0 14px #38bdf833;font-family:'Space Grotesk',monospace;font-size:10px}
+    .mg-tip b{display:block;color:#fff}
+    .mg-tip .k{color:#6b8794}
+    .mg-tip .g{color:#fbbf24}
+    .mg-legend{position:absolute;left:8px;bottom:6px;right:8px;color:#475569;font-size:9px;pointer-events:none;font-family:monospace}
+    /* ===== end ===== */
+
     /* Radar scan animation */
     @keyframes radarSweep {
       0% { transform: rotate(0deg); }
@@ -458,7 +477,11 @@
       );
     }
 
-    // ── Dynamic Neural Memory Graph (Tree & Orbit Constellation Visualizer) ──
+    // ── Dynamic Neural Memory Tree Graph (Ingests Real AIVCO Data) ──
+    const COLS = [60, 200, 380, 580];     // x per column: root · engrams+trunks · projects · chat leaves
+    const GAP = 38, ENGRAM_GAP = 58;      // min row gap for leaves (>=26px label buffer) · extra room for engram dots
+    const isChat = n => n && (n.type === "chat" || n.type === "casual_chat");
+
     function MemoryGraph({
       activeChatId,
       activeProjectId,
@@ -469,42 +492,47 @@
       theme = 'argon',
       refreshKey = 0
     }) {
-      const canvasRef = useRef(null);
-      const containerRef = useRef(null);
-
-      // Graph Data State
-      const [graphData, setGraphData] = useState({ nodes: [], links: [] });
-      const [filter, setFilter] = useState('all'); // 'all' | 'projects' | 'starred'
-      const [searchQuery, setSearchQuery] = useState('');
-      const [physicsMode, setPhysicsMode] = useState('orbit'); // 'orbit' | 'tree'
-      const [hoveredNode, setHoveredNode] = useState(null);
-      const [tooltip, setTooltip] = useState(null);
-      const [isLoading, setIsLoading] = useState(false);
-
-      // Animation & Coordinates Ref
-      const nodesRef = useRef([]);
-      const linksRef = useRef([]);
-      const nodePosCacheRef = useRef(new Map());
-      const cameraRef = useRef({ x: 0, y: 0, zoom: 1.0 });
-      const dragRef = useRef({
-        isDraggingNode: false,
-        draggedNode: null,
-        isPanning: false,
-        startX: 0,
-        startY: 0,
-        hasMoved: false
+      const stageRef = useRef(null);
+      const cvRef = useRef(null);
+      const tipRef = useRef(null);
+      const S = useRef({
+        nodes: [],
+        links: [],
+        by: new Map(),
+        parent: new Map(),
+        asleep: false,
+        view: { x: 0, y: 0, k: 1 },
+        w: 0,
+        h: 0,
+        dpr: 1,
+        hover: null,
+        drag: null,
+        pan: null,
+        moved: false,
+        match: () => true,
+        term: "",
+        active: null,
+        path: new Set(),
+        fit: () => {}
       });
 
-      const themeColor = THEME_COLORS[theme] || '#56E2F5';
+      const [data, setData] = useState({ nodes: [], links: [] });
+      const [filter, setFilter] = useState("all");
+      const [q, setQ] = useState("");
+      const [focus, setFocus] = useState(null);
+      const [hoverId, setHoverId] = useState(null);
+      const [isLoading, setIsLoading] = useState(false);
 
-      // 1. Fetch Dynamic Graph Schema from GET /api/memory/graph
+      const wake = () => { S.current.asleep = false; };
+
+      // 0. Fetch real live data from /api/memory/graph
       const fetchGraph = useCallback(async () => {
         setIsLoading(true);
         try {
           const res = await fetch(`${API_BASE}/api/memory/graph`);
           if (res.ok) {
-            const data = await res.json();
-            setGraphData(data);
+            const json = await res.json();
+            setData(json);
           }
         } catch (err) {
           console.error("Failed to fetch memory graph:", err);
@@ -517,853 +545,557 @@
         fetchGraph();
       }, [fetchGraph, refreshKey]);
 
-      // 2. Build / Update Nodes and Links with Target Positions
       useEffect(() => {
-        const container = containerRef.current;
-        const width = container ? container.clientWidth : 280;
-        const height = container ? container.clientHeight : 240;
-        const cx = width / 2;
-        const cy = height / 2;
+        if (activeProjectId) {
+          setFocus(`proj_${activeProjectId}`);
+        }
+      }, [activeProjectId]);
 
-        const posCache = nodePosCacheRef.current;
-        const rawNodes = graphData.nodes || [];
-        const rawLinks = graphData.links || [];
+      /* 1. Build nodes/links, derive parent->child tree from links, lay out columns + rows */
+      useEffect(() => {
+        if (!data || !data.nodes || !data.nodes.length) return;
+        const s = S.current, old = s.by, by = new Map();
+        const nodes = data.nodes.map(d => {
+          const o = old.get(d.id);
+          const n = {
+            ...d,
+            x: o?.x ?? 0,
+            y: o?.y ?? 0,
+            vx: o?.vx ?? 0,
+            vy: o?.vy ?? 0,
+            ph: Math.random() * 6.28,
+            seeded: !!o
+          };
+          by.set(n.id, n);
+          return n;
+        });
+        const links = (data.links || []).map(l => ({
+          a: by.get(l.source),
+          b: by.get(l.target)
+        })).filter(l => l.a && l.b);
 
-        const projects = rawNodes.filter(n => n.type === 'project');
-        const casualChats = rawNodes.filter(n => n.type === 'casual_chat');
-        const projectChats = rawNodes.filter(n => n.type === 'chat');
-        const engrams = rawNodes.filter(n => n.type === 'engram');
+        const root = nodes.find(n => n.type === "root") || nodes[0];
+        if (!root) return;
 
-        const projIndexMap = new Map();
-        projects.forEach((p, idx) => projIndexMap.set(p.id, idx));
-
-        const newNodes = rawNodes.map((n, i) => {
-          let targetX = cx;
-          let targetY = cy;
-
-          if (physicsMode === 'tree') {
-            // ── TREE LAYOUT ──
-            if (n.type === 'root') {
-              targetX = cx;
-              targetY = 28;
-            } else if (n.type === 'engram') {
-              const eIdx = engrams.findIndex(e => e.id === n.id);
-              targetX = cx - 95 + eIdx * 34;
-              targetY = 70;
-            } else if (n.type === 'trunk') {
-              if (n.id === 'trunk_projects') {
-                targetX = cx - 50;
-                targetY = 115;
-              } else {
-                targetX = cx + 60;
-                targetY = 115;
-              }
-            } else if (n.type === 'project') {
-              const pIdx = projIndexMap.get(n.id) || 0;
-              const span = Math.max(1, projects.length - 1) * 44;
-              targetX = cx - 50 - span / 2 + pIdx * 44;
-              targetY = 160;
-            } else if (n.type === 'chat') {
-              const pIdx = projIndexMap.get(n.project_id) || 0;
-              const siblingChats = projectChats.filter(c => c.project_id === n.project_id);
-              const cIdx = siblingChats.findIndex(c => c.id === n.id);
-              const parentX = cx - 50 - (Math.max(1, projects.length - 1) * 44) / 2 + pIdx * 44;
-              targetX = parentX + (cIdx % 2 === 0 ? -1 : 1) * (10 + Math.floor(cIdx / 2) * 16);
-              targetY = 205 + Math.floor(cIdx / 2) * 22;
-            } else if (n.type === 'casual_chat') {
-              const cIdx = casualChats.findIndex(c => c.id === n.id);
-              targetX = cx + 60 + ((cIdx % 3) - 1) * 26;
-              targetY = 160 + Math.floor(cIdx / 3) * 24;
+        const kids = new Map(nodes.map(n => [n.id, []])), parent = new Map(), order = [root], seen = new Set([root.id]);
+        for (let i = 0; i < order.length; i++) {
+          links.forEach(l => {
+            if (l.a === order[i] && !seen.has(l.b.id)) {
+              seen.add(l.b.id);
+              parent.set(l.b.id, l.a.id);
+              kids.get(l.a.id).push(l.b);
+              order.push(l.b);
             }
+          });
+        }
+        nodes.forEach(n => {
+          if (!seen.has(n.id)) {
+            parent.set(n.id, root.id);
+            kids.get(root.id).push(n);
+            order.push(n);
+          }
+        });
+
+        let cur = 0;
+        const lay = (n, d) => {
+          n.depth = d;
+          const ks = kids.get(n.id);
+          n.leaf = !ks.length;
+          if (n.leaf) {
+            const h = n.type === "engram" ? ENGRAM_GAP : GAP;
+            n.ty = cur + h / 2;
+            cur += h;
           } else {
-            // ── ORBIT LAYOUT ──
-            if (n.type === 'root') {
-              targetX = cx;
-              targetY = cy;
-            } else if (n.type === 'engram') {
-              const eIdx = engrams.findIndex(e => e.id === n.id);
-              const angle = (eIdx / Math.max(1, engrams.length)) * Math.PI * 2 + Math.PI / 4;
-              targetX = cx + Math.cos(angle) * 44;
-              targetY = cy + Math.sin(angle) * 44;
-            } else if (n.type === 'trunk') {
-              if (n.id === 'trunk_projects') {
-                targetX = cx - 75;
-                targetY = cy - 20;
-              } else {
-                targetX = cx + 75;
-                targetY = cy + 20;
-              }
-            } else if (n.type === 'project') {
-              const pIdx = projIndexMap.get(n.id) || 0;
-              const angle = Math.PI + (pIdx - (projects.length - 1) / 2) * 0.7;
-              targetX = cx - 75 + Math.cos(angle) * 38;
-              targetY = cy - 20 + Math.sin(angle) * 38;
-            } else if (n.type === 'chat') {
-              const pIdx = projIndexMap.get(n.project_id) || 0;
-              const siblingChats = projectChats.filter(c => c.project_id === n.project_id);
-              const cIdx = siblingChats.findIndex(c => c.id === n.id);
-              const pAngle = Math.PI + (pIdx - (projects.length - 1) / 2) * 0.7;
-              const projBaseX = cx - 75 + Math.cos(pAngle) * 38;
-              const projBaseY = cy - 20 + Math.sin(pAngle) * 38;
-              const cAngle = pAngle + (cIdx + 1) * 0.8;
-              targetX = projBaseX + Math.cos(cAngle) * 26;
-              targetY = projBaseY + Math.sin(cAngle) * 26;
-            } else if (n.type === 'casual_chat') {
-              const cIdx = casualChats.findIndex(c => c.id === n.id);
-              const angle = (cIdx * 0.9) % (Math.PI * 2);
-              targetX = cx + 75 + Math.cos(angle) * (26 + (cIdx % 3) * 10);
-              targetY = cy + 20 + Math.sin(angle) * (26 + (cIdx % 3) * 10);
-            }
+            ks.forEach(k => lay(k, d + 1));
+            n.ty = (ks[0].ty + ks[ks.length - 1].ty) / 2;
           }
+        };
+        lay(root, 0);
 
-          let cached = posCache.get(n.id);
-          if (!cached) {
-            cached = { x: targetX, y: targetY, vx: 0, vy: 0 };
-            posCache.set(n.id, cached);
-          }
-
-          const turns = n.turns || 1;
-          let r = n.radius || 6;
-          if (n.type === 'chat' || n.type === 'casual_chat') {
-            r = Math.max(4, Math.min(9, 4 + turns * 0.7));
-          }
-
-          return {
-            ...n,
-            radius: r,
-            x: cached.x,
-            y: cached.y,
-            vx: cached.vx || 0,
-            vy: cached.vy || 0,
-            targetX,
-            targetY,
-            seed: i * 1.7 + 0.3
-          };
+        nodes.forEach(n => {
+          n.ty -= cur / 2;
+          n.tx = COLS[isChat(n) ? 3 : Math.min(n.depth, 2)];
         });
-
-        // Resolve link references to node objects
-        const nodeMap = new Map();
-        newNodes.forEach(node => nodeMap.set(node.id, node));
-
-        const resolvedLinks = [];
-        rawLinks.forEach(link => {
-          const srcId = typeof link.source === 'object' ? link.source.id : link.source;
-          const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
-          const sourceNode = nodeMap.get(srcId);
-          const targetNode = nodeMap.get(tgtId);
-          if (sourceNode && targetNode) {
-            resolvedLinks.push({
-              source: sourceNode,
-              target: targetNode,
-              type: targetNode.type
-            });
+        order.forEach(n => {
+          if (!n.seeded) {
+            const p = by.get(parent.get(n.id));
+            n.x = (p ? p.x : 0) + (Math.random() - .5) * 12;
+            n.y = (p ? p.y : 0) + (Math.random() - .5) * 12;
           }
         });
 
-        nodesRef.current = newNodes;
-        linksRef.current = resolvedLinks;
-      }, [graphData, physicsMode]);
+        Object.assign(s, { nodes, links, by, parent });
+        wake();
+        s.fit();
+      }, [data]);
 
-      // 3. Canvas Simulation & Rendering Loop
+      /* 2. Active path: root -> active chat */
       useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        let animId;
+        const s = S.current;
+        s.active = activeChatId;
+        const set = new Set();
+        for (let id = activeChatId; id && s.by.has(id); id = s.parent.get(id)) set.add(id);
+        s.path = set;
+      }, [activeChatId, data]);
 
-        const render = (time) => {
-          const width = canvas.width / (window.devicePixelRatio || 1);
-          const height = canvas.height / (window.devicePixelRatio || 1);
-          const cx = width / 2;
-          const cy = height / 2;
-
-          const nodes = nodesRef.current;
-          const links = linksRef.current;
-          const cam = cameraRef.current;
-          const q = searchQuery.trim().toLowerCase();
-
-          // Physics Step
-          if (nodes.length > 0) {
-            nodes.forEach(n => {
-              if (!n.isDragging) {
-                if (physicsMode === 'tree') {
-                  n.vx += (n.targetX - n.x) * 0.045;
-                  n.vy += (n.targetY - n.y) * 0.045;
-                  n.x += Math.cos(time * 0.001 + n.seed) * 0.06;
-                  n.y += Math.sin(time * 0.0012 + n.seed) * 0.06;
-                } else {
-                  n.x += Math.cos(time * 0.0012 + n.seed) * 0.12;
-                  n.y += Math.sin(time * 0.0015 + n.seed) * 0.12;
-                }
-              }
-            });
-
-            if (physicsMode === 'orbit') {
-              links.forEach(link => {
-                const dx = link.target.x - link.source.x;
-                const dy = link.target.y - link.source.y;
-                const dist = Math.hypot(dx, dy) || 1;
-                const ideal = link.source.type === 'root' ? 48 : (link.source.type === 'trunk' ? 38 : 28);
-                const force = (dist - ideal) * 0.014;
-                const fx = (dx / dist) * force;
-                const fy = (dy / dist) * force;
-                if (!link.source.isDragging) {
-                  link.source.vx += fx;
-                  link.source.vy += fy;
-                }
-                if (!link.target.isDragging) {
-                  link.target.vx -= fx;
-                  link.target.vy -= fy;
-                }
-              });
-
-              for (let i = 0; i < nodes.length; i++) {
-                for (let j = i + 1; j < nodes.length; j++) {
-                  const a = nodes[i];
-                  const b = nodes[j];
-                  const dx = b.x - a.x;
-                  const dy = b.y - a.y;
-                  const distSq = dx * dx + dy * dy + 1;
-                  const minDist = a.radius + b.radius + 14;
-                  if (distSq < minDist * minDist * 4) {
-                    const dist = Math.sqrt(distSq);
-                    const repulse = (minDist * minDist) / (distSq * 6);
-                    const rx = (dx / dist) * repulse;
-                    const ry = (dy / dist) * repulse;
-                    if (!a.isDragging) { a.vx -= rx; a.vy -= ry; }
-                    if (!b.isDragging) { b.vx += rx; b.vy += ry; }
-                  }
-                }
-              }
-
-              nodes.forEach(n => {
-                if (!n.isDragging) {
-                  n.vx += (cx - n.x) * 0.0007;
-                  n.vy += (cy - n.y) * 0.0007;
-                }
-              });
-            }
-
-            nodes.forEach(n => {
-              if (!n.isDragging) {
-                n.vx *= 0.84;
-                n.vy *= 0.84;
-                n.x += n.vx;
-                n.y += n.vy;
-                nodePosCacheRef.current.set(n.id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy });
-              }
-            });
-          }
-
-          // Clear
-          ctx.clearRect(0, 0, width, height);
-          ctx.save();
-          ctx.translate(cam.x, cam.y);
-          ctx.scale(cam.zoom, cam.zoom);
-
-          // Subtle Sci-Fi Grid Points
-          ctx.fillStyle = 'rgba(86, 226, 245, 0.035)';
-          const gridSize = 32;
-          const startX = Math.floor((-cam.x / cam.zoom) / gridSize) * gridSize - gridSize;
-          const startY = Math.floor((-cam.y / cam.zoom) / gridSize) * gridSize - gridSize;
-          const endX = startX + (width / cam.zoom) + gridSize * 2;
-          const endY = startY + (height / cam.zoom) + gridSize * 2;
-          for (let gx = startX; gx < endX; gx += gridSize) {
-            for (let gy = startY; gy < endY; gy += gridSize) {
-              ctx.beginPath();
-              ctx.arc(gx, gy, 0.75, 0, Math.PI * 2);
-              ctx.fill();
-            }
-          }
-
-          // Filter & Search Matchers
-          const matchesFilter = (n) => {
-            if (n.type === 'root') return true;
-            if (filter === 'starred') {
-              if (n.starred) return true;
-              if (n.type === 'project') return links.some(l => l.source.id === n.id && l.target.starred);
-              if (n.id === 'trunk_projects') return links.some(l => l.source.id === n.id && matchesFilter(l.target));
-              if (n.id === 'trunk_casual') return links.some(l => l.source.id === n.id && l.target.starred);
-              return false;
-            }
-            if (filter === 'projects') {
-              if (n.type === 'engram' || n.type === 'casual_chat' || n.id === 'trunk_casual') return false;
-              return true;
-            }
-            return true;
-          };
-
-          const matchesQuery = (n) => {
-            if (!q) return true;
-            return (n.label || '').toLowerCase().includes(q) || (n.id || '').toLowerCase().includes(q);
-          };
-
-          // Draw Links
-          links.forEach(link => {
-            const sMatch = matchesFilter(link.source) && matchesQuery(link.source);
-            const tMatch = matchesFilter(link.target) && matchesQuery(link.target);
-            const isDimmed = !sMatch || !tMatch;
-            const isHovered = hoveredNode && (hoveredNode.id === link.source.id || hoveredNode.id === link.target.id);
-
-            ctx.beginPath();
-            ctx.moveTo(link.source.x, link.source.y);
-            ctx.lineTo(link.target.x, link.target.y);
-
-            let strokeColor = 'rgba(148, 163, 184, 0.22)';
-            let strokeWidth = 0.85;
-
-            if (link.source.type === 'root') {
-              strokeColor = isHovered ? 'rgba(56, 189, 248, 0.95)' : 'rgba(56, 189, 248, 0.35)';
-              strokeWidth = isHovered ? 1.8 : 1.1;
-            } else if (link.source.type === 'trunk' && link.source.id === 'trunk_projects') {
-              strokeColor = isHovered ? 'rgba(245, 158, 11, 0.95)' : 'rgba(245, 158, 11, 0.32)';
-              strokeWidth = isHovered ? 1.8 : 1.0;
-            } else if (link.source.type === 'project') {
-              strokeColor = isHovered ? 'rgba(56, 189, 248, 0.95)' : 'rgba(56, 189, 248, 0.28)';
-              strokeWidth = isHovered ? 1.6 : 0.9;
-            } else {
-              strokeColor = isHovered ? 'rgba(168, 85, 247, 0.95)' : 'rgba(148, 163, 184, 0.24)';
-              strokeWidth = isHovered ? 1.4 : 0.8;
-            }
-
-            ctx.strokeStyle = strokeColor;
-            ctx.lineWidth = strokeWidth;
-            ctx.globalAlpha = isDimmed ? 0.08 : 1.0;
-            if (isHovered) {
-              ctx.shadowColor = link.source.color || '#38bdf8';
-              ctx.shadowBlur = 6;
-            } else {
-              ctx.shadowBlur = 0;
-            }
-            ctx.stroke();
-            ctx.shadowBlur = 0;
-            ctx.globalAlpha = 1.0;
-          });
-
-          // Draw Nodes
-          nodes.forEach(n => {
-            const isFiltered = !matchesFilter(n);
-            const isSearched = matchesQuery(n);
-            const isDimmed = isFiltered || (!isSearched && q);
-            const isHovered = hoveredNode && hoveredNode.id === n.id;
-            const isActive = (n.type === 'chat' || n.type === 'casual_chat') && n.id === activeChatId;
-
-            ctx.save();
-            ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
-
-            if (n.type === 'root') {
-              // ── AIVCO IDENTITY ROOT ──
-              const pulse = Math.sin(time * 0.005) * 3;
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius + 6 + pulse, 0, Math.PI * 2);
-              ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
-              ctx.lineWidth = 1;
-              ctx.stroke();
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.fillStyle = '#061325';
-              ctx.fill();
-              ctx.strokeStyle = '#38bdf8';
-              ctx.lineWidth = 2;
-              ctx.stroke();
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, 3.5, 0, Math.PI * 2);
-              ctx.fillStyle = '#ffffff';
-              ctx.shadowColor = '#38bdf8';
-              ctx.shadowBlur = 10;
-              ctx.fill();
-              ctx.shadowBlur = 0;
-
-              ctx.font = 'bold 8px "IBM Plex Mono", monospace';
-              ctx.fillStyle = '#e2e8f0';
-              ctx.textAlign = 'center';
-              ctx.textBaseline = 'top';
-              ctx.fillText('AIVCO CORE', n.x, n.y + n.radius + 3);
-
-            } else if (n.type === 'engram') {
-              // ── COGNITIVE ENGRAM LAYER ──
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius + 3, 0, Math.PI * 2);
-              ctx.strokeStyle = isHovered ? '#ffffff' : (n.color || '#38bdf8');
-              ctx.lineWidth = 1;
-              ctx.globalAlpha = isDimmed ? 0.15 : 0.4;
-              ctx.stroke();
-              ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.fillStyle = n.color || '#38bdf8';
-              if (isHovered) {
-                ctx.shadowColor = n.color || '#38bdf8';
-                ctx.shadowBlur = 8;
-              }
-              ctx.fill();
-              ctx.shadowBlur = 0;
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.strokeStyle = '#000000';
-              ctx.lineWidth = 1;
-              ctx.stroke();
-
-              ctx.font = 'bold 8px "IBM Plex Mono", monospace';
-              ctx.fillStyle = '#ffffff';
-              ctx.textAlign = 'center';
-              ctx.textBaseline = 'middle';
-              ctx.fillText((n.category || 'e')[0].toUpperCase(), n.x, n.y);
-
-            } else if (n.type === 'trunk') {
-              // ── SESSION TRUNK ──
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius + 4, 0, Math.PI * 2);
-              ctx.strokeStyle = isHovered ? '#ffffff' : (n.color || '#f59e0b');
-              ctx.lineWidth = 1;
-              ctx.globalAlpha = isDimmed ? 0.15 : 0.35;
-              ctx.stroke();
-              ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.fillStyle = '#0f172a';
-              ctx.fill();
-              ctx.strokeStyle = n.color || '#f59e0b';
-              ctx.lineWidth = 1.8;
-              if (isHovered) {
-                ctx.shadowColor = n.color || '#f59e0b';
-                ctx.shadowBlur = 8;
-              }
-              ctx.stroke();
-              ctx.shadowBlur = 0;
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, 2.5, 0, Math.PI * 2);
-              ctx.fillStyle = n.color || '#f59e0b';
-              ctx.fill();
-
-              ctx.font = 'bold 7px "IBM Plex Mono", monospace';
-              ctx.fillStyle = isHovered ? '#ffffff' : '#94a3b8';
-              ctx.textAlign = 'center';
-              ctx.textBaseline = 'top';
-              const label = n.id === 'trunk_projects' ? 'PROJECTS' : 'CASUAL';
-              ctx.fillText(label, n.x, n.y + n.radius + 2);
-
-            } else if (n.type === 'project') {
-              // ── PROJECT HUB ──
-              const pulse = Math.sin(time * 0.004 + n.seed) * 2;
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius + 4 + pulse, 0, Math.PI * 2);
-              ctx.strokeStyle = isHovered ? '#ffffff' : 'rgba(245, 158, 11, 0.45)';
-              ctx.lineWidth = 1;
-              ctx.stroke();
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.fillStyle = '#171206';
-              ctx.fill();
-              ctx.strokeStyle = '#f59e0b';
-              ctx.lineWidth = isHovered ? 2 : 1.4;
-              ctx.stroke();
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, 3, 0, Math.PI * 2);
-              ctx.fillStyle = '#f59e0b';
-              ctx.shadowColor = '#f59e0b';
-              ctx.shadowBlur = 6;
-              ctx.fill();
-              ctx.shadowBlur = 0;
-
-              ctx.font = 'bold 8px "IBM Plex Mono", monospace';
-              ctx.fillStyle = isHovered ? '#ffffff' : '#cbd5e1';
-              ctx.textAlign = 'center';
-              ctx.textBaseline = 'top';
-              const plabel = (n.label || '').toUpperCase();
-              ctx.fillText(plabel.length > 12 ? plabel.slice(0, 11) + '…' : plabel, n.x, n.y + n.radius + 2);
-
-            } else {
-              // ── CHAT & CASUAL CHAT LEAVES ──
-              let nodeColor = n.color || '#94a3b8';
-              let glowColor = n.starred ? '#fbbf24' : '#38bdf8';
-
-              if (isActive) {
-                const ringR = n.radius + ((time * 0.035) % 12);
-                const ringAlpha = 1.0 - (ringR - n.radius) / 12;
-                ctx.beginPath();
-                ctx.arc(n.x, n.y, ringR, 0, Math.PI * 2);
-                ctx.strokeStyle = themeColor;
-                ctx.lineWidth = 1.4;
-                ctx.globalAlpha = isDimmed ? 0.15 : ringAlpha;
-                ctx.stroke();
-                ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
-              }
-
-              if (q && isSearched) {
-                const sRing = n.radius + ((time * 0.05) % 8);
-                ctx.beginPath();
-                ctx.arc(n.x, n.y, sRing, 0, Math.PI * 2);
-                ctx.strokeStyle = '#fbbf24';
-                ctx.lineWidth = 1.2;
-                ctx.stroke();
-              }
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.fillStyle = nodeColor;
-              if (isHovered || isActive) {
-                ctx.shadowColor = glowColor;
-                ctx.shadowBlur = 8;
-              }
-              ctx.fill();
-              ctx.shadowBlur = 0;
-
-              ctx.beginPath();
-              ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
-              ctx.strokeStyle = isHovered ? '#ffffff' : 'rgba(255, 255, 255, 0.4)';
-              ctx.lineWidth = isHovered ? 1.5 : 0.75;
-              ctx.stroke();
-
-              if (n.starred && n.radius >= 5.5) {
-                ctx.fillStyle = '#ffffff';
-                ctx.font = '7px sans-serif';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText('★', n.x, n.y);
-              }
-            }
-
-            ctx.restore();
-          });
-
-          ctx.restore();
-          animId = requestAnimationFrame(render);
-        };
-
-        animId = requestAnimationFrame(render);
-        return () => cancelAnimationFrame(animId);
-      }, [searchQuery, filter, physicsMode, activeChatId, themeColor]);
-
-      // 4. ResizeObserver for Crisp DPI
+      /* 3. Filter pills / project focus / search */
       useEffect(() => {
-        const container = containerRef.current;
-        const canvas = canvasRef.current;
-        if (!container || !canvas) return;
-
-        const updateSize = () => {
-          const dpr = window.devicePixelRatio || 1;
-          const rect = container.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) return;
-
-          canvas.width = Math.floor(rect.width * dpr);
-          canvas.height = Math.floor(rect.height * dpr);
-          canvas.style.width = `${rect.width}px`;
-          canvas.style.height = `${rect.height}px`;
-
-          const ctx = canvas.getContext('2d');
-          ctx.scale(dpr, dpr);
+        const s = S.current, term = q.trim().toLowerCase();
+        s.term = term;
+        s.match = n => {
+          let ok = true;
+          if (focus) ok = n.id === focus || n.project_id === focus;
+          else if (filter === "projects") ok = n.type === "project" || n.id === "trunk_projects" || (isChat(n) && !!n.project_id);
+          else if (filter === "starred") ok = (isChat(n) && n.starred) || (n.type === "project" && (data.nodes || []).some(c => c.project_id === n.id && c.starred));
+          return ok && (!term || (n.label || "").toLowerCase().includes(term) || (n.category || "").includes(term));
         };
+      }, [filter, q, focus, data]);
 
-        updateSize();
-        const ro = new ResizeObserver(updateSize);
-        ro.observe(container);
-        return () => ro.disconnect();
+      /* 4. Retina canvas + fit-to-view */
+      useEffect(() => {
+        const s = S.current, el = stageRef.current, cv = cvRef.current;
+        if (!el || !cv) return;
+        s.fit = () => {
+          if (!s.w || !s.nodes.length) return;
+          let a = 1e9, b = -1e9, c = 1e9, d = -1e9;
+          s.nodes.forEach(n => {
+            a = Math.min(a, n.tx);
+            b = Math.max(b, n.tx);
+            c = Math.min(c, n.ty);
+            d = Math.max(d, n.ty);
+          });
+          const v = s.view;
+          v.k = Math.min((s.w - 260) / Math.max(b - a, 1), (s.h - 60) / Math.max(d - c, 1), 1.5);
+          v.x = 44 - a * v.k;
+          v.y = s.h / 2 - (c + d) / 2 * v.k;
+        };
+        const size = () => {
+          if (!el || !cv) return;
+          const r = el.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+          s.w = r.width;
+          s.h = r.height;
+          s.dpr = d;
+          cv.width = Math.round(r.width * d);
+          cv.height = Math.round(r.height * d);
+          if (!s.sized && r.width) {
+            s.sized = true;
+            s.fit();
+          }
+        };
+        size();
+        const ro = new ResizeObserver(size);
+        ro.observe(el);
+        window.addEventListener("resize", size);
+        return () => {
+          ro.disconnect();
+          window.removeEventListener("resize", size);
+        };
       }, []);
 
-      // 5. Mouse / Interaction Handlers
-      const findNodeAtPos = (clientX, clientY) => {
-        const canvas = canvasRef.current;
-        if (!canvas) return null;
-        const rect = canvas.getBoundingClientRect();
-        const cam = cameraRef.current;
-        const mx = (clientX - rect.left - cam.x) / cam.zoom;
-        const my = (clientY - rect.top - cam.y) / cam.zoom;
+      /* 5. Spring physics (nodes ease to their tree slots) + render loop */
+      useEffect(() => {
+        const s = S.current, cv = cvRef.current;
+        if (!cv) return;
+        const ctx = cv.getContext("2d");
+        let raf, last = performance.now();
 
-        const nodes = nodesRef.current;
-        for (let i = nodes.length - 1; i >= 0; i--) {
-          const n = nodes[i];
-          const dist = Math.hypot(n.x - mx, n.y - my);
-          if (dist <= n.radius + 6) {
-            return n;
-          }
-        }
-        return null;
-      };
-
-      const handleMouseDown = (e) => {
-        const node = findNodeAtPos(e.clientX, e.clientY);
-        const drag = dragRef.current;
-        drag.startX = e.clientX;
-        drag.startY = e.clientY;
-        drag.hasMoved = false;
-
-        if (node) {
-          drag.isDraggingNode = true;
-          drag.draggedNode = node;
-          node.isDragging = true;
-          node.vx = 0;
-          node.vy = 0;
-        } else {
-          drag.isPanning = true;
-        }
-      };
-
-      const handleMouseMove = (e) => {
-        const drag = dragRef.current;
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const rect = canvas.getBoundingClientRect();
-        const cam = cameraRef.current;
-
-        const dx = e.clientX - drag.startX;
-        const dy = e.clientY - drag.startY;
-        if (Math.hypot(dx, dy) > 4) {
-          drag.hasMoved = true;
-        }
-
-        if (drag.isDraggingNode && drag.draggedNode) {
-          const n = drag.draggedNode;
-          n.x = (e.clientX - rect.left - cam.x) / cam.zoom;
-          n.y = (e.clientY - rect.top - cam.y) / cam.zoom;
-          n.vx = 0;
-          n.vy = 0;
-          nodePosCacheRef.current.set(n.id, { x: n.x, y: n.y, vx: 0, vy: 0 });
-          return;
-        }
-
-        if (drag.isPanning) {
-          cam.x += e.movementX || dx;
-          cam.y += e.movementY || dy;
-          drag.startX = e.clientX;
-          drag.startY = e.clientY;
-          return;
-        }
-
-        const node = findNodeAtPos(e.clientX, e.clientY);
-        setHoveredNode(node);
-        if (node) {
-          canvas.style.cursor = 'pointer';
-          const screenX = node.x * cam.zoom + cam.x;
-          const screenY = node.y * cam.zoom + cam.y;
-          setTooltip({
-            x: Math.max(10, Math.min(rect.width - 10, screenX)),
-            y: Math.max(10, screenY - node.radius * cam.zoom - 6),
-            node: node
-          });
-        } else {
-          canvas.style.cursor = 'crosshair';
-          setTooltip(null);
-        }
-      };
-
-      const handleMouseUp = (e) => {
-        const drag = dragRef.current;
-        if (drag.isDraggingNode && drag.draggedNode) {
-          drag.draggedNode.isDragging = false;
-        }
-
-        if (!drag.hasMoved) {
-          const node = findNodeAtPos(e.clientX, e.clientY);
-          if (node) {
-            if (node.type === 'chat' || node.type === 'casual_chat') {
-              onSelectChat(node.id);
-            } else if (node.type === 'project') {
-              const pid = node.id.replace('proj_', '');
-              if (onSelectProject) onSelectProject(pid);
-            } else if (node.type === 'engram' && onOpenNewEngram) {
-              onOpenNewEngram();
+        const step = dt => {
+          if (s.asleep) return;
+          const { nodes } = s;
+          for (let i = 0; i < nodes.length; i++) {
+            for (let j = i + 1; j < nodes.length; j++) {
+              const a = nodes[i], b = nodes[j];
+              let dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy;
+              if (d2 > 78400) continue;
+              d2 = Math.max(d2, 100);
+              const d = Math.sqrt(d2), f = 600 / d2;
+              dx /= d;
+              dy /= d;
+              a.vx -= dx * f;
+              a.vy -= dy * f;
+              b.vx += dx * f;
+              b.vy += dy * f;
             }
           }
-        }
+          const damp = Math.pow(.8, dt);
+          let mv = 0;
+          for (const n of nodes) {
+            n.vx += (n.tx - n.x) * .07;
+            n.vy += (n.ty - n.y) * .07;
+            if (s.drag === n) {
+              n.vx = n.vy = 0;
+              continue;
+            }
+            n.vx *= damp;
+            n.vy *= damp;
+            n.x += n.vx * dt;
+            n.y += n.vy * dt;
+            mv = Math.max(mv, Math.abs(n.vx) + Math.abs(n.vy));
+          }
+          if (!s.drag && mv < .02) s.asleep = true;
+        };
 
-        drag.isDraggingNode = false;
-        drag.draggedNode = null;
-        drag.isPanning = false;
-        drag.hasMoved = false;
-      };
+        const draw = t => {
+          const { w, h, dpr, view: v, nodes, links } = s;
+          const pulse = .5 + .5 * Math.sin(t / 600);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, w, h);
+          ctx.save();
+          ctx.translate(v.x, v.y);
+          ctx.scale(v.k, v.k);
 
-      const handleWheel = (e) => {
-        e.preventDefault();
-        const cam = cameraRef.current;
-        const zoomDelta = e.deltaY < 0 ? 1.1 : 0.9;
-        cam.zoom = Math.max(0.5, Math.min(2.5, cam.zoom * zoomDelta));
-      };
+          for (const l of links) {
+            const { a, b } = l;
+            const m = s.match(a) && s.match(b);
+            const hi = s.path.has(a.id) && s.path.has(b.id) && s.parent.get(b.id) === a.id;
+            const cas = b.type === "casual_chat" || b.id === "trunk_casual";
+            const amb = b.type === "project" || b.type === "chat" || b.id === "trunk_projects";
+            const dx = b.x - a.x;
 
-      const handleFitToView = () => {
-        cameraRef.current = { x: 0, y: 0, zoom: 1.0 };
-      };
+            ctx.globalAlpha = m ? 1 : .12;
+            ctx.lineWidth = (hi ? 1.8 : 1) / v.k;
+            ctx.strokeStyle = hi ? "rgba(245,158,11,.8)" : cas ? "rgba(148,163,184,.25)" : amb ? "rgba(245,158,11,.35)" : "rgba(56,189,248,.22)";
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.bezierCurveTo(a.x + dx * .5, a.y, b.x - dx * .5, b.y, b.x, b.y);
+            ctx.stroke();
 
-      const totalNodes = (graphData.nodes || []).length;
+            if (hi) {
+              const u = (t / 1600 + a.ph) % 1, mx = (a.x + b.x) / 2, i = 1 - u;
+              const x = i * i * i * a.x + 3 * i * i * u * mx + 3 * i * u * u * mx + u * u * u * b.x;
+              const y = i * i * i * a.y + 3 * i * i * u * a.y + 3 * i * u * u * b.y + u * u * u * b.y;
+              ctx.globalAlpha = 1;
+              ctx.fillStyle = "#fff";
+              ctx.shadowColor = "#f59e0b";
+              ctx.shadowBlur = 8;
+              ctx.beginPath();
+              ctx.arc(x, y, 2.2 / v.k, 0, 6.283);
+              ctx.fill();
+              ctx.shadowBlur = 0;
+            }
+          }
+
+          for (const n of nodes) {
+            const m = s.match(n), hov = s.hover === n, act = n.id === s.active, hit = s.term && m;
+            const r = n.radius * (hov ? 1.3 : 1) * (hit ? 1 + .25 * pulse : 1);
+            const dim = m ? 1 : .13;
+
+            if (n.type === "project" || n.type === "trunk" || (isChat(n) && n.starred)) {
+              ctx.strokeStyle = n.color;
+              ctx.globalAlpha = dim * (.15 + .25 * (1 - pulse));
+              ctx.lineWidth = 1.5;
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, r + 4 + pulse * 5, 0, 6.283);
+              ctx.stroke();
+            }
+
+            if (n.type === "engram") {
+              const N = Math.min(n.count || 0, 24);
+              ctx.fillStyle = n.color;
+              ctx.globalAlpha = dim * .85;
+              for (let i = 0; i < N; i++) {
+                const a = i * 6.283 / N - 1.5708, rr = r + 11 + (i % 3) * 3;
+                ctx.beginPath();
+                ctx.arc(n.x + Math.cos(a) * rr, n.y + Math.sin(a) * rr, 1.7, 0, 6.283);
+                ctx.fill();
+              }
+            }
+
+            if (n.type === "project" && n.instructions_len != null) {
+              ctx.globalAlpha = dim;
+              ctx.lineWidth = 2;
+              ctx.strokeStyle = n.color;
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, r + 6, -1.5708, -1.5708 + 6.283 * Math.min(1, n.instructions_len / 2000));
+              ctx.stroke();
+            }
+
+            ctx.globalAlpha = dim;
+            ctx.fillStyle = n.color;
+            ctx.shadowColor = n.glow || n.color;
+            ctx.shadowBlur = m ? (hov || act || hit ? 22 : isChat(n) ? 8 : 15) : 0;
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, r, 0, 6.283);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            if (n.has_recap) {
+              ctx.strokeStyle = n.color;
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, r + 2.5, 0, 6.283);
+              ctx.stroke();
+            }
+
+            if (n.type === "root" || n.type === "trunk") {
+              ctx.strokeStyle = n.glow;
+              ctx.lineWidth = 1.4;
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, r + 4 + pulse * 2, 0, 6.283);
+              ctx.stroke();
+            }
+
+            if (act) {
+              for (let k = 0; k < 2; k++) {
+                const ph = ((t / 1700) + k * .5) % 1;
+                ctx.globalAlpha = (1 - ph) * .9;
+                ctx.strokeStyle = "#f59e0b";
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, r + 4 + ph * 24, 0, 6.283);
+                ctx.stroke();
+              }
+            }
+
+            if (m) {
+              ctx.globalAlpha = .92;
+              ctx.fillStyle = "#cfe8ef";
+              ctx.font = `${(isChat(n) ? 9.5 : 10.5) / v.k}px "IBM Plex Mono", monospace`;
+              const lim = n.leaf ? 38 : 24;
+              const txt = (n.label || "").length > lim ? (n.label || "").slice(0, lim - 1) + "..." : (n.label || "");
+              if (n.leaf) {
+                ctx.textAlign = "left";
+                ctx.fillText(txt, n.x + r + 9 / v.k, n.y + 3.5 / v.k);
+              } else {
+                ctx.textAlign = "center";
+                ctx.fillText(txt, n.x, n.y - r - (n.type === "engram" || n.type === "project" ? 20 : 10) / v.k);
+              }
+            }
+          }
+          ctx.restore();
+          ctx.globalAlpha = 1;
+        };
+
+        const loop = t => {
+          const dt = Math.min((t - last) / 16.667, 3);
+          last = t;
+          step(dt);
+          draw(t);
+          raf = requestAnimationFrame(loop);
+        };
+        raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+      }, []);
+
+      /* 6. Pointer: drag node · pan · wheel zoom · hover · click */
+      useEffect(() => {
+        const s = S.current, cv = cvRef.current;
+        if (!cv) return;
+
+        const pos = e => {
+          const r = cv.getBoundingClientRect();
+          return [e.clientX - r.left, e.clientY - r.top];
+        };
+        const world = (x, y) => [(x - s.view.x) / s.view.k, (y - s.view.y) / s.view.k];
+        const hit = (x, y) => {
+          const [wx, wy] = world(x, y);
+          let best = null, bd = 1e9;
+          for (const n of s.nodes) {
+            const d = Math.hypot(n.x - wx, n.y - wy);
+            if (d <= n.radius + 6 / s.view.k && d < bd) {
+              best = n;
+              bd = d;
+            }
+          }
+          return best;
+        };
+
+        const down = e => {
+          const [x, y] = pos(e), n = e.button === 2 ? null : hit(x, y);
+          s.moved = false;
+          cv.setPointerCapture(e.pointerId);
+          if (n) {
+            s.drag = n;
+            wake();
+          } else {
+            s.pan = { x, y, vx: s.view.x, vy: s.view.y };
+          }
+          cv.style.cursor = "grabbing";
+        };
+
+        const move = e => {
+          const [x, y] = pos(e);
+          if (s.drag) {
+            const [wx, wy] = world(x, y);
+            s.drag.x = wx;
+            s.drag.y = wy;
+            s.moved = true;
+            wake();
+            return;
+          }
+          if (s.pan) {
+            if (Math.abs(x - s.pan.x) + Math.abs(y - s.pan.y) > 3) s.moved = true;
+            s.view.x = s.pan.vx + x - s.pan.x;
+            s.view.y = s.pan.vy + y - s.pan.y;
+            return;
+          }
+          const n = hit(x, y);
+          if (n !== s.hover) {
+            s.hover = n;
+            setHoverId(n ? n.id : null);
+          }
+          cv.style.cursor = n ? "pointer" : "grab";
+          if (tipRef.current) {
+            tipRef.current.style.transform = `translate(${Math.min(x + 16, s.w - 260)}px,${Math.min(y + 16, s.h - 130)}px)`;
+          }
+        };
+
+        const up = () => {
+          const n = s.drag, mv = s.moved;
+          s.drag = null;
+          s.pan = null;
+          wake();
+          cv.style.cursor = s.hover ? "pointer" : "grab";
+          if (n && !mv) {
+            if (isChat(n)) {
+              onSelectChat?.(n.id);
+            } else if (n.type === "project") {
+              setFocus(f => f === n.id ? null : n.id);
+              const rawPid = n.id.replace(/^proj_/, "");
+              onSelectProject?.(rawPid);
+            }
+          }
+        };
+
+        const wheel = e => {
+          e.preventDefault();
+          const [x, y] = pos(e), [wx, wy] = world(x, y);
+          const k = Math.min(4, Math.max(.3, s.view.k * Math.exp(-e.deltaY * .0015)));
+          s.view.k = k;
+          s.view.x = x - wx * k;
+          s.view.y = y - wy * k;
+        };
+
+        const leave = () => {
+          s.hover = null;
+          setHoverId(null);
+        };
+        const noCtx = e => e.preventDefault();
+
+        cv.addEventListener("pointerdown", down);
+        cv.addEventListener("pointermove", move);
+        cv.addEventListener("pointerup", up);
+        cv.addEventListener("pointerleave", leave);
+        cv.addEventListener("wheel", wheel, { passive: false });
+        cv.addEventListener("contextmenu", noCtx);
+        return () => {
+          cv.removeEventListener("pointerdown", down);
+          cv.removeEventListener("pointermove", move);
+          cv.removeEventListener("pointerup", up);
+          cv.removeEventListener("pointerleave", leave);
+          cv.removeEventListener("wheel", wheel);
+          cv.removeEventListener("contextmenu", noCtx);
+        };
+      }, [onSelectChat, onSelectProject]);
+
+      const hn = hoverId && S.current.by.get(hoverId);
+      const proj = hn?.project_id && S.current.by.get(hn.project_id);
+      const fp = focus && S.current.by.get(focus);
+      const childCount = hn ? (data.nodes || []).filter(c => S.current.parent.get(c.id) === hn.id).length : 0;
+      const totalNodes = (data.nodes || []).length;
 
       return (
-        <div className="glass-bracket p-2.5 rounded flex-1 flex flex-col gap-2 min-h-[260px] relative overflow-hidden bg-slate-950/70 border border-border/80">
-          
+        <div className="glass-bracket p-2.5 rounded flex-1 flex flex-col gap-1.5 min-h-[300px] relative overflow-hidden bg-slate-950/70 border border-border/80">
           {/* Card Header: Title & Minimal Icon Controls */}
-          <div className="flex flex-col gap-1.5 font-mono">
-            <div className="flex items-center justify-between text-xs">
-              <div className="flex items-center gap-1.5 text-slate-300">
-                <span className="w-1.5 h-1.5 rounded-full bg-argon animate-pulse"></span>
-                <span className="font-bold tracking-wider text-[11px] text-argon">MEMORY ENGRAMS</span>
-                <span className="text-[9px] text-slate-500 font-normal">[{totalNodes}]</span>
-              </div>
-              <div className="flex items-center gap-1">
-                {/* Physics Layout Mode Toggle [ TREE | ORBIT ] */}
-                <button
-                  type="button"
-                  onClick={() => setPhysicsMode(m => m === 'orbit' ? 'tree' : 'orbit')}
-                  className="text-[9px] font-bold px-1.5 py-0.5 rounded border border-border/70 hover:border-argon/60 text-slate-300 hover:text-argon transition-colors uppercase"
-                  title="Toggle Tree / Orbit Constellation Layout"
-                >
-                  {physicsMode === 'orbit' ? '⊚ ORBIT' : '⑂ TREE'}
-                </button>
-                {/* Fit to View Button [ ⌖ ] */}
-                <button
-                  type="button"
-                  onClick={handleFitToView}
-                  className="text-[10px] text-slate-400 hover:text-white px-1.5 py-0.5 rounded border border-border/60 hover:border-slate-500 font-bold"
-                  title="Fit to View / Recenter Graph"
-                >
-                  ⌖
-                </button>
-                {onOpenNewEngram && (
-                  <button
-                    type="button"
-                    onClick={onOpenNewEngram}
-                    className="text-[9px] text-slate-400 hover:text-argon px-1.5 py-0.5 rounded border border-border/60 hover:border-argon/40"
-                    title="Commit Semantic Engram"
-                  >
-                    + ENGRAM
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={onNewChat}
-                  className="text-[9px] text-argon hover:text-white font-bold px-1.5 py-0.5 rounded border border-argon/40 hover:bg-argon/20 transition-all flex items-center gap-0.5"
-                  title="Start Fresh Chat Session"
-                >
-                  <span>+</span>
-                  <span>NEW</span>
-                </button>
-              </div>
+          <div className="flex items-center justify-between text-xs pb-1 border-b border-border/40 font-mono">
+            <div className="flex items-center gap-1.5 text-slate-300">
+              <span className="w-1.5 h-1.5 rounded-full bg-argon animate-pulse"></span>
+              <span className="font-bold tracking-wider text-[11px] text-argon">MEMORY ENGRAMS</span>
+              <span className="text-[9px] text-slate-500 font-normal">[{totalNodes}]</span>
             </div>
-
-            {/* Sub-header Filter Tabs & Search Bar */}
-            <div className="flex items-center gap-1 text-[10px]">
-              <div className="flex items-center bg-slate-900/90 rounded border border-border/60 p-0.5">
-                {[
-                  { id: 'all', label: 'ALL' },
-                  { id: 'projects', label: 'PROJECTS' },
-                  { id: 'starred', label: '★ STARRED' }
-                ].map(tab => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setFilter(tab.id)}
-                    className={`px-1.5 py-0.5 rounded text-[9px] transition-colors ${
-                      filter === tab.id 
-                        ? 'bg-argon/20 text-argon font-bold border border-argon/40' 
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-              <div className="relative flex-1">
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Filter nodes..."
-                  className="w-full bg-slate-900/80 border border-border/70 rounded px-1.5 py-0.5 text-[10px] text-slate-200 outline-none focus:border-argon placeholder:text-slate-600"
-                />
-                {searchQuery && (
-                  <button
-                    type="button"
-                    onClick={() => setSearchQuery('')}
-                    className="absolute right-1 top-0.5 text-[9px] text-slate-500 hover:text-white"
-                  >
-                    ✕
-                  </button>
-                )}
-              </div>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={fetchGraph}
+                className="text-[9px] px-1.5 py-0.5 rounded border border-border/70 text-slate-400 hover:text-slate-200 hover:border-argon/50 transition-colors uppercase font-mono"
+                title="Refresh Memory Graph"
+              >
+                ↻ REFRESH
+              </button>
             </div>
           </div>
 
-          {/* Canvas Viewport */}
-          <div
-            ref={containerRef}
-            className="relative flex-1 w-full min-h-[170px] h-full overflow-hidden rounded bg-slate-950/90 border border-border/50 select-none cursor-crosshair"
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp}
-            onWheel={handleWheel}
-          >
-            <canvas id="memoryGraphCanvas" ref={canvasRef} className="w-full h-full block" />
-
-            {/* HUD Tooltip Overlay */}
-            {tooltip && tooltip.node && (
-              <div
-                style={{
-                  left: `${tooltip.x}px`,
-                  top: `${tooltip.y}px`,
-                  transform: 'translate(-50%, -100%)'
-                }}
-                className="absolute pointer-events-none mb-1.5 z-30 px-2.5 py-1.5 rounded bg-slate-900/95 border border-argon/60 shadow-xl backdrop-blur-md font-mono text-[10px] text-slate-200 min-w-[140px] max-w-[220px]"
+          <div className="mg">
+            <div className="mg-bar">
+              {[["all", "ALL"], ["projects", "PROJECTS"], ["starred", "★ STARRED"]].map(([k, l]) => (
+                <button
+                  key={k}
+                  className="pill"
+                  aria-pressed={filter === k && !focus}
+                  onClick={() => { setFilter(k); setFocus(null); }}
+                >
+                  {l}
+                </button>
+              ))}
+              {fp && (
+                <button className="pill focus" onClick={() => setFocus(null)} title="Clear project focus">
+                  {fp.label} ✕
+                </button>
+              )}
+              <input
+                value={q}
+                onChange={e => setQ(e.target.value)}
+                placeholder="Search memory..."
+                aria-label="Search memory"
+              />
+              <button
+                className="pill"
+                onClick={() => { S.current.fit(); setFocus(null); }}
+                aria-label="Fit to view"
+                title="Fit to view"
               >
-                <div className="flex items-center justify-between text-argon font-bold mb-0.5">
-                  <span className="truncate max-w-[160px]">{tooltip.node.label || tooltip.node.id}</span>
-                  {tooltip.node.starred && <span className="text-amber-400 ml-1">★</span>}
+                ⌖
+              </button>
+            </div>
+
+            <div className="mg-stage" ref={stageRef}>
+              <canvas
+                ref={cvRef}
+                role="img"
+                aria-label="Memory tree: identity core, cognitive engrams, project workspaces and chats"
+              />
+              <div className="mg-legend">
+                drag node • pan canvas • wheel zoom • click chat to load • click project to focus
+              </div>
+
+              {hn && (
+                <div className="mg-tip" ref={tipRef}>
+                  <b>{hn.label}</b>
+                  <div className="k">
+                    {hn.type.replace("_", " ").toUpperCase()}
+                    {hn.category ? ` · ${hn.category}` : ""}
+                    {hn.starred && <span className="g"> · ★ starred</span>}
+                  </div>
+                  {isChat(hn) && (
+                    <div>
+                      turns {hn.turns} · project {proj ? proj.label : "standalone"}
+                      {hn.has_recap !== undefined && (
+                        <>
+                          <br />recap {hn.has_recap ? "✓ active" : "— none yet"}
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {hn.type === "project" && <div>{childCount} chats · click to focus</div>}
+                  {hn.type === "trunk" && <div>{childCount} branches</div>}
+                  {hn.type === "engram" && <div>{hn.count} stored items</div>}
+                  {hn.type === "root" && <div>cognitive baseline</div>}
                 </div>
-                <div className="text-[9px] text-slate-400 flex items-center justify-between gap-1">
-                  <span className="uppercase text-slate-500 text-[8px] font-bold">
-                    {tooltip.node.type === 'root' && 'Identity Core'}
-                    {tooltip.node.type === 'engram' && `${tooltip.node.category} layer`}
-                    {tooltip.node.type === 'trunk' && 'Workspace Trunk'}
-                    {tooltip.node.type === 'project' && 'Project Hub'}
-                    {tooltip.node.type === 'chat' && 'Project Thread'}
-                    {tooltip.node.type === 'casual_chat' && 'Casual Session'}
+              )}
+
+              {(!data.nodes || data.nodes.length === 0) && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-slate-500 font-mono text-[10px]">
+                  <span className="animate-pulse text-argon">
+                    {isLoading ? "SYNCING REAL AIVCO MEMORY GRAPH..." : "NO MEMORY NODES FOUND"}
                   </span>
-                  {tooltip.node.turns !== undefined && (
-                    <span className="text-slate-400 shrink-0">{tooltip.node.turns} turns</span>
-                  )}
-                  {tooltip.node.count !== undefined && (
-                    <span className="text-slate-400 shrink-0">{tooltip.node.count} records</span>
-                  )}
-                  {tooltip.node.pins_count !== undefined && (
-                    <span className="text-amber-400 shrink-0">{tooltip.node.pins_count} pins</span>
-                  )}
                 </div>
-                {(tooltip.node.type === 'chat' || tooltip.node.type === 'casual_chat') && (
-                  <div className="text-[8px] text-slate-500 mt-0.5 flex justify-between items-center">
-                    <span>{tooltip.node.has_recap ? '✓ Recap Synced' : 'Click to load session'}</span>
-                  </div>
-                )}
-                {tooltip.node.type === 'project' && (
-                  <div className="text-[8px] text-amber-500/80 mt-0.5">
-                    Click to switch active project
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Empty State Overlay */}
-            {nodesRef.current.length === 0 && !isLoading && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-slate-600 font-mono text-[10px]">
-                <span>NO GRAPH NODES LOADED</span>
-                <span className="text-[9px] text-slate-700 mt-0.5">Initializing neural memory graph...</span>
-              </div>
-            )}
-
-            {/* Bottom Status Ticker */}
-            <div className="absolute bottom-1 left-2 right-2 flex items-center justify-between pointer-events-none text-[8px] font-mono text-slate-500">
-              <span>{physicsMode.toUpperCase()} MODE • ⌖ FIT • CLICK TO LOAD</span>
-              <span className="text-argon/70">{totalNodes} ACTIVE NODES</span>
+              )}
             </div>
           </div>
         </div>
       );
     }
+
 
     const MemoryNeuralGraph = MemoryGraph;
 
@@ -2707,6 +2439,7 @@
                 activeChatId={activeChatId}
                 activeProjectId={activeProjectId}
                 onSelectChat={loadChat}
+                onSelectProject={handleProjectSelect}
                 onNewChat={handleNewChat}
                 onOpenNewEngram={() => setShowNewEngramModal(true)}
                 theme={theme}
