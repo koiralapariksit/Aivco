@@ -139,6 +139,7 @@ class ChatStore:
             "project_id": safe_pid,
             "starred": False,
             "title_is_manual": False,
+            "turn_count": 0,
         }
         self._atomic_write_json(chat_dir / "meta.json", meta)
         self._atomic_write_json(chat_dir / "recap.json", {"lines": [], "covered_through_turn": 0})
@@ -186,6 +187,7 @@ class ChatStore:
                         "updated": meta.get("updated", 0.0),
                         "project_id": meta.get("project_id"),
                         "starred": bool(meta.get("starred", False)),
+                        "turn_count": meta.get("turn_count", 0),
                     })
                 except Exception:
                     continue
@@ -238,10 +240,12 @@ class ChatStore:
             with open(msg_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            # Update meta.json updated time and check for auto-titling
+            # Update meta.json updated time, turn_count, and check for auto-titling
             meta = self.get_chat(chat_id)
             if meta:
                 meta["updated"] = record["ts"]
+                if record.get("turn_id"):
+                    meta["turn_count"] = max(meta.get("turn_count", 0), int(record["turn_id"]))
                 # Auto-title on the first turn if title has not been manually edited
                 if not meta.get("title_is_manual") and record.get("prompt") and record.get("turn_id") == 1:
                     raw_prompt = record["prompt"]
