@@ -1623,35 +1623,38 @@ def test_history_16_exchanges_and_groq_override():
             mode="casual",
         )
 
-    # 1. Default (16 exchanges = 32 messages)
+    # 1. Default (16 exchanges = 32 messages + 1 casual recap system message = 33)
     msgs = ledger.get_chat_history_messages(mode="casual")
-    assert len(msgs) == 32
-    assert msgs[0]["content"] == "user prompt 5"
-    assert msgs[1]["content"] == "assistant answer 5"
+    assert len(msgs) == 33
+    assert msgs[0]["role"] == "system"
+    assert "[CASUAL SESSION RECAP]" in msgs[0]["content"]
+    assert msgs[1]["content"] == "user prompt 5"
+    assert msgs[2]["content"] == "assistant answer 5"
     assert msgs[-2]["content"] == "user prompt 20"
     assert msgs[-1]["content"] == "assistant answer 20"
 
-    # 2. Groq override (8 exchanges = 16 messages)
+    # 2. Groq override (8 exchanges = 16 messages + 1 casual recap system message = 17)
     msgs_groq = ledger.get_chat_history_messages(mode="casual", provider="groq")
-    assert len(msgs_groq) == 16
-    assert msgs_groq[0]["content"] == "user prompt 13"
-    assert msgs_groq[1]["content"] == "assistant answer 13"
+    assert len(msgs_groq) == 17
+    assert msgs_groq[0]["role"] == "system"
+    assert msgs_groq[1]["content"] == "user prompt 13"
+    assert msgs_groq[2]["content"] == "assistant answer 13"
     assert msgs_groq[-2]["content"] == "user prompt 20"
     assert msgs_groq[-1]["content"] == "assistant answer 20"
 
     # 3. Colon prefix format (e.g. "tier2:groq")
     msgs_tier2 = ledger.get_chat_history_messages(mode="casual", provider="tier2:groq")
-    assert len(msgs_tier2) == 16
-    assert msgs_tier2[0]["content"] == "user prompt 13"
+    assert len(msgs_tier2) == 17
+    assert msgs_tier2[1]["content"] == "user prompt 13"
 
-    # 4. Non-overridden provider gets 16 exchanges
+    # 4. Non-overridden provider gets 16 exchanges + 1 system message = 33
     msgs_gemini = ledger.get_chat_history_messages(mode="casual", provider="gemini")
-    assert len(msgs_gemini) == 32
+    assert len(msgs_gemini) == 33
 
-    # 5. Explicit max_turns overrides default
+    # 5. Explicit max_turns overrides default (4 exchanges = 8 messages + 1 system message = 9)
     msgs_custom = ledger.get_chat_history_messages(max_turns=4, mode="casual", provider="groq")
-    assert len(msgs_custom) == 8
-    assert msgs_custom[0]["content"] == "user prompt 17"
+    assert len(msgs_custom) == 9
+    assert msgs_custom[1]["content"] == "user prompt 17"
 
 
 def test_history_char_cap_keeps_newest_drops_oldest():
@@ -1773,4 +1776,83 @@ def test_duplicate_injection_fix_project_mode(tmp_path):
     project_ctx = ledger.get_recent_history_context(mode="project", project_id=pid)
     # Must be empty string to prevent duplicate history injection in Project Mode
     assert project_ctx == ""
+
+
+def test_casual_mode_in_memory_recap(tmp_path):
+    from kernel.arbiter import SessionExecutionLedger
+
+    test_projects_dir = tmp_path / "projects"
+    ledger = SessionExecutionLedger(projects_dir=test_projects_dir)
+
+    # 1. First 16 turns: within active window, casual recap must be empty
+    for i in range(1, 17):
+        ledger.record_turn(
+            prompt=f"Casual turn {i}: test function {i}",
+            target_tier="kernel",
+            actual_provider="groq",
+            response_markdown=f"Casual response {i}",
+            mode="casual",
+        )
+    assert ledger.get_casual_recap_entries() == []
+    msgs_16 = ledger.get_chat_history_messages(mode="casual")
+    assert len(msgs_16) == 32
+    assert not any("[CASUAL SESSION RECAP]" in m.get("content", "") for m in msgs_16)
+
+    # 2. Simulate turns 17 through 20 (4 turns evicted from 16-turn active window)
+    for i in range(17, 21):
+        resp = f"Casual response {i}"
+        if i == 18:
+            resp = "```html\n<!DOCTYPE html><html><body>Casual App</body></html>\n```"
+        ledger.record_turn(
+            prompt=f"Casual turn {i}: test function {i}",
+            target_tier="kernel",
+            actual_provider="groq",
+            response_markdown=resp,
+            mode="casual",
+        )
+
+    # Casual recap must exist in-memory covering turns 1..4
+    recap_entries = ledger.get_casual_recap_entries()
+    assert len(recap_entries) == 4
+    assert recap_entries[0] == "Casual turn 1: test function 1 -> groq"
+    assert recap_entries[1] == "Casual turn 2: test function 2 -> groq"
+    assert recap_entries[2] == "Casual turn 3: test function 3 -> groq"
+    assert recap_entries[3] == "Casual turn 4: test function 4 -> groq"
+
+    # Verify get_chat_history_messages includes [CASUAL SESSION RECAP]
+    msgs_20 = ledger.get_chat_history_messages(mode="casual")
+    assert len(msgs_20) == 33
+    assert msgs_20[0]["role"] == "system"
+    recap_content = msgs_20[0]["content"]
+    assert "[CASUAL SESSION RECAP]" in recap_content
+    assert "Casual turn 1: test function 1 -> groq" in recap_content
+    assert "Casual turn 2: test function 2 -> groq" in recap_content
+    assert "Casual turn 3: test function 3 -> groq" in recap_content
+    assert "Casual turn 4: test function 4 -> groq" in recap_content
+    assert "Casual turn 5" not in recap_content
+
+    # Active verbatim history contains turns 5..20
+    assert msgs_20[1]["content"] == "Casual turn 5: test function 5"
+    assert msgs_20[-2]["content"] == "Casual turn 20: test function 20"
+
+    # STRICT REQUIREMENT: Verify NO files were created under test_projects_dir or disk
+    assert not test_projects_dir.exists() or len(list(test_projects_dir.iterdir())) == 0
+
+    # 3. Test 800-character cap and aggregate compression
+    for i in range(21, 42):
+        ledger.record_turn(
+            prompt=f"Casual turn {i}: very long user exploration query explaining complex architectural design patterns and database sharding techniques {i}",
+            target_tier="kernel",
+            actual_provider="claude",
+            response_markdown=f"Response {i}",
+            mode="casual",
+        )
+    compressed_entries = ledger.get_casual_recap_entries()
+    assert len("\n".join(compressed_entries)) <= 800
+    assert any("Earlier session context: user exploration and Q&A" in e for e in compressed_entries)
+
+    # 4. Test clear resets casual recap in RAM
+    ledger.clear(mode="casual")
+    assert ledger.get_casual_recap_entries() == []
+    assert len(ledger.get_chat_history_messages(mode="casual")) == 0
 

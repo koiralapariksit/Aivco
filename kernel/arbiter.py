@@ -401,6 +401,8 @@ class SessionExecutionLedger:
         self._lock = threading.Lock()
         self._max_turns: int = max_turns
         self._turns: Deque[SessionTurnRecord] = deque(maxlen=max_turns)
+        self._casual_turns: List[SessionTurnRecord] = []
+        self._casual_recap: List[str] = []
         self._turn_counter: int = 0
         self._project_ledgers: Dict[str, Deque[SessionTurnRecord]] = {}
         self._projects_dir: Path = projects_dir or PROJECTS_DIR
@@ -582,6 +584,44 @@ class SessionExecutionLedger:
             return []
         return []
 
+    def _compress_casual_recap_lines(self, lines: List[str], max_chars: int = 800) -> List[str]:
+        if not lines:
+            return []
+
+        def fits(cand: List[str]) -> bool:
+            return len("\n".join(cand)) <= max_chars
+
+        if fits(lines):
+            return lines
+
+        for n in range(2, len(lines) + 1):
+            milestone = "[Earlier session context: user exploration and Q&A]"
+            cand = [milestone] + lines[n:]
+            if fits(cand):
+                return cand
+
+        return ["[Earlier session context: user exploration and Q&A]"]
+
+    def _sync_casual_recap(self) -> None:
+        t_count = len(self._casual_turns)
+        if t_count <= HISTORY_EXCHANGES:
+            self._casual_recap = []
+            return
+
+        evicted = self._casual_turns[:-HISTORY_EXCHANGES]
+        raw_lines: List[str] = []
+        for t in evicted:
+            p_text = (t.prompt or "").strip()[:80].strip()
+            prov = t.actual_provider or "groq"
+            app_flag = " [app built]" if t.has_html_artifact else ""
+            raw_lines.append(f"{p_text} -> {prov}{app_flag}")
+
+        self._casual_recap = self._compress_casual_recap_lines(raw_lines, max_chars=800)
+
+    def get_casual_recap_entries(self) -> List[str]:
+        with self._lock:
+            return list(self._casual_recap)
+
     def record_turn(
         self,
         prompt: str,
@@ -670,6 +710,8 @@ class SessionExecutionLedger:
                     response=response_markdown,
                 )
                 self._turns.append(rec)
+                self._casual_turns.append(rec)
+                self._sync_casual_recap()
                 return rec
 
     def get_last_turn(self, mode: str = "casual", project_id: Optional[str] = None) -> Optional[SessionTurnRecord]:
@@ -678,7 +720,7 @@ class SessionExecutionLedger:
                 assert project_id is not None
                 turns = self._get_or_load_project_turns(project_id)
                 return turns[-1] if turns else None
-            return self._turns[-1] if self._turns else None
+            return self._casual_turns[-1] if self._casual_turns else (self._turns[-1] if self._turns else None)
 
     def get_recent_turns(self, n: int = 3, mode: str = "casual", project_id: Optional[str] = None) -> List[SessionTurnRecord]:
         with self._lock:
@@ -686,7 +728,8 @@ class SessionExecutionLedger:
                 assert project_id is not None
                 turns = self._get_or_load_project_turns(project_id)
                 return list(turns)[-n:]
-            return list(self._turns)[-n:]
+            src = self._casual_turns if self._casual_turns else list(self._turns)
+            return src[-n:]
 
     def get_recent_history_context(
         self,
@@ -703,7 +746,8 @@ class SessionExecutionLedger:
             if self._is_project_mode(mode, project_id):
                 return ""
 
-            turns = [t for t in self._turns if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
+            turns_source = self._casual_turns if self._casual_turns else list(self._turns)
+            turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-n:]
             if not turns:
                 return ""
             blocks = []
@@ -777,7 +821,11 @@ class SessionExecutionLedger:
 
                 turns_source = self._get_or_load_project_turns(safe_pid)
             else:
-                turns_source = self._turns
+                if self._casual_recap:
+                    recap_text = "\n".join(self._casual_recap)[:800]
+                    messages.append({"role": "system", "content": f"[CASUAL SESSION RECAP]\n{recap_text}"})
+
+                turns_source = self._casual_turns if self._casual_turns else self._turns
 
             candidate_turns = [t for t in turns_source if not ATTRIBUTION_PATTERN.search(t.prompt)][-effective_max_turns:]
             collected_pairs: List[List[Dict[str, str]]] = []
@@ -852,7 +900,8 @@ class SessionExecutionLedger:
                         return rec
                 return None
             else:
-                for rec in reversed(self._turns):
+                src = self._casual_turns if self._casual_turns else self._turns
+                for rec in reversed(src):
                     if rec.has_html_artifact and rec.html_code:
                         return rec
                 return None
@@ -869,7 +918,7 @@ class SessionExecutionLedger:
                 assert project_id is not None
                 turns_source = self._get_or_load_project_turns(project_id)
             else:
-                turns_source = self._turns
+                turns_source = self._casual_turns if self._casual_turns else self._turns
 
             if query:
                 q_lower = query.lower()
@@ -913,6 +962,8 @@ class SessionExecutionLedger:
                     self._project_ledgers[safe_pid].clear()
             else:
                 self._turns.clear()
+                self._casual_turns.clear()
+                self._casual_recap.clear()
                 self._turn_counter = 0
 
 
