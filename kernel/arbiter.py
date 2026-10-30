@@ -1491,8 +1491,32 @@ class ProviderHealthRegistry:
                 rec.last_failure_reason = ""
             self._has_active_cooldown = False
 
+    def get_cooldown_remaining(self, provider: str, now: Optional[float] = None) -> float:
+        norm = self._normalize(provider)
+        current_time = now if now is not None else time.time()
+        with self._lock:
+            if norm not in self._registry:
+                return 0.0
+            rec = self._registry[norm]
+            return max(0.0, rec.cooldown_until - current_time)
+
 
 provider_health = ProviderHealthRegistry()
+
+
+def classify_failure(text: str) -> str:
+    """
+    Classifies error text into 'rate_limit', 'timeout', or 'unavailable'.
+    Matches exact phrases to prevent false positives (e.g., bare 'rate' matching 'generate').
+    """
+    if not text:
+        return "unavailable"
+    t = text.lower()
+    if "rate_limit_reached" in t or "rate limit" in t or "ratelimit" in t or "429" in t:
+        return "rate_limit"
+    if "timed out" in t or "timeout" in t:
+        return "timeout"
+    return "unavailable"
 
 
 # ── Fuzzy Provider Directive Extraction ──────────────────────────────────────

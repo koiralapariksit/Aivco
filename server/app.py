@@ -12,6 +12,7 @@ Flow of POST /api/chat:
 import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
+import logging
 import os
 from pathlib import Path
 import re
@@ -50,8 +51,10 @@ from kernel.cognitive_kernel import (
     LIVE_SEARCH_PATTERN,
     session_ledger,
 )
-from kernel.arbiter import ensure_project_storage, sanitize_project_id, PIN_SHORTCUT_PATTERN
+from kernel.arbiter import ensure_project_storage, sanitize_project_id, PIN_SHORTCUT_PATTERN, classify_failure
 from agents.browser_agent import browser_agent, search_web, universal_web_agent
+
+logger = logging.getLogger("aivco.server")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 V2_MEMORY_FILE = str(BASE_DIR / "data" / "v2_memory.json")
@@ -899,9 +902,10 @@ async def execute_web_failover(
     t0: float,
     mode: str = "casual",
     project_id: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Cascades to Tier 2 Groq/Gemini when Brain 4 web provider fails or hits rate limit."""
-    provider_health.record_failure(target_tier, reason="unavailable")
+    provider_health.record_failure(target_tier, reason=reason or "unavailable")
     tiered_context = _assemble_context(cloud_safe=True)
     failover_notice = (
         f"⚡ [aivco-kernel] {target_tier.upper()} web session unavailable/rate-limited. "
@@ -988,18 +992,16 @@ async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> 
         auto_launch_wait=15.0,
     )
     if is_web_result_failure(web_res):
-        if not escalated:
-            provider_health.record_failure(
-                provider,
-                reason="rate_limit" if "rate" in (web_res or "").lower() else "timeout",
-            )
+        reason = classify_failure(web_res or "")
         return await execute_web_failover(
             provider, clean_prompt, raw_prompt, plan["handshake"], t0,
             mode=plan.get("mode", "casual"), project_id=plan.get("project_id"),
+            reason=reason,
         )
 
     latency_ms = max(10, round((time.time() - t0) * 1000))
     web_res = sanitize_and_validate_code_output(web_res)
+    provider_health.record_success(provider, latency_ms)
     finish_turn(
         raw_prompt=raw_prompt,
         response=web_res,
@@ -1013,7 +1015,7 @@ async def _run_web_account(plan: Dict[str, Any], raw_prompt: str, t0: float) -> 
             f"AIVCO Cognitive Arbiter -> Brain 4 ({provider}) execution." if escalated
             else f"AIVCO ExtensionBridgeRouter -> {provider} Chrome Extension execution."
         ),
-        health_ms=None if escalated else latency_ms,
+        health_ms=latency_ms,
         mode=plan.get("mode", "casual"),
         project_id=plan.get("project_id"),
     )
@@ -1099,6 +1101,13 @@ async def _run_web_fallback(plan: Dict[str, Any], raw_prompt: str, t0: float) ->
         mode=plan.get("mode", "casual"), project_id=plan.get("project_id"),
     )
     web_res = await asyncio.to_thread(universal_web_agent.query, fallback_target, enveloped)
+    latency_ms = max(10, round((time.time() - t0) * 1000))
+    if is_web_result_failure(web_res):
+        reason = classify_failure(web_res or "")
+        provider_health.record_failure(fallback_target, reason=reason)
+    else:
+        provider_health.record_success(fallback_target, latency_ms)
+
     finish_turn(
         raw_prompt=raw_prompt,
         response=web_res,
@@ -1109,6 +1118,7 @@ async def _run_web_fallback(plan: Dict[str, Any], raw_prompt: str, t0: float) ->
         source=f"web_agent_{fallback_target}",
         task_type="web_agent_fallback",
         system_content=f"AIVCO UniversalWebAgent -> {fallback_target} web fallback.",
+        health_ms=latency_ms if not is_web_result_failure(web_res) else None,
         mode=plan.get("mode", "casual"),
         project_id=plan.get("project_id"),
     )
@@ -1177,12 +1187,25 @@ async def _run_llm(plan: Dict[str, Any], raw_prompt: str, t0: float) -> Dict[str
         )
         return _reply(plan, t0, response_text, provider_label, "Episodic", tier_num, min_lat=0)
     except ModelUnavailableError as exc:
-        provider_health.record_failure(force_provider or "groq", reason=str(exc))
+        target_prov = getattr(exc, "provider", None) or force_provider
+        if target_prov:
+            provider_health.record_failure(target_prov, reason=str(exc))
+        else:
+            logger.warning("Provider failure detected with unknown provider target; skipping health degradation")
         return _reply(plan, t0, f"[AIVCO] Model unavailable: {exc}", "unavailable", "Procedural", 0, min_lat=0)
     except ModelGenerationError as exc:
-        provider_health.record_failure(force_provider or "groq", reason=str(exc))
+        target_prov = getattr(exc, "provider", None) or force_provider
+        if target_prov:
+            provider_health.record_failure(target_prov, reason=str(exc))
+        else:
+            logger.warning("Provider failure detected with unknown provider target; skipping health degradation")
         return _reply(plan, t0, f"[AIVCO] Generation error: {exc}", "error", "Procedural", 0, min_lat=0)
     except Exception as exc:
+        target_prov = getattr(exc, "provider", None) or force_provider
+        if target_prov:
+            provider_health.record_failure(target_prov, reason=str(exc))
+        else:
+            logger.warning("Provider failure detected with unknown provider target; skipping health degradation")
         return _reply(plan, t0, f"[AIVCO] Error: {exc}", "error", "Procedural", 0, min_lat=0)
 
 
