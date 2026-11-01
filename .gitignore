@@ -1,32 +1,42 @@
+# Python & Environment
 __pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+*.py[cod]
+*$py.class
 .venv/
 venv/
+ENV/
+*.env
+.env.*
 
-# User memory and backups (private)
-memory/user/
-memory/user/*.bak
-memory/user/profile.json
-memory/user/profile_backup.json
-memory/user/*.json.bak
+# AIVCO Local Data & Persistent Memory (CRITICAL PRIVACY)
+data/
+data/chats/
+data/projects/
+data/provider_health.json
+data/*.jsonl
+data/*.json
 
-# Local environment and logs
-.env
+# Fine-tuning & Chat Logs
+*.jsonl
+dataset_logs/
+telemetry/
 *.log
 
-# Personal AIVCO memory & runtime data
-data/
-data/ai_credentials_vault.json
-data/browser_profiles/
-data/browser_profile/
-data/*.dmp
-data/*.pma
+# Personal Identity & Local Cache
+memory/user/
+memory/storage/
+.cache/
+.pytest_cache/
+*.sqlite3
+*.db
 
 # Temp and backup files
 scratch/
 scripts/
 *.bak
+
+# OS / Editor Artifacts
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
