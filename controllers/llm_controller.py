@@ -10,15 +10,12 @@ Supports:
 
 import json
 import os
-import subprocess
+import httpx
 from pathlib import Path
 from typing import Dict, List, Optional
 import urllib.error
 import urllib.request
 
-LLAMA_PATH = r"C:\Users\koira\AppData\Local\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama-cli.exe"
-
-MODEL_PATH = r"C:\Users\koira\.cache\huggingface\hub\models--ggml-org--Qwen3-0.6B-GGUF\snapshots\b5f37287796e5be0ea3dab2e7430873fb3f73e49\Qwen3-0.6B-Q4_0.gguf"
 LLM_TIMEOUT_SECONDS = 180
 LLM_MAX_TOKENS = 512
 
@@ -33,6 +30,73 @@ class ModelUnavailableError(AIVCOModelError):
 
 class ModelGenerationError(AIVCOModelError):
     """The model failed during generation or network request."""
+
+
+class LocalInferenceProvider:
+    """OpenAI-compatible local endpoint adapter for Ollama and mlx_lm.server."""
+
+    def __init__(self, environ=None):
+        environ = os.environ if environ is None else environ
+        self.enabled = str(environ.get("AIVCO_LOCAL_ENABLED", "true")).strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self.base_url = str(environ.get(
+            "AIVCO_LOCAL_BASE_URL", "http://127.0.0.1:11434/v1"
+        )).rstrip("/")
+        self.model = str(environ.get("AIVCO_LOCAL_MODEL", "qwen3:8b")).strip() or "qwen3:8b"
+        try:
+            self.timeout = max(0.1, float(environ.get("AIVCO_LOCAL_TIMEOUT", "60.0")))
+        except (TypeError, ValueError):
+            self.timeout = 60.0
+
+    def is_available(self) -> bool:
+        if not self.enabled:
+            return False
+        timeout = httpx.Timeout(0.3, connect=0.3)
+        try:
+            response = httpx.get(f"{self.base_url}/models", timeout=timeout)
+            response.raise_for_status()
+            return True
+        except (httpx.HTTPError, OSError, ValueError):
+            return False
+
+    def generate(
+        self,
+        system_prompt: str = "",
+        user_prompt: str = "",
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        if not self.enabled:
+            raise ModelUnavailableError("Local inference is disabled (AIVCO_LOCAL_ENABLED=false).")
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(
+                {"role": turn.get("role", "user"), "content": turn.get("content", "")}
+                for turn in history if turn.get("content")
+            )
+        messages.append({"role": "user", "content": user_prompt})
+        body = {"model": self.model, "messages": messages}
+        timeout = httpx.Timeout(self.timeout, connect=min(0.3, self.timeout))
+        try:
+            response = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers={"Content-Type": "application/json", "User-Agent": "AIVCO/2.0"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            raise ModelUnavailableError(f"Local inference endpoint unavailable: {exc}") from exc
+        try:
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError("response content is not text")
+            return content.strip()
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ModelGenerationError(f"Invalid local inference response: {exc}") from exc
 
 
 EXECUTIVE_AUTONOMY_MANDATE = (
@@ -135,7 +199,7 @@ def load_env_file(env_path: str = ".env") -> None:
 
 
 class LLMController:
-    local_enabled: bool = False
+    local_enabled: bool = True
 
     def __init__(
         self,
@@ -143,25 +207,61 @@ class LLMController:
         model_path: Optional[str] = None,
         env_path: str = ".env",
     ):
-        self.local_enabled = False
         self.env_path = env_path
         load_env_file(self.env_path)
-        # Brain 2 (Local LLM) hard-killed to prevent OS crashes & RAM exhaustion
+        self.local_provider = LocalInferenceProvider()
+        self.local_enabled = self.local_provider.enabled
+        # Retained as inert compatibility attributes; local inference is URL based.
         self.llama_path = None
         self.model_path = None
 
     def is_available(self) -> bool:
-        return False
+        return self.local_provider.is_available()
 
     def _generate_local(self, system_prompt: str = "", user_prompt: str = "") -> str:
-        return "[aivco-kernel] Local LLM tier permanently disabled to conserve system RAM."
+        return self.local_provider.generate(system_prompt, user_prompt)
 
     def generate(self, system_prompt: str = "", user_prompt: str = "") -> str:
         """
-        Local LLM generation permanently disabled to conserve system RAM.
-        Raises ModelUnavailableError so callers know local LLM cannot be run.
+        Generate through the configured OpenAI-compatible local endpoint.
         """
-        raise ModelUnavailableError("[aivco-kernel] Local LLM tier permanently disabled to conserve system RAM.")
+        return self._generate_local(system_prompt, user_prompt)
+
+    @staticmethod
+    def _budgeted_inputs(system_prompt, user_prompt, history, tier):
+        # Imported lazily to keep controller initialization decoupled from the kernel.
+        from kernel.cognitive_kernel import budget_prompt_context
+
+        try:
+            result = budget_prompt_context(
+                system_prompt=system_prompt,
+                user_input=user_prompt,
+                conversation_history=history or [],
+                tier=tier,
+            )
+        except ValueError as exc:
+            error = ModelUnavailableError(f"{tier} context budget exceeded: {exc}")
+            error.provider = {"compact": "local_llama", "standard": "groq", "deep": "gemini"}[tier]
+            raise error from exc
+        parts = result["components"]
+        return parts["system_prompt"], parts["user_input"], parts["conversation_history"]
+
+    def _invoke_local(self, system_prompt: str, user_prompt: str, history=None) -> str:
+        system_prompt, user_prompt, budgeted_history = self._budgeted_inputs(
+            system_prompt, user_prompt, history, "compact"
+        )
+        if budgeted_history:
+            return self.local_provider.generate(system_prompt, user_prompt, history=budgeted_history)
+        return self.generate(system_prompt, user_prompt)
+
+    def _local_result(self, response: str, fallback: bool = False, source: str = "") -> dict:
+        provider = "local_llama" if not fallback else f"local_llama (fallback from {source})"
+        return {
+            "response": response,
+            "provider_used": provider,
+            "fallback_triggered": fallback,
+            "model_used": self.local_provider.model,
+        }
 
     def _generate_groq(
         self,
@@ -482,12 +582,22 @@ class LLMController:
         effective_force = force_provider or (task_type if task_type in ("claude", "chatgpt", "grok", "gemini_web", "claude_web", "chatgpt_web", "grok_web", "gemini", "groq", "local_llama", "local") else None)
 
         def _invoke(fn, prov_name):
+            budget_tier = {
+                "local_llama": "compact",
+                "groq": "standard",
+                "gemini": "deep",
+            }.get(prov_name)
+            call_system, call_user, call_history = system_prompt, user_prompt, history
+            if budget_tier:
+                call_system, call_user, call_history = self._budgeted_inputs(
+                    system_prompt, user_prompt, history, budget_tier
+                )
             if history is not None and prov_name in ("groq", "gemini", "claude", "chatgpt", "grok"):
                 try:
-                    return fn(system_prompt, user_prompt, history=history)
+                    return fn(call_system, call_user, history=call_history)
                 except TypeError:
-                    return fn(system_prompt, user_prompt)
-            return fn(system_prompt, user_prompt)
+                    return fn(call_system, call_user)
+            return fn(call_system, call_user)
 
         WEB_PROVIDERS = ("claude", "chatgpt", "grok", "gemini_web", "gemini-web", "claude_web", "chatgpt_web", "grok_web")
         if effective_force in WEB_PROVIDERS:
@@ -521,12 +631,8 @@ class LLMController:
 
         if effective_force in ("local", "local_llama") or task_type in ("private", "memory", "offline"):
             try:
-                response = self.generate(system_prompt, user_prompt)
-                return {
-                    "response": response,
-                    "provider_used": "local_llama",
-                    "fallback_triggered": False,
-                }
+                response = self._invoke_local(system_prompt, user_prompt, history=history)
+                return self._local_result(response)
             except AIVCOModelError as local_err:
                 # Privacy block eliminated: operator requires cloud fallback (Groq -> Gemini) to execute
                 try:
@@ -539,15 +645,15 @@ class LLMController:
                 except AIVCOModelError as groq_err:
                     try:
                         response = _invoke(self._generate_gemini, "gemini")
-                        return {
-                            "response": response,
-                            "provider_used": "gemini (fallback from local)",
-                            "fallback_triggered": True,
-                        }
                     except AIVCOModelError as gemini_err:
                         raise ModelUnavailableError(
                             f"All providers failed (local: {local_err}; groq: {groq_err}; gemini: {gemini_err})"
                         )
+                    return {
+                        "response": response,
+                        "provider_used": "gemini (fallback from local)",
+                        "fallback_triggered": True,
+                    }
 
         if effective_force == "gemini":
             try:
@@ -567,12 +673,8 @@ class LLMController:
                         "fallback_triggered": True,
                     }
                 except AIVCOModelError:
-                    response = self.generate(system_prompt, user_prompt)
-                    return {
-                        "response": response,
-                        "provider_used": "local_llama (fallback from gemini)",
-                        "fallback_triggered": True,
-                    }
+                    response = self._invoke_local(system_prompt, user_prompt, history=history)
+                    return self._local_result(response, fallback=True, source="gemini")
 
         if effective_force == "groq":
             try:
@@ -592,12 +694,8 @@ class LLMController:
                         "fallback_triggered": True,
                     }
                 except AIVCOModelError:
-                    response = self.generate(system_prompt, user_prompt)
-                    return {
-                        "response": response,
-                        "provider_used": "local_llama (fallback from groq)",
-                        "fallback_triggered": True,
-                    }
+                    response = self._invoke_local(system_prompt, user_prompt, history=history)
+                    return self._local_result(response, fallback=True, source="groq")
 
         # Rule 2: Tier 3 Deep / Large Context
         if task_type in ("deep", "research") or (len(system_prompt) + len(user_prompt) > 6000):
@@ -617,11 +715,16 @@ class LLMController:
         errors = []
         for idx, (provider_name, provider_fn) in enumerate(chain):
             try:
-                response = _invoke(provider_fn, provider_name)
+                response = (
+                    self._invoke_local(system_prompt, user_prompt, history=history)
+                    if provider_name == "local_llama"
+                    else _invoke(provider_fn, provider_name)
+                )
                 return {
                     "response": response,
                     "provider_used": provider_name,
                     "fallback_triggered": idx > 0,
+                    **({"model_used": self.local_provider.model} if provider_name == "local_llama" else {}),
                 }
             except AIVCOModelError as exc:
                 errors.append((provider_name, exc))

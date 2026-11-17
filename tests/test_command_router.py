@@ -417,14 +417,15 @@ def test_model_failure_does_not_create_fake_assistant_message(tmp_path, monkeypa
     assert history == [{"role": "user", "content": "hello"}]
 
 
-def test_llm_controller_missing_files_does_not_call_subprocess(monkeypatch):
+def test_llm_controller_disabled_local_provider_is_unavailable(monkeypatch):
+    monkeypatch.setenv("AIVCO_LOCAL_ENABLED", "false")
     controller = llm_controller.LLMController("missing.exe", "missing.gguf")
     assert controller.is_available() is False
 
-    def fail_run(*args, **kwargs):
-        raise AssertionError("subprocess.run should not be called")
+    def fail_post(*args, **kwargs):
+        raise AssertionError("disabled local provider must not make HTTP requests")
 
-    monkeypatch.setattr(llm_controller.subprocess, "run", fail_run)
+    monkeypatch.setattr(llm_controller.httpx, "post", fail_post)
 
     with pytest.raises(llm_controller.ModelUnavailableError):
         controller.generate("system", "user")

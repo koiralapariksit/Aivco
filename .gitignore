@@ -3,10 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.env
 venv/
 ENV/
 *.env
 .env.*
+!.env.example
 
 # AIVCO Local Data & Persistent Memory (CRITICAL PRIVACY)
 data/
