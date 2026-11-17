@@ -28,6 +28,7 @@ Subsystem 4:
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
@@ -49,6 +50,192 @@ from kernel.arbiter import (
 
 if TYPE_CHECKING:
     from memory.multi_layer_memory import MultiLayerMemory
+
+
+# Deterministic context ceilings reserved for the local/cloud routing tiers.
+TIER_CONTEXT_BUDGETS = {
+    "compact": 3_072,
+    "standard": 8_192,
+    "deep": 32_768,
+}
+_TIER_ALIASES = {
+    "tier1": "compact", "local": "compact", "local_llama": "compact",
+    "tier2": "standard", "groq": "standard", "fast": "standard",
+    "tier3": "deep", "gemini": "deep", "claude": "deep", "chatgpt": "deep",
+}
+_TOKEN_PARTS = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+def estimate_tokens(text: object) -> int:
+    """Return a stable, dependency-free conservative token estimate for text."""
+    if text is None:
+        return 0
+    total = 0
+    for part in _TOKEN_PARTS.findall(str(text)):
+        if part.isalnum() or "_" in part:
+            total += max(1, math.ceil(len(part) / 4))
+        else:
+            total += 1
+    return total
+
+
+def _normalize_context_tier(tier: str) -> str:
+    normalized = str(tier or "standard").strip().lower()
+    normalized = _TIER_ALIASES.get(normalized, normalized)
+    if normalized not in TIER_CONTEXT_BUDGETS:
+        raise ValueError(f"Unknown context tier: {tier}")
+    return normalized
+
+
+def _history_turns(history: object) -> tuple[list, bool]:
+    """Split history while keeping each turn intact; supports text and message lists."""
+    if isinstance(history, str):
+        blocks = [part for part in re.split(r"\n\s*\n", history.strip()) if part]
+        # If the supplied history is a sequence of role-labelled lines rather
+        # than blank-separated blocks, pair adjacent lines as a single turn.
+        if len(blocks) == 1 and "\n" in blocks[0]:
+            lines = blocks[0].splitlines()
+            blocks = ["\n".join(lines[i:i + 2]) for i in range(0, len(lines), 2)]
+        return blocks, True
+    if isinstance(history, (list, tuple)):
+        messages = list(history)
+        turns, pending = [], []
+        for message in messages:
+            role = message.get("role") if isinstance(message, dict) else None
+            if role == "user" and pending:
+                turns.append(pending)
+                pending = []
+            pending.append(message)
+            if role == "assistant":
+                turns.append(pending)
+                pending = []
+        if pending:
+            turns.append(pending)
+        return turns, False
+    return [], isinstance(history, str)
+
+
+def _render_history(turns: list, was_text: bool) -> object:
+    if was_text:
+        return "\n\n".join(turns)
+    return [message for turn in turns for message in turn]
+
+
+def _history_text(history: object) -> str:
+    if isinstance(history, str):
+        return history
+    if isinstance(history, (list, tuple)):
+        return "\n".join(
+            f"{message.get('role', '')}: {message.get('content', '')}"
+            if isinstance(message, dict) else str(message)
+            for message in history
+        )
+    return str(history or "")
+
+
+def _trim_episode_context(memory_context: str, token_budget: int) -> str:
+    """Trim dated/episodic lines from the end while retaining profile sections."""
+    if estimate_tokens(memory_context) <= token_budget:
+        return memory_context
+    lines = memory_context.splitlines()
+    removable = []
+    episode_section = False
+    for idx, line in enumerate(lines):
+        heading = line.strip().lstrip("# ").lower()
+        if line.lstrip().startswith("#"):
+            episode_section = any(word in heading for word in ("episode", "recent history", "retrieved memory"))
+        is_episode = episode_section and bool(line.strip()) and not line.lstrip().startswith("#")
+        is_dated_entry = bool(re.match(r"\s*[-*]\s*\[\d{4}-\d{2}-\d{2}\]", line))
+        if is_episode or is_dated_entry:
+            removable.append(idx)
+    for idx in reversed(removable):
+        if estimate_tokens("\n".join(lines)) <= token_budget:
+            break
+        lines[idx] = ""
+    return "\n".join(lines).strip()
+
+
+def budget_prompt_context(
+    *,
+    system_prompt: str = "",
+    memory_context: str = "",
+    conversation_history: object = "",
+    user_input: str = "",
+    tier: str = "standard",
+    memory_controller: object = None,
+) -> dict:
+    """Fit prompt components to a tier budget without trimming protected text.
+
+    History is discarded oldest-first. If it is exhausted, dated episodic
+    memory is trimmed. Optional retrieved profile records are selected through
+    MemoryController's token-budget API and appended only when space remains.
+    System instructions and the current query are always preserved; if those
+    alone exceed the selected ceiling a ValueError is raised instead of silently
+    changing either protected component.
+    """
+    normalized_tier = _normalize_context_tier(tier)
+    limit = TIER_CONTEXT_BUDGETS[normalized_tier]
+    system_prompt = str(system_prompt or "")
+    memory_context = str(memory_context or "")
+    user_input = str(user_input or "")
+    protected_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_input)
+    if protected_tokens > limit:
+        raise ValueError("System prompt and current user input exceed the tier context budget")
+
+    turns, history_is_text = _history_turns(conversation_history)
+    history_value = _render_history(turns, history_is_text)
+    def total_tokens(memory_value: str, history_value: object) -> int:
+        return (
+            estimate_tokens(system_prompt) + estimate_tokens(memory_value)
+            + estimate_tokens(_history_text(history_value)) + estimate_tokens(user_input)
+        )
+
+    while turns and total_tokens(memory_context, history_value) > limit:
+        turns.pop(0)
+        history_value = _render_history(turns, history_is_text)
+
+    if total_tokens(memory_context, history_value) > limit:
+        remaining_memory = limit - protected_tokens - estimate_tokens(_history_text(history_value))
+        memory_context = _trim_episode_context(memory_context, max(0, remaining_memory))
+
+    # Optional retrieved records are individually ranked and sliced by the
+    # controller. They are an additive low-priority section, never a substitute
+    # for profile invariants already present in memory_context.
+    if memory_controller is not None:
+        room = limit - total_tokens(memory_context, history_value)
+        if room > 0 and hasattr(memory_controller, "all_records"):
+            records = memory_controller.all_records(token_budget=room, query=user_input)
+            retrieved = "\n".join(f"- {key}: {record['value']}" for key, record in records.items())
+            if retrieved:
+                memory_context = "\n\n".join(part for part in (memory_context, "### Retrieved Memories\n" + retrieved) if part)
+
+    counts = {
+        "system_prompt": estimate_tokens(system_prompt),
+        "memory_context": estimate_tokens(memory_context),
+        "conversation_history": estimate_tokens(_history_text(history_value)),
+        "user_input": estimate_tokens(user_input),
+    }
+    total = sum(counts.values())
+    if total > limit:
+        # A controller can return records whose tokenizer estimate differs
+        # slightly from its own budget estimate. Drop retrieved lines only.
+        memory_context = _trim_episode_context(memory_context, max(0, limit - protected_tokens - counts["conversation_history"]))
+        counts["memory_context"] = estimate_tokens(memory_context)
+        total = sum(counts.values())
+    if total > limit:
+        raise ValueError("Protected prompt and profile context exceed the tier context budget")
+    return {
+        "tier": normalized_tier,
+        "budget": limit,
+        "components": {
+            "system_prompt": system_prompt,
+            "memory_context": memory_context,
+            "conversation_history": history_value,
+            "user_input": user_input,
+        },
+        "token_counts": counts,
+        "total_tokens": total,
+    }
 
 
 # ---------------------------------------------------------------------------
