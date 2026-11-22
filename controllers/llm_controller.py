@@ -11,10 +11,12 @@ Supports:
 import json
 import os
 import httpx
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 LLM_TIMEOUT_SECONDS = 180
 LLM_MAX_TOKENS = 512
@@ -36,6 +38,7 @@ class LocalInferenceProvider:
     """OpenAI-compatible local endpoint adapter for Ollama and mlx_lm.server."""
 
     def __init__(self, environ=None):
+        self._config_lock = threading.RLock()
         environ = os.environ if environ is None else environ
         self.enabled = str(environ.get("AIVCO_LOCAL_ENABLED", "true")).strip().lower() not in {
             "0", "false", "no", "off",
@@ -49,12 +52,57 @@ class LocalInferenceProvider:
         except (TypeError, ValueError):
             self.timeout = 60.0
 
+    @staticmethod
+    def validate_base_url(base_url: str) -> str:
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError("base_url must be a non-empty URL")
+        value = base_url.strip().rstrip("/")
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("base_url must be a valid local inference URL") from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or port not in {8080, 11434}
+            or parsed.path != "/v1"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "base_url must target http://127.0.0.1:11434/v1 (Ollama) "
+                "or http://127.0.0.1:8080/v1 (mlx_lm.server)"
+            )
+        return value
+
+    def set_local_model(self, model: str, base_url: Optional[str] = None) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a non-empty string")
+        validated_url = self.validate_base_url(base_url) if base_url is not None else None
+        with self._config_lock:
+            if validated_url is not None:
+                self.base_url = validated_url
+            self.model = model.strip()
+
+    def get_configuration(self) -> dict:
+        with self._config_lock:
+            return {
+                "enabled": self.enabled,
+                "model": self.model,
+                "base_url": self.base_url,
+                "timeout": self.timeout,
+            }
+
     def is_available(self) -> bool:
-        if not self.enabled:
+        config = self.get_configuration()
+        if not config["enabled"]:
             return False
         timeout = httpx.Timeout(0.3, connect=0.3)
         try:
-            response = httpx.get(f"{self.base_url}/models", timeout=timeout)
+            response = httpx.get(f"{config['base_url']}/models", timeout=timeout)
             response.raise_for_status()
             return True
         except (httpx.HTTPError, OSError, ValueError):
@@ -66,8 +114,11 @@ class LocalInferenceProvider:
         user_prompt: str = "",
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        if not self.enabled:
-            raise ModelUnavailableError("Local inference is disabled (AIVCO_LOCAL_ENABLED=false).")
+        config = self.get_configuration()
+        if not config["enabled"]:
+            error = ModelUnavailableError("Local inference is disabled (AIVCO_LOCAL_ENABLED=false).")
+            error.provider = "local_llama"
+            raise error
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -77,18 +128,20 @@ class LocalInferenceProvider:
                 for turn in history if turn.get("content")
             )
         messages.append({"role": "user", "content": user_prompt})
-        body = {"model": self.model, "messages": messages}
-        timeout = httpx.Timeout(self.timeout, connect=min(0.3, self.timeout))
+        body = {"model": config["model"], "messages": messages}
+        timeout = httpx.Timeout(config["timeout"], connect=min(0.3, config["timeout"]))
         try:
             response = httpx.post(
-                f"{self.base_url}/chat/completions",
+                f"{config['base_url']}/chat/completions",
                 json=body,
                 headers={"Content-Type": "application/json", "User-Agent": "AIVCO/2.0"},
                 timeout=timeout,
             )
             response.raise_for_status()
         except (httpx.HTTPError, OSError, ValueError) as exc:
-            raise ModelUnavailableError(f"Local inference endpoint unavailable: {exc}") from exc
+            error = ModelUnavailableError(f"Local inference endpoint unavailable: {exc}")
+            error.provider = "local_llama"
+            raise error from exc
         try:
             data = response.json()
             content = data["choices"][0]["message"]["content"]
@@ -96,7 +149,9 @@ class LocalInferenceProvider:
                 raise TypeError("response content is not text")
             return content.strip()
         except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise ModelGenerationError(f"Invalid local inference response: {exc}") from exc
+            error = ModelGenerationError(f"Invalid local inference response: {exc}")
+            error.provider = "local_llama"
+            raise error from exc
 
 
 EXECUTIVE_AUTONOMY_MANDATE = (
@@ -217,6 +272,55 @@ class LLMController:
 
     def is_available(self) -> bool:
         return self.local_provider.is_available()
+
+    def set_local_model(self, model: str, base_url: Optional[str] = None) -> None:
+        self.local_provider.set_local_model(model, base_url=base_url)
+        self.local_enabled = self.local_provider.enabled
+
+    def get_provider_status(self, browser_available: bool = False) -> dict:
+        from kernel.arbiter import provider_health
+
+        def health_fields(provider: str) -> dict:
+            record = provider_health.get_record(provider)
+            return {
+                "last_error": record.last_failure_reason or None,
+                "latency_ms": round(record.avg_latency_ms, 2) if record.avg_latency_ms else None,
+            }
+
+        local_health = health_fields("local_llama")
+        local_config = self.local_provider.get_configuration()
+        groq_enabled = bool(os.environ.get("GROQ_API_KEY", "").strip())
+        gemini_enabled = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+        browser_health = health_fields("claude")
+        return {
+            "local": {
+                "enabled": local_config["enabled"],
+                "available": self.local_provider.is_available(),
+                "active_model": local_config["model"],
+                "base_url": local_config["base_url"],
+                **local_health,
+            },
+            "groq": {
+                "enabled": groq_enabled,
+                "available": groq_enabled and provider_health.is_available("groq"),
+                "active_model": "openai/gpt-oss-120b",
+                "base_url": "https://api.groq.com/openai/v1",
+                **health_fields("groq"),
+            },
+            "gemini": {
+                "enabled": gemini_enabled,
+                "available": gemini_enabled and provider_health.is_available("gemini"),
+                "active_model": "gemini-flash-latest",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                **health_fields("gemini"),
+            },
+            "browser": {
+                "enabled": True,
+                "available": bool(browser_available),
+                "active_model": "Browser Bridge",
+                **browser_health,
+            },
+        }
 
     def _generate_local(self, system_prompt: str = "", user_prompt: str = "") -> str:
         return self.local_provider.generate(system_prompt, user_prompt)

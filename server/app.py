@@ -23,7 +23,7 @@ import json
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from memory.multi_layer_memory import MultiLayerMemory, CoreFact
 from memory.memory_controller import MemoryController
@@ -31,6 +31,7 @@ from memory.dataset_logger import FineTuneDatasetLogger
 from controllers.command_controller import CommandController
 from controllers.llm_controller import (
     LLMController,
+    LocalInferenceProvider,
     ModelUnavailableError,
     ModelGenerationError,
     ANTI_HALLUCINATION_MANDATE,
@@ -114,6 +115,27 @@ class ChatRequest(BaseModel):
     project_id: Optional[str] = None
     chat_id: Optional[str] = None
     temporary: bool = False
+
+
+class LocalModelSwitchRequest(BaseModel):
+    model: str
+    base_url: Optional[str] = None
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("model must be a non-empty string")
+        if len(value.strip()) > 200:
+            raise ValueError("model must be at most 200 characters")
+        return value.strip()
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return LocalInferenceProvider.validate_base_url(value)
 
 
 class ChatCreateRequest(BaseModel):
@@ -253,6 +275,38 @@ def get_health() -> Dict[str, Any]:
             },
         },
     }
+
+
+@app.get("/api/providers/status")
+def get_provider_status() -> Dict[str, Any]:
+    """Return live provider readiness, active models, and recent health data."""
+    return {
+        "providers": llm_controller.get_provider_status(
+            browser_available=universal_web_agent.is_connected()
+        )
+    }
+
+
+@app.post("/api/providers/local/model")
+def set_local_model(req: LocalModelSwitchRequest) -> Dict[str, Any]:
+    """Hot-swap the local model/endpoint and report whether it is reachable."""
+    try:
+        llm_controller.set_local_model(req.model, base_url=req.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    local_status = llm_controller.get_provider_status(
+        browser_available=universal_web_agent.is_connected()
+    )["local"]
+    if not local_status["available"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Local model configuration was applied, but the endpoint is unreachable.",
+                "provider": local_status,
+            },
+        )
+    return {"ok": True, "provider": local_status}
 
 
 @app.get("/api/state")

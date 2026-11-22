@@ -1,6 +1,7 @@
 import httpx
 import pytest
 import sys
+import importlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -10,6 +11,14 @@ from controllers.llm_controller import (
     LocalInferenceProvider,
     ModelUnavailableError,
 )
+
+
+def import_server_app_without_env_file(monkeypatch):
+    """Import the API without invoking its legacy .env loader during tests."""
+    import controllers.llm_controller as llm_module
+
+    monkeypatch.setattr(llm_module, "load_env_file", lambda env_path=".env": None)
+    return importlib.import_module("server.app")
 
 
 class FakeResponse:
@@ -157,3 +166,91 @@ def test_local_routing_uses_compact_budget_before_generation(monkeypatch):
     assert "RECENT TURN" in str(captured["history"])
     assert captured["system"] == "Protected system prompt"
     assert captured["user"] == "Current user query"
+
+
+def test_local_provider_hot_swap_updates_model_and_endpoint(monkeypatch):
+    local_env(monkeypatch)
+    controller = LLMController(env_path="/nonexistent/test.env")
+    controller.set_local_model("mlx-qwen-8b", "http://127.0.0.1:8080/v1")
+    assert controller.local_provider.model == "mlx-qwen-8b"
+    assert controller.local_provider.base_url == "http://127.0.0.1:8080/v1"
+
+    controller.set_local_model("ollama-qwen-8b", "http://127.0.0.1:11434/v1")
+    assert controller.local_provider.model == "ollama-qwen-8b"
+    assert controller.local_provider.base_url == "http://127.0.0.1:11434/v1"
+
+
+def test_provider_status_endpoint_returns_live_provider_status(monkeypatch):
+    server = import_server_app_without_env_file(monkeypatch)
+    monkeypatch.setattr(server.llm_controller.local_provider, "is_available", lambda: True)
+    monkeypatch.setattr(server.universal_web_agent, "is_connected", lambda: True)
+    from fastapi.testclient import TestClient
+
+    response = TestClient(server.app).get("/api/providers/status")
+    assert response.status_code == 200
+    providers = response.json()["providers"]
+    assert set(providers) == {"local", "groq", "gemini", "browser"}
+    assert providers["local"]["available"] is True
+    assert providers["local"]["active_model"] == server.llm_controller.local_provider.model
+    assert providers["local"]["base_url"] == server.llm_controller.local_provider.base_url
+    assert "last_error" in providers["local"]
+    assert "latency_ms" in providers["local"]
+    assert providers["browser"]["available"] is True
+
+
+def test_local_model_endpoint_hot_swaps_and_checks_reachability(monkeypatch):
+    server = import_server_app_without_env_file(monkeypatch)
+    monkeypatch.setattr(server.llm_controller.local_provider, "is_available", lambda: True)
+    from fastapi.testclient import TestClient
+
+    old_model = server.llm_controller.local_provider.model
+    old_url = server.llm_controller.local_provider.base_url
+    try:
+        response = TestClient(server.app).post(
+            "/api/providers/local/model",
+            json={"model": "mlx-community/Qwen3-8B", "base_url": "http://127.0.0.1:8080/v1"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["provider"]["available"] is True
+        assert body["provider"]["active_model"] == "mlx-community/Qwen3-8B"
+        assert body["provider"]["base_url"] == "http://127.0.0.1:8080/v1"
+    finally:
+        server.llm_controller.set_local_model(old_model, old_url)
+
+
+def test_local_model_endpoint_reports_unreachable_after_applying_config(monkeypatch):
+    server = import_server_app_without_env_file(monkeypatch)
+    monkeypatch.setattr(server.llm_controller.local_provider, "is_available", lambda: False)
+    from fastapi.testclient import TestClient
+
+    old_model = server.llm_controller.local_provider.model
+    old_url = server.llm_controller.local_provider.base_url
+    try:
+        response = TestClient(server.app).post(
+            "/api/providers/local/model",
+            json={"model": "offline-test-model", "base_url": "http://127.0.0.1:11434/v1"},
+        )
+        assert response.status_code == 503
+        assert response.json()["detail"]["provider"]["available"] is False
+        assert server.llm_controller.local_provider.model == "offline-test-model"
+    finally:
+        server.llm_controller.set_local_model(old_model, old_url)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"model": "   "},
+        {"model": "qwen", "base_url": "https://example.com/v1"},
+        {"model": "qwen", "base_url": "http://127.0.0.1:9000/v1"},
+    ],
+)
+def test_local_model_endpoint_rejects_empty_or_invalid_payloads(monkeypatch, payload):
+    server = import_server_app_without_env_file(monkeypatch)
+    from fastapi.testclient import TestClient
+
+    response = TestClient(server.app).post("/api/providers/local/model", json=payload)
+    assert response.status_code == 422
