@@ -5,14 +5,31 @@ Implements Layer 1 (Core Profile), Layer 2 (Episodic), and Layer 3 (Project Memo
 
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
+from contextlib import contextmanager
+import hashlib
+import fcntl
 import json
 import os
+import tempfile
+import threading
 import uuid
+from memory.semantic_index import SemanticIndex
 
 
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_PATH_LOCKS: Dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
 @dataclass
@@ -55,8 +72,13 @@ class ProjectState:
 
 
 class MultiLayerMemory:
-    def __init__(self, storage_path: str = "data/multilayer_profile.json"):
-        self.storage_path = storage_path
+    def __init__(self, storage_path: Optional[str] = None):
+        data_dir = Path(os.environ.get("AIVCO_DATA_DIR", "./data"))
+        self.storage_path = Path(storage_path) if storage_path is not None else data_dir / "multilayer_profile.json"
+        self._thread_lock = _thread_lock_for(self.storage_path)
+        self._deleted_core_keys = set()
+        index_dir = Path(os.environ.get("AIVCO_DATA_DIR", str(self.storage_path.parent)))
+        self.semantic_index = SemanticIndex(index_dir)
         self.core_profile: Dict[str, CoreFact] = {}
         self.episodes: List[Episode] = []
         self.projects: Dict[str, ProjectState] = {}
@@ -82,6 +104,24 @@ class MultiLayerMemory:
         self.active_project_id = project_id
         self.save()
 
+    def _sync_semantic_index(self) -> None:
+        source = hashlib.sha256(str(self.storage_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        prefix = f"v2:{source}:"
+        entries = []
+        for key, fact in self.core_profile.items():
+            value = fact.value if isinstance(fact, CoreFact) else str(fact)
+            updated = fact.updated_at if isinstance(fact, CoreFact) else _utc_iso_now()
+            entries.append((f"fact:{key}", "core_profile", f"{key}: {value}", updated))
+        for episode in self.episodes:
+            entries.append((f"episode:{episode.id}", "episode", f"{episode.event} {episode.outcome}", episode.timestamp))
+        for project_id, project in self.projects.items():
+            content = " ".join((project.title, project.status, *project.tech_stack, *project.pending_tasks, *project.completed_milestones, *project.known_issues))
+            entries.append((f"project:{project_id}", "project", content, project.last_updated))
+        for index, item in enumerate(self.learned_facts):
+            content = " ".join(str(item.get(k, "")) for k in ("trigger", "fact", "fact_type", "trigger_keywords"))
+            entries.append((f"learned:{index}", "learned", content, item.get("timestamp", "")))
+        self.semantic_index.sync_source(prefix, entries)
+
     def get_active_project(self) -> Optional[str]:
         return self.active_project_id
 
@@ -89,6 +129,7 @@ class MultiLayerMemory:
     def set_core_fact(self, key: str, value: str, importance: str = "high") -> CoreFact:
         fact = CoreFact(key=key, value=value, importance=importance)
         self.core_profile[key] = fact
+        self._deleted_core_keys.discard(key)
         self.save()
         return fact
 
@@ -101,6 +142,7 @@ class MultiLayerMemory:
     def delete_core_fact(self, key: str) -> bool:
         if key in self.core_profile:
             del self.core_profile[key]
+            self._deleted_core_keys.add(key)
             self.save()
             return True
         return False
@@ -245,8 +287,118 @@ class MultiLayerMemory:
         return "\n\n".join(sections)
 
     # --- Disk Storage ---
+    @property
+    def _lock_path(self) -> Path:
+        return self.storage_path.with_name(self.storage_path.name + ".lock")
+
+    @contextmanager
+    def _locked_file(self, exclusive: bool):
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._thread_lock:
+            with self._lock_path.open("a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _read_json(path: Path):
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+
+    def _valid_backups(self) -> List[Path]:
+        backup_dir = self.storage_path.parent / ".backups"
+        if not backup_dir.exists():
+            return []
+        valid = []
+        for path in backup_dir.glob(self.storage_path.name + ".*.json"):
+            try:
+                if self._read_json(path) is not None:
+                    valid.append(path)
+            except (OSError, ValueError):
+                continue
+        return sorted(valid, key=lambda p: p.stat().st_mtime_ns, reverse=True)
+
+    def _restore_backup_locked(self) -> Optional[dict]:
+        for backup in self._valid_backups():
+            try:
+                data = self._read_json(backup)
+                if data is not None:
+                    self._atomic_json_write(data)
+                    return data
+            except (OSError, ValueError):
+                continue
+        return None
+
+    def _backup_current_locked(self) -> None:
+        try:
+            current = self._read_json(self.storage_path)
+        except (OSError, ValueError):
+            return
+        if current is None:
+            return
+        backup_dir = self.storage_path.parent / ".backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = backup_dir / f"{self.storage_path.name}.{stamp}.{uuid.uuid4().hex[:8]}.json"
+        backup_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+        backups = self._valid_backups()
+        for old in backups[5:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def _atomic_json_write(self, data: dict) -> None:
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self.storage_path.name + ".", suffix=".tmp", dir=self.storage_path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            with open(tmp_name, "r", encoding="utf-8") as f:
+                json.load(f)
+            os.replace(tmp_name, self.storage_path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _merge_snapshots(disk: dict, current: dict) -> dict:
+        """Preserve independently-added facts and episodes from stale instances."""
+        merged = dict(disk)
+        merged.update(current)
+        for field_name, date_key in (("core_profile", "updated_at"), ("projects", "last_updated")):
+            old_items = disk.get(field_name, {})
+            new_items = current.get(field_name, {})
+            if isinstance(old_items, dict) and isinstance(new_items, dict):
+                combined = dict(old_items)
+                for key, value in new_items.items():
+                    old = combined.get(key)
+                    if not isinstance(old, dict) or value.get(date_key, "") >= old.get(date_key, ""):
+                        combined[key] = value
+                merged[field_name] = combined
+        old_eps, new_eps = disk.get("episodes", []), current.get("episodes", [])
+        if isinstance(old_eps, list) and isinstance(new_eps, list):
+            by_id = {e.get("id"): e for e in old_eps if isinstance(e, dict) and e.get("id")}
+            by_id.update({e.get("id"): e for e in new_eps if isinstance(e, dict) and e.get("id")})
+            merged["episodes"] = list(by_id.values())
+        old_facts, new_facts = disk.get("learned_facts", []), current.get("learned_facts", [])
+        if isinstance(old_facts, list) and isinstance(new_facts, list):
+            merged["learned_facts"] = list({
+                json.dumps(x, sort_keys=True): x for x in old_facts + new_facts
+            }.values())
+        return merged
+
     def save(self) -> None:
-        os.makedirs(os.path.dirname(self.storage_path) or ".", exist_ok=True)
         core_dict = {}
         for k, v in self.core_profile.items():
             if isinstance(v, CoreFact):
@@ -266,19 +418,37 @@ class MultiLayerMemory:
             "projects": {k: asdict(v) for k, v in self.projects.items()},
             "learned_facts": self.learned_facts,
         }
-        with open(self.storage_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        with self._locked_file(exclusive=True):
+            try:
+                disk = self._read_json(self.storage_path) or {}
+            except (OSError, ValueError):
+                disk = {}
+            data = self._merge_snapshots(disk, data)
+            for key in self._deleted_core_keys:
+                data.get("core_profile", {}).pop(key, None)
+            self._backup_current_locked()
+            self._atomic_json_write(data)
+            self._deleted_core_keys.clear()
+        self._sync_semantic_index()
 
     def load(self) -> None:
-        if not os.path.exists(self.storage_path):
+        with self._locked_file(exclusive=False):
+            try:
+                data = self._read_json(self.storage_path) if self.storage_path.exists() else None
+            except (OSError, ValueError):
+                data = None
+        if data is None:
+            with self._locked_file(exclusive=True):
+                try:
+                    data = self._read_json(self.storage_path) if self.storage_path.exists() else None
+                except (OSError, ValueError):
+                    data = None
+                if data is None:
+                    data = self._restore_backup_locked()
+        if data is None:
+            self._sync_semantic_index()
             return
         try:
-            with open(self.storage_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if not isinstance(data, dict):
-                return
-
             self.active_project_id = data.get("active_project_id")
 
             self.core_profile = {}
@@ -311,5 +481,9 @@ class MultiLayerMemory:
             # Validate loaded active_project_id exists in projects
             if self.active_project_id and self.active_project_id not in self.projects:
                 self.active_project_id = None
+            self._sync_semantic_index()
         except Exception:
-            pass
+            with self._locked_file(exclusive=True):
+                restored = self._restore_backup_locked()
+            if restored is not None:
+                self.load()

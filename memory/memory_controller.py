@@ -14,8 +14,11 @@ import os
 import re
 import shutil
 import tempfile
+import math
+import hashlib
 from pathlib import Path
 from typing import Optional, Any
+from memory.semantic_index import SemanticIndex
 
 # Keys may only contain letters, numbers, underscore, hyphen.
 # This blocks things like "../../etc/passwd" from ever being treated
@@ -63,6 +66,24 @@ class MemoryController:
         self._data: dict = self._load()
         self._had_existing_data = bool(self._data)
         self._apply_profile_migration()
+        self.semantic_index = self._make_semantic_index()
+        self._sync_semantic_index()
+
+    def _make_semantic_index(self) -> SemanticIndex:
+        data_dir = Path(os.environ.get("AIVCO_DATA_DIR", str(self.memory_path.parent)))
+        return SemanticIndex(data_dir=data_dir)
+
+    def _semantic_source_prefix(self) -> str:
+        source = hashlib.sha256(str(self.memory_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        return f"v1:{source}:"
+
+    def _sync_semantic_index(self) -> None:
+        memories = self._data.get("memories", {})
+        entries = (
+            (key, record.get("category", DEFAULT_CATEGORY), f"{key}: {record.get('value', '')}", record.get("updated_at", ""))
+            for key, record in memories.items()
+        )
+        self.semantic_index.sync_source(self._semantic_source_prefix(), entries)
 
     # ---------------- persistence ----------------
 
@@ -156,6 +177,13 @@ class MemoryController:
                 backup = self.memory_path.with_suffix(".json.bak")
                 self.memory_path.replace(backup)
             except OSError:
+                backup = self.memory_path.with_suffix(".json.bak")
+            try:
+                with backup.open("r", encoding="utf-8") as f:
+                    recovered = json.load(f)
+                if isinstance(recovered, dict):
+                    return recovered
+            except (json.JSONDecodeError, OSError):
                 pass
             return {}
 
@@ -210,6 +238,8 @@ class MemoryController:
 
     def _save(self) -> None:
         self._atomic_write(self._data)
+        if hasattr(self, "semantic_index"):
+            self._sync_semantic_index()
 
     # ---------------- validation ----------------
 
@@ -267,14 +297,86 @@ class MemoryController:
             created_at=created_at,
             updated_at=self._now_iso(),
         )
+        # Collapse duplicate representations of the same fact while retaining
+        # distinct facts within a category. A repeated key is a conflict and
+        # the new value supersedes it, preserving the original creation time.
+        normalized_value = value.casefold()
+        for other_key, record in list(memories.items()):
+            if other_key == key or not self._is_record(record):
+                continue
+            if (
+                record.get("category") == category
+                and str(record.get("value", "")).strip().casefold() == normalized_value
+            ):
+                del memories[other_key]
         self._save()
         return True, f"Saved: {key} = {value}"
 
-    def recall(self, key: Optional[str] = None):
+    @staticmethod
+    def _record_score(key: str, record: dict, query: str = "") -> float:
+        importance = {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(
+            str(record.get("importance", "medium")).lower(), 2
+        )
+        try:
+            updated = datetime.datetime.fromisoformat(record.get("updated_at", ""))
+            age_days = max(0.0, (datetime.datetime.now(updated.tzinfo) - updated).total_seconds() / 86400)
+        except (TypeError, ValueError):
+            age_days = 3650.0
+        recency = 1.0 / (1.0 + age_days / 30.0)
+        query = query.casefold().strip()
+        relevance = 0.0
+        if query:
+            haystack = f"{key} {record.get('value', '')} {record.get('category', '')}".casefold()
+            relevance = 4.0 if query in haystack else sum(1.0 for word in query.split() if word in haystack)
+        return importance + recency + relevance
+
+    def _slice_records(
+        self, records: dict, *, max_items: Optional[int] = None,
+        token_budget: Optional[int] = None, query: str = "",
+    ) -> dict:
+        if max_items is None and token_budget is None:
+            return records
+        semantic_scores = self._semantic_scores(query) if query.strip() else {}
+        ranked = sorted(records.items(), key=lambda item: self._hybrid_score(
+            item[0], item[1], query, semantic_scores
+        ), reverse=True)
+        selected = {}
+        used_tokens = 0
+        for key, record in ranked:
+            if max_items is not None and len(selected) >= max(0, max_items):
+                break
+            value = record.get("value", "")
+            cost = max(1, math.ceil(len(f"{key}: {value}") / 4))
+            if token_budget is not None and used_tokens + cost > max(0, token_budget):
+                continue
+            selected[key] = record
+            used_tokens += cost
+        return selected
+
+    def _semantic_scores(self, query: str) -> dict[str, float]:
+        prefix = self._semantic_source_prefix()
+        return {
+            item["memory_id"][len(prefix):]: item["score"]
+            for item in self.semantic_index.search(query)
+            if item["memory_id"].startswith(prefix)
+        }
+
+    def _hybrid_score(self, key: str, record: dict, query: str = "", semantic_scores=None) -> float:
+        if not query.strip():
+            return self._record_score(key, record)
+        semantic = (semantic_scores or {}).get(key, 0.0)
+        lexical = self._record_score(key, record, query) - self._record_score(key, record)
+        return 0.7 * semantic + 0.2 * max(0.0, lexical) + 0.1 * self._record_score(key, record)
+
+    def recall(
+        self, key: Optional[str] = None, *, max_items: Optional[int] = None,
+        token_budget: Optional[int] = None, query: str = "",
+    ):
         """Return one value (or None), or the whole key/value dict if key is None."""
         memories = self._data.get("memories", {})
         if key is None:
-            return {k: v["value"] for k, v in memories.items()}
+            sliced = self._slice_records(memories, max_items=max_items, token_budget=token_budget, query=query)
+            return {k: v["value"] for k, v in sliced.items()}
 
         key = self._normalize_key(key)
         if not key:
@@ -311,22 +413,25 @@ class MemoryController:
             return None
         return self._data.get("memories", {}).get(key)
 
-    def all_records(self) -> dict:
-        return dict(self._data.get("memories", {}))
+    def all_records(
+        self, *, max_items: Optional[int] = None, token_budget: Optional[int] = None,
+        query: str = "",
+    ) -> dict:
+        records = dict(self._data.get("memories", {}))
+        return self._slice_records(records, max_items=max_items, token_budget=token_budget, query=query)
 
-    def search(self, text: str) -> dict:
+    def search(
+        self, text: str, *, max_items: Optional[int] = None, token_budget: Optional[int] = None,
+    ) -> dict:
         query = str(text).strip().lower()
         if not query:
             return {}
         results = {}
-        for key, record in self.all_records().items():
-            if (
-                query in key.lower()
-                or query in record["value"].lower()
-                or query in record["category"].lower()
-            ):
+        for key in self._semantic_scores(query):
+            record = self._data.get("memories", {}).get(key)
+            if record is not None:
                 results[key] = record
-        return results
+        return self._slice_records(results, max_items=max_items, token_budget=token_budget, query=query)
 
     def stats(self) -> dict:
         memories = self.all_records()
@@ -346,5 +451,8 @@ class MemoryController:
             "categories": {k: v for k, v in category_counts.items() if v > 0},
         }
 
-    def as_dict(self) -> dict:
-        return {k: v["value"] for k, v in self.all_records().items()}
+    def as_dict(self, *, max_items: Optional[int] = None, token_budget: Optional[int] = None) -> dict:
+        return {
+            k: v["value"]
+            for k, v in self.all_records(max_items=max_items, token_budget=token_budget).items()
+        }
