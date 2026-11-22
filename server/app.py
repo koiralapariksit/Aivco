@@ -179,6 +179,21 @@ class MemoryAddRequest(BaseModel):
     body: str
 
 
+class MemoryUpsertRequest(BaseModel):
+    category: str
+    key: str
+    value: str
+
+
+class MemoryDeleteRequest(BaseModel):
+    category: str
+    key_or_id: str
+
+
+class ConsolidateRequest(BaseModel):
+    dry_run: bool = False
+
+
 class ProjectCreateRequest(BaseModel):
     name: Optional[str] = None
     project_id: Optional[str] = None
@@ -1522,6 +1537,47 @@ def toggle_task(req: TaskToggleRequest) -> Dict[str, Any]:
             return {"ok": True, "done": False, "text": m}
 
     raise HTTPException(status_code=404, detail="Task text not found in project.")
+
+
+@app.get("/api/memory/summary")
+def memory_summary() -> Dict[str, Any]:
+    db = v1_memory.semantic_index.db_path
+    try:
+        entries = v1_memory.semantic_index.search("")
+        index_health = {"healthy": db.exists(), "entry_count": len(entries)}
+    except Exception:
+        index_health = {"healthy": False, "entry_count": 0}
+    backups = list(v1_memory.memory_path.parent.glob(v1_memory.memory_path.name + ".*.bak"))
+    return {"layers": {
+        "profile": len(v1_memory.all_records()),
+        "projects": len(tiered_memory.projects),
+        "learned_facts": len(tiered_memory.learned_facts),
+        "episodes": len(tiered_memory.episodes),
+    }, "rolling_backup_count": len(backups), "semantic_index": index_health}
+
+
+@app.post("/api/memory/consolidate")
+def consolidate_memory(req: ConsolidateRequest) -> Dict[str, Any]:
+    from memory.memory_detector import MemoryDetector
+    messages = session_ledger.get_chat_history_messages(max_turns=20)
+    return MemoryDetector().consolidate_session(messages, v1_memory, dry_run=req.dry_run)
+
+
+@app.post("/api/memory/upsert")
+def upsert_memory_endpoint(req: MemoryUpsertRequest) -> Dict[str, Any]:
+    try:
+        record = v1_memory.upsert_memory(req.category, req.key, req.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "key": req.key.strip().lower(), "record": record}
+
+
+@app.delete("/api/memory/item")
+def delete_memory_endpoint(req: MemoryDeleteRequest) -> Dict[str, Any]:
+    deleted = v1_memory.delete_memory(req.category, req.key_or_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Memory item not found")
+    return {"ok": True, "deleted": True}
 
 
 @app.post("/api/memory/add")

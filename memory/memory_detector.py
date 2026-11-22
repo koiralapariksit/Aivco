@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import re
 from typing import List
+from typing import Any
 
 
 @dataclass
@@ -37,6 +38,36 @@ class MemoryDetector:
     ]
 
     _CLEAN_KEY_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+    _TRANSIENT = re.compile(r"\b(weather|tired|hungry|ate|went|today|joke|lol|haha|thanks|thank you)\b", re.I)
+
+    def consolidate_session(self, messages_or_episodes, memory_controller, dry_run: bool = False) -> dict:
+        """Extract only explicit durable facts; previews never mutate storage."""
+        messages = messages_or_episodes if isinstance(messages_or_episodes, (list, tuple)) else [messages_or_episodes]
+        candidates, rejected = [], []
+        for item in messages:
+            if isinstance(item, dict):
+                text = str(item.get("content", item.get("event", ""))).strip()
+            else:
+                text = str(getattr(item, "event", item)).strip()
+            if not text or self._TRANSIENT.search(text):
+                rejected.append({"text": text, "reason": "transient_or_empty"})
+                continue
+            for candidate in self.detect(text):
+                existing = memory_controller.search(candidate.value, max_items=5)
+                if any(rec["value"].casefold() == candidate.value.casefold() for rec in existing.values()):
+                    rejected.append({"text": text, "reason": "duplicate"})
+                    break
+                candidates.append({"category": candidate.category, "key": candidate.key, "value": candidate.value, "confidence": 0.9, "source": text})
+                break
+            else:
+                rejected.append({"text": text, "reason": "no_durable_fact"})
+        accepted = []
+        for candidate in candidates:
+            if not dry_run:
+                memory_controller.upsert_memory(candidate["category"], candidate["key"], candidate["value"], provenance={"source": candidate["source"]})
+            accepted.append(candidate)
+        return {"accepted": accepted, "rejected": rejected, "dry_run": dry_run}
 
     def detect(self, user_input: str) -> List[MemoryCandidate]:
         text = user_input.strip()

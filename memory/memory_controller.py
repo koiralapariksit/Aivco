@@ -312,6 +312,31 @@ class MemoryController:
         self._save()
         return True, f"Saved: {key} = {value}"
 
+    def upsert_memory(self, category: str, key: str, value: Any, provenance: Optional[dict] = None) -> dict:
+        key = self._normalize_key(str(key))
+        category = self._normalize_category(category)
+        if not self.is_valid_key(key) or category not in VALID_CATEGORIES:
+            raise ValueError("Invalid memory category or key")
+        memories = self._data.setdefault("memories", {})
+        old = memories.get(key, {})
+        record = self._build_record(value, category=category, importance=DEFAULT_IMPORTANCE,
+                                    created_at=old.get("created_at"), updated_at=self._now_iso())
+        if provenance:
+            record["provenance"] = {**provenance, "consolidated_at": self._now_iso()}
+        memories[key] = record
+        self._save()
+        return record
+
+    def delete_memory(self, category: str, key_or_id: str) -> bool:
+        category = self._normalize_category(category)
+        key = self._normalize_key(str(key_or_id))
+        record = self._data.get("memories", {}).get(key)
+        if record is None or (category and record.get("category") != category):
+            return False
+        del self._data["memories"][key]
+        self._save()
+        return True
+
     @staticmethod
     def _record_score(key: str, record: dict, query: str = "") -> float:
         importance = {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(
