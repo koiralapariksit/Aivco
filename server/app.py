@@ -295,11 +295,16 @@ def get_health() -> Dict[str, Any]:
 @app.get("/api/providers/status")
 def get_provider_status() -> Dict[str, Any]:
     """Return live provider readiness, active models, and recent health data."""
-    return {
-        "providers": llm_controller.get_provider_status(
-            browser_available=universal_web_agent.is_connected()
-        )
-    }
+    connected = universal_web_agent.is_connected()
+    providers = llm_controller.get_provider_status(browser_available=connected)
+    bridge = universal_web_agent.status()
+    tabs = bridge.get("tabs", bridge.get("connected_tabs", {})) if isinstance(bridge, dict) else {}
+    providers["browser"]["tabs"] = tabs
+    providers["browser"]["active_brains"] = [name for name, active in tabs.items() if active]
+    providers["browser"]["available"] = bool(
+        connected and (not tabs or providers["browser"]["active_brains"])
+    )
+    return {"providers": providers}
 
 
 @app.post("/api/providers/local/model")

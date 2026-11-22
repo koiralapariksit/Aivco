@@ -13,6 +13,19 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
   (function () {
     console.log("[AIVCO Bridge] Content script loaded for:", window.location.hostname);
 
+    async function postBridgeResult(payload) {
+      const body = JSON.stringify(payload);
+      try {
+        return await fetch("http://127.0.0.1:8000/api/bridge/result", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body
+        });
+      } catch (_) {
+        return fetch("http://localhost:8000/api/bridge/result", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body
+        });
+      }
+    }
+
     // ── Provider Identification ──────────────────────────────────────────────────
 
     function detectProvider() {
@@ -711,11 +724,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
           error: `Unsupported provider or unrecognized page: ${window.location.hostname}`
         };
         chrome.runtime.sendMessage(errPayload);
-        fetch("http://127.0.0.1:8000/api/bridge/result", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(errPayload)
-        }).catch(() => {});
+        postBridgeResult(errPayload).catch(() => {});
         return;
       }
 
@@ -770,11 +779,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         chrome.runtime.sendMessage(donePayload);
 
         // 2. Direct HTTP POST callback to server
-        fetch("http://127.0.0.1:8000/api/bridge/result", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(donePayload)
-        }).catch(() => {});
+        postBridgeResult(donePayload).catch(() => {});
       } catch (err) {
         console.error("[AIVCO Bridge] Error executing prompt:", err);
         let fallbackText = "";
@@ -792,11 +797,7 @@ if (window.__AIVCO_CONTENT_SCRIPT_LOADED__) {
         };
 
         chrome.runtime.sendMessage(errPayload);
-        fetch("http://127.0.0.1:8000/api/bridge/result", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(errPayload)
-        }).catch(() => {});
+        postBridgeResult(errPayload).catch(() => {});
       }
     }
 

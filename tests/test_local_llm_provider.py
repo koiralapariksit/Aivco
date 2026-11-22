@@ -195,7 +195,7 @@ def test_provider_status_endpoint_returns_live_provider_status(monkeypatch):
     assert providers["local"]["base_url"] == server.llm_controller.local_provider.base_url
     assert "last_error" in providers["local"]
     assert "latency_ms" in providers["local"]
-    assert providers["browser"]["available"] is True
+    assert providers["browser"]["available"] is False
 
 
 def test_local_model_endpoint_hot_swaps_and_checks_reachability(monkeypatch):

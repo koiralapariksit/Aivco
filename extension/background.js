@@ -7,11 +7,13 @@
 
 const BACKEND_WS_URL = "ws://127.0.0.1:8000/ws/bridge";
 const BACKEND_HTTP_URL = "http://127.0.0.1:8000/api/bridge/result";
+const BACKEND_HTTP_FALLBACK_URL = "http://localhost:8000/api/bridge/result";
 
 let socket = null;
 let isConnected = false;
 let reconnectTimer = null;
 let heartbeatTimer = null;
+let useLocalhostFallback = false;
 const activeDispatches = new Map(); // requestId -> { tabId, keepAliveInterval }
 
 const PROVIDER_CONFIG = {
@@ -65,7 +67,10 @@ function connectWebSocket() {
   }
 
   try {
-    socket = new WebSocket(BACKEND_WS_URL);
+    const wsUrl = useLocalhostFallback
+      ? "ws://localhost:8000/ws/bridge"
+      : BACKEND_WS_URL;
+    socket = new WebSocket(wsUrl);
 
     socket.onopen = async () => {
       isConnected = true;
@@ -98,6 +103,7 @@ function connectWebSocket() {
     socket.onclose = () => {
       isConnected = false;
       stopHeartbeat();
+      useLocalhostFallback = !useLocalhostFallback;
       console.warn("[AIVCO Bridge] Disconnected from AIVCO backend. Retrying in 3s...");
       scheduleReconnect();
     };
@@ -132,7 +138,14 @@ function startHeartbeat() {
         tabs: tabs
       }));
     }
-  }, 5000);
+  }, 20000);
+}
+
+if (chrome.alarms) {
+  chrome.alarms.create("aivco-bridge-reconnect", { periodInMinutes: 0.5 });
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === "aivco-bridge-reconnect" && (!socket || socket.readyState > WebSocket.OPEN)) connectWebSocket();
+  });
 }
 
 function stopHeartbeat() {
@@ -276,7 +289,10 @@ function deliverBridgeResult(requestId, provider, markdown, error = null) {
         error: error || null,
         provider: provider
       })
-    }).then(res => {
+    }).catch(() => fetch(BACKEND_HTTP_FALLBACK_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, status: error ? "error" : "done", markdown: markdown || "", error: error || null, provider })
+    })).then(res => {
       console.log(`[AIVCO Bridge] HTTP callback status for ${requestId}:`, res.status);
     }).catch(err => {
       console.warn(`[AIVCO Bridge] HTTP callback error:`, err);

@@ -7,20 +7,26 @@
     "tabs",
     "storage",
     "scripting",
+    "alarms",
     "clipboardRead",
     "clipboardWrite"
   ],
   "host_permissions": [
     "*://claude.ai/*",
     "*://*.claude.ai/*",
+    "https://claude.com/*",
     "*://chatgpt.com/*",
     "*://*.chatgpt.com/*",
+    "*://openai.com/*",
+    "*://*.openai.com/*",
     "*://gemini.google.com/*",
+    "*://*.google.com/*",
     "*://grok.com/*",
     "*://*.grok.com/*",
     "*://x.ai/*",
     "*://*.x.ai/*",
-    "http://127.0.0.1:8000/*"
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -34,8 +40,11 @@
       "matches": [
         "*://claude.ai/*",
         "*://*.claude.ai/*",
+        "https://claude.com/*",
         "*://chatgpt.com/*",
         "*://*.chatgpt.com/*",
+        "*://openai.com/*",
+        "*://*.openai.com/*",
         "*://gemini.google.com/*",
         "*://grok.com/*",
         "*://*.grok.com/*",
