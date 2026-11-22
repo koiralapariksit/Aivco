@@ -42,3 +42,4 @@ scripts/
 Thumbs.db
 .vscode/
 .idea/
+._*
